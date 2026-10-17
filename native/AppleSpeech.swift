@@ -71,24 +71,33 @@ func convert(_ input: AVAudioPCMBuffer, to format: AVAudioFormat) throws -> AVAu
 func module() async throws -> SpeechTranscriber {
     guard SpeechTranscriber.isAvailable,
           let locale = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: "en-US")) else { throw InputFailure.unavailable }
-    return SpeechTranscriber(locale: locale, preset: .transcription)
+    // The transcription preset plus word start times. The parent uses timing to
+    // drop wake-phrase audio, however the recognizer spelled it.
+    return SpeechTranscriber(locale: locale, transcriptionOptions: [], reportingOptions: [], attributeOptions: [.audioTimeRange])
 }
+struct Word { let text: String; let startMs: Int }
 @available(macOS 26.0, *)
-func transcribe(_ input: AVAudioPCMBuffer) async throws -> String {
+func transcribe(_ input: AVAudioPCMBuffer) async throws -> (String, [Word]) {
     let transcriber = try await module()
     guard await AssetInventory.status(forModules: [transcriber]) == .installed else { throw InputFailure.assets }
     guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber], considering: input.format) else { throw InputFailure.conversion }
     let buffer = try convert(input, to: format)
     let analyzer = SpeechAnalyzer(modules: [transcriber])
-    let results = Task { () throws -> String in
+    let results = Task { () throws -> (String, [Word]) in
         var text = ""
+        var words: [Word] = []
         for try await result in transcriber.results {
             let part = String(result.text.characters)
             guard text.utf8.count + part.utf8.count + 1 <= 8192 else { throw InputFailure.output }
             if !text.isEmpty { text += " " }
             text += part
+            for run in result.text.runs {
+                let word = String(result.text[run.range].characters).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !word.isEmpty, let range = run.audioTimeRange, range.start.seconds.isFinite, words.count < 2048 else { continue }
+                words.append(Word(text: word, startMs: max(0, Int(range.start.seconds * 1000))))
+            }
         }
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (text.trimmingCharacters(in: .whitespacesAndNewlines), words)
     }
     let stream = AsyncStream<AnalyzerInput> { continuation in
         continuation.yield(AnalyzerInput(buffer: buffer))
@@ -114,9 +123,12 @@ func transcribe(_ input: AVAudioPCMBuffer) async throws -> String {
             }
             guard CommandLine.arguments.count == 1 else { throw InputFailure.invalid }
             let input = try pcmBuffer(readInput())
-            let text = try await transcribe(input)
+            let (text, words) = try await transcribe(input)
             guard !text.isEmpty else { throw InputFailure.output }
-            let json = try JSONSerialization.data(withJSONObject: ["text": text])
+            let json = try JSONSerialization.data(withJSONObject: [
+                "text": text,
+                "words": words.map { ["text": $0.text, "start_ms": $0.startMs] },
+            ])
             FileHandle.standardOutput.write(json)
             FileHandle.standardOutput.write(Data([10]))
         } catch InputFailure.assets {

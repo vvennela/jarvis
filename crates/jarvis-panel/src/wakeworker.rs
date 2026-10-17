@@ -116,6 +116,17 @@ pub trait WakeBackend {
     ) -> Result<String, &'static str> {
         self.transcribe(samples, cancelled)
     }
+    /// A keyword-armed command: words starting before `skip_before` samples
+    /// are the wake phrase. Backends without word timing ignore it.
+    fn transcribe_command_after(
+        &mut self,
+        samples: &[f32],
+        skip_before: Option<usize>,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<String, &'static str> {
+        let _ = skip_before;
+        self.transcribe_command(samples, cancelled)
+    }
 }
 fn append_keyword_audio(buffer: &mut Vec<f32>, samples: &[f32]) {
     let keep = samples.len().min(64_000);
@@ -739,7 +750,11 @@ impl WakeWorker {
                         let result = if request.phase == Phase::Wake {
                             backend.transcribe(&request.samples, c.cancelled.clone())
                         } else {
-                            backend.transcribe_command(&request.samples, c.cancelled.clone())
+                            backend.transcribe_command_after(
+                                &request.samples,
+                                request.skip_before,
+                                c.cancelled.clone(),
+                            )
                         };
                         c.decode_finished(decode_started.elapsed(), result.is_err());
                         if followup_armed
@@ -1187,6 +1202,16 @@ impl WakeBackend for NativeBackend {
     ) -> Result<String, &'static str> {
         self.transcriber
             .transcribe(samples, cancelled)
+            .map_err(|_| "Try saying Jarvis again")
+    }
+    fn transcribe_command_after(
+        &mut self,
+        samples: &[f32],
+        skip_before: Option<usize>,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<String, &'static str> {
+        self.transcriber
+            .transcribe_after(samples, skip_before, cancelled)
             .map_err(|_| "Try saying Jarvis again")
     }
 }

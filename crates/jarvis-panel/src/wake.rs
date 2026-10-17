@@ -12,6 +12,9 @@ const SPEECH_PREROLL: usize = RATE;
 const FIRST_DECODE_INTERVAL: usize = RATE * 6 / 5;
 const DECODE_INTERVAL: usize = RATE * 5 / 2;
 const COMMAND_CAP: usize = RATE * 15;
+// Wake-phrase words start at least ~460 ms before detection fires; command
+// words spoken straight after it start within ~160 ms. Cut between the two.
+const WAKE_SKIP_MARGIN: usize = RATE * 3 / 10;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     Wake,
@@ -21,6 +24,9 @@ pub struct DecodeRequest {
     pub samples: Vec<f32>,
     pub phase: Phase,
     pub endpoint: bool,
+    /// Samples at the start that hold the wake phrase. Words the recognizer
+    /// places before this point are dropped, however it spelled them.
+    pub skip_before: Option<usize>,
 }
 pub struct DecodeOutcome {
     pub command: Option<String>,
@@ -35,6 +41,7 @@ pub struct WakeDetector {
     probed: bool,
     waiting: usize,
     pending: Option<(Phase, bool)>,
+    wake_skip: Option<usize>,
 }
 impl Default for WakeDetector {
     fn default() -> Self {
@@ -52,6 +59,7 @@ impl WakeDetector {
             probed: false,
             waiting: 0,
             pending: None,
+            wake_skip: None,
         }
     }
     pub fn phase(&self) -> Phase {
@@ -65,6 +73,8 @@ impl WakeDetector {
         self.active = true;
         let start = audio.len().saturating_sub(WAKE_WINDOW);
         self.audio.extend_from_slice(&audio[start..]);
+        // Detection fired at the end of the supplied audio.
+        self.wake_skip = Some(self.audio.len().saturating_sub(WAKE_SKIP_MARGIN));
     }
     /// One explicitly requested answer, with no fabricated keyword audio.
     pub fn arm_followup(&mut self) {
@@ -83,6 +93,7 @@ impl WakeDetector {
         self.since_decode = 0;
         self.probed = false;
         self.waiting = 0;
+        self.wake_skip = None;
     }
     pub fn ingest(&mut self, samples: &[f32]) -> Option<DecodeRequest> {
         self.ingest_with_activity(samples, None)
@@ -166,6 +177,9 @@ impl WakeDetector {
                 samples: self.audio.clone(),
                 phase: self.phase,
                 endpoint,
+                skip_before: (self.phase == Phase::Command)
+                    .then_some(self.wake_skip)
+                    .flatten(),
             });
         }
         None
@@ -247,7 +261,9 @@ impl WakeDetector {
                 // such as "tell me about Jarvis" must remain intact.
                 let invocation = leading_wake_tail(text).map(strip_repeated_wakes);
                 let command = invocation.unwrap_or(text).trim();
-                if invocation.is_some() && command.is_empty() {
+                // Timing removed everything: only the wake phrase was heard.
+                let wake_only = self.wake_skip.is_some() && text.trim().is_empty();
+                if (invocation.is_some() || wake_only) && command.is_empty() {
                     self.clear_audio();
                     return None;
                 }

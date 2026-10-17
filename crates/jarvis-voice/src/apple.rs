@@ -55,6 +55,19 @@ impl AppleTranscriber {
         samples: &[f32],
         cancelled: Arc<AtomicBool>,
     ) -> Result<String, AppleSpeechError> {
+        self.transcribe_after(samples, None, cancelled)
+    }
+
+    /// With `skip_before` (16 kHz samples), keep only words that start at or
+    /// after that point. The result may be empty when only the wake phrase
+    /// was heard. Helpers without word timing return the full text.
+    #[cfg(unix)]
+    pub fn transcribe_after(
+        &self,
+        samples: &[f32],
+        skip_before: Option<usize>,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<String, AppleSpeechError> {
         if cancelled.load(Ordering::Acquire) {
             return Err(AppleSpeechError::Cancelled);
         }
@@ -146,7 +159,13 @@ impl AppleTranscriber {
             if text.trim().is_empty() || text.contains('\0') {
                 return Err(AppleSpeechError::InvalidResponse);
             }
-            Ok(text.trim().to_owned())
+            match (
+                skip_before,
+                value.get("words").and_then(serde_json::Value::as_array),
+            ) {
+                (Some(skip), Some(words)) if !words.is_empty() => after_skip(words, skip),
+                _ => Ok(text.trim().to_owned()),
+            }
         })();
         if result.is_err() {
             let _ = child.kill();
@@ -154,6 +173,41 @@ impl AppleTranscriber {
         let _ = child.wait();
         result
     }
+}
+
+fn after_skip(words: &[serde_json::Value], skip: usize) -> Result<String, AppleSpeechError> {
+    if words.len() > 2048 {
+        return Err(AppleSpeechError::ResponseTooLarge);
+    }
+    let mut kept = String::new();
+    for word in words {
+        let text = word
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(AppleSpeechError::InvalidResponse)?;
+        let start_ms = word
+            .get("start_ms")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(AppleSpeechError::InvalidResponse)?;
+        if text.contains('\0') {
+            return Err(AppleSpeechError::InvalidResponse);
+        }
+        if start_ms.saturating_mul(u64::from(crate::SAMPLE_RATE) / 1000) < skip as u64 {
+            continue;
+        }
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if !kept.is_empty() {
+            kept.push(' ');
+        }
+        kept.push_str(text);
+        if kept.len() > crate::MAX_TRANSCRIPT_BYTES {
+            return Err(AppleSpeechError::ResponseTooLarge);
+        }
+    }
+    Ok(kept.trim().to_owned())
 }
 
 fn wav_bytes(samples: &[f32]) -> Vec<u8> {

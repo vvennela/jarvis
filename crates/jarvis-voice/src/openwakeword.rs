@@ -10,7 +10,9 @@ const MEL_BINS: usize = 32;
 const MEL_FRAMES: usize = 76;
 const FEATURES: usize = 96;
 const WAKE_FRAMES: usize = 16;
-const THRESHOLD: f32 = 0.5;
+// Upstream suggests 0.5, but generated en-IN "Hey Jarvis" spoken straight
+// into a command peaked at 0.34-0.50. Ordinary speech stayed below 0.2.
+const THRESHOLD: f32 = 0.3;
 
 /// Injectable graph boundary; production uses the three official ONNX graphs.
 pub trait Inference {
