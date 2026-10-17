@@ -53,6 +53,15 @@ impl WakeDetector {
     pub fn phase(&self) -> Phase {
         self.phase
     }
+    /// A dedicated acoustic spotter has already heard the invocation. Preserve
+    /// its bounded keyword/tail audio so Whisper can transcribe a same-breath request.
+    pub fn arm_keyword(&mut self, audio: &[f32]) {
+        self.reset();
+        self.phase = Phase::Command;
+        self.active = true;
+        let start = audio.len().saturating_sub(WAKE_WINDOW);
+        self.audio.extend_from_slice(&audio[start..]);
+    }
     pub fn reset(&mut self) {
         self.phase = Phase::Wake;
         self.clear_audio();

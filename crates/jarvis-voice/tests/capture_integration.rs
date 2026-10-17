@@ -248,3 +248,102 @@ fn microphone_inventory_and_utf8_names_have_explicit_resource_bounds() {
     let oversized = "🎤".repeat(33);
     assert!(select_input_index(std::slice::from_ref(&oversized), &oversized).is_err());
 }
+
+#[test]
+fn callback_handoff_preserves_every_sample_during_concurrent_consumer_drains() {
+    use jarvis_voice::capture::AudioHandoff;
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicBool, Ordering},
+    };
+    let handoff = Arc::new(AudioHandoff::new());
+    let ready = Arc::new(Barrier::new(2));
+    let done = Arc::new(AtomicBool::new(false));
+    let expected: Vec<f32> = (0..100000).map(|i| (i % 997) as f32 / 997.0).collect();
+    let producer = handoff.clone();
+    let barrier = ready.clone();
+    let finished = done.clone();
+    let input = expected.clone();
+    let thread = std::thread::spawn(move || {
+        barrier.wait();
+        for chunk in input.chunks(137) {
+            producer.push(chunk);
+            std::thread::yield_now();
+        }
+        finished.store(true, Ordering::Release);
+    });
+    ready.wait();
+    let mut actual = Vec::new();
+    while !done.load(Ordering::Acquire) {
+        let (samples, gap) = handoff.drain();
+        assert!(!gap, "consumer contention dropped callback audio");
+        assert!(samples.len() <= MAX_RECORDING_SAMPLES);
+        actual.extend(samples);
+        std::thread::yield_now();
+    }
+    thread.join().unwrap();
+    let (samples, gap) = handoff.drain();
+    assert!(!gap);
+    actual.extend(samples);
+    assert_eq!(
+        actual, expected,
+        "handoff reordered or lost callback samples"
+    );
+    assert_eq!(handoff.overruns(), 0);
+    assert_eq!(handoff.drain(), (Vec::new(), false));
+}
+
+#[test]
+fn stalled_consumer_only_marks_discontinuity_on_actual_capacity_exhaustion_and_recovers() {
+    use jarvis_voice::capture::AudioHandoff;
+    use std::sync::{Arc, mpsc};
+    let handoff = Arc::new(AudioHandoff::new());
+    let producer = handoff.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        producer.push(&vec![0.125; MAX_RECORDING_SAMPLES]);
+        done_tx.send(()).unwrap();
+    });
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("producer waited for stalled consumer");
+    thread.join().unwrap();
+    assert_eq!(handoff.overruns(), 0);
+    handoff.push(&[0.5; 320]);
+    assert_eq!(handoff.overruns(), 1);
+    let (samples, gap) = handoff.drain();
+    assert!(gap);
+    assert_eq!(samples, vec![0.125; MAX_RECORDING_SAMPLES]);
+    assert_eq!(
+        handoff.drain(),
+        (Vec::new(), false),
+        "overflow poisoned later callbacks"
+    );
+    handoff.push(&[0.25; 320]);
+    assert_eq!(handoff.drain(), (vec![0.25; 320], false));
+    assert_eq!(handoff.overruns(), 1);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn capture_diagnostics_separate_os_xruns_from_route_changes_and_queue_pressure() {
+    use jarvis_voice::capture::CaptureHealth;
+    let health = CaptureHealth::default();
+    for _ in 0..3 {
+        health.record_stream_error(cpal::ErrorKind::Xrun);
+    }
+    health.record_stream_error(cpal::ErrorKind::DeviceChanged);
+    health.record_stream_error(cpal::ErrorKind::RealtimeDenied);
+    let counters = health.diagnostics();
+    assert_eq!(counters.xruns, 3);
+    assert_eq!(counters.route_changes, 1);
+    assert_eq!(counters.queue_overruns, 0);
+    assert!(!health.failed());
+    assert!(health.take_discontinuity());
+    assert!(!health.take_discontinuity());
+    assert_eq!(
+        health.diagnostics(),
+        counters,
+        "consuming reset signal erased diagnostic evidence"
+    );
+}

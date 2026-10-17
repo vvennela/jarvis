@@ -4,6 +4,8 @@
 //! opened implicitly and transcription uses no cloud service.
 
 pub mod capture;
+#[cfg(target_os = "macos")]
+pub mod kws;
 
 use std::{
     fmt,

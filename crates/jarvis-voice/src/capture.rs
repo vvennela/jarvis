@@ -66,13 +66,83 @@ pub fn select_input_index(names: &[String], requested: &str) -> Result<usize, Ca
     Ok(index)
 }
 
+/// Preallocated lock-free callback handoff. Producer pushes never allocate or
+/// wait for the consumer; only actual capacity exhaustion loses samples.
+pub struct AudioHandoff {
+    queue: crossbeam_queue::ArrayQueue<f32>,
+    overruns: std::sync::atomic::AtomicU64,
+    discontinuity: std::sync::atomic::AtomicBool,
+}
+impl Default for AudioHandoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl AudioHandoff {
+    pub fn new() -> Self {
+        Self {
+            queue: crossbeam_queue::ArrayQueue::new(MAX_RECORDING_SAMPLES),
+            overruns: Default::default(),
+            discontinuity: Default::default(),
+        }
+    }
+    pub fn push(&self, samples: &[f32]) {
+        let mut dropped = false;
+        for &sample in samples {
+            if self.queue.push(sample).is_err() {
+                dropped = true;
+            }
+        }
+        if dropped {
+            self.overruns
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.discontinuity
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    pub fn drain(&self) -> (Vec<f32>, bool) {
+        let mut samples = Vec::with_capacity(self.queue.len().min(MAX_RECORDING_SAMPLES));
+        // A producer can refill concurrently; bound this consumer invocation.
+        for _ in 0..MAX_RECORDING_SAMPLES {
+            match self.queue.pop() {
+                Some(sample) => samples.push(sample),
+                None => break,
+            }
+        }
+        let interrupted = self
+            .discontinuity
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
+        (samples, interrupted)
+    }
+    pub fn overruns(&self) -> u64 {
+        self.overruns.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CaptureDiagnostics {
+    pub xruns: u64,
+    pub route_changes: u64,
+    pub queue_overruns: u64,
+}
+
 /// Error state shared by the realtime callback and its bounded consumer.
 #[derive(Default)]
 pub struct CaptureHealth {
     failed: std::sync::atomic::AtomicBool,
+    xruns: std::sync::atomic::AtomicU64,
+    route_changes: std::sync::atomic::AtomicU64,
     discontinuity: std::sync::atomic::AtomicBool,
 }
 impl CaptureHealth {
+    pub fn diagnostics(&self) -> CaptureDiagnostics {
+        CaptureDiagnostics {
+            xruns: self.xruns.load(std::sync::atomic::Ordering::Relaxed),
+            route_changes: self
+                .route_changes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            queue_overruns: 0,
+        }
+    }
     pub fn failed(&self) -> bool {
         self.failed.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -95,7 +165,16 @@ impl CaptureHealth {
     #[cfg(target_os = "macos")]
     pub fn record_stream_error(&self, kind: cpal::ErrorKind) {
         match kind {
-            cpal::ErrorKind::Xrun | cpal::ErrorKind::DeviceChanged => self.discontinuity(),
+            cpal::ErrorKind::Xrun => {
+                self.xruns
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.discontinuity();
+            }
+            cpal::ErrorKind::DeviceChanged => {
+                self.route_changes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.discontinuity();
+            }
             cpal::ErrorKind::RealtimeDenied => {}
             _ => self.fail(),
         }
@@ -246,6 +325,7 @@ mod native {
         stream: Option<cpal::Stream>,
         buffer: Arc<Mutex<Option<CaptureBuffer>>>,
         health: Arc<CaptureHealth>,
+        handoff: Option<Arc<AudioHandoff>>,
         full: Arc<AtomicBool>,
         info: InputInfo,
     }
@@ -293,16 +373,27 @@ mod native {
                 sample_rate: config.sample_rate,
                 channels: config.channels,
             };
-            let buffer = Arc::new(Mutex::new(Some(if continuous {
-                CaptureBuffer::continuous(config.sample_rate, config.channels)?
+            let buffer = Arc::new(Mutex::new(if continuous {
+                None
             } else {
-                CaptureBuffer::new(config.sample_rate, config.channels)?
-            })));
+                Some(CaptureBuffer::new(config.sample_rate, config.channels)?)
+            }));
+            let handoff = continuous.then(|| Arc::new(AudioHandoff::new()));
             let health = Arc::new(CaptureHealth::default());
             let full = Arc::new(AtomicBool::new(false));
             macro_rules! stream {
                 ($sample:ty, $push:ident) => {{
                     let data_buffer = Arc::clone(&buffer);
+                    let data_handoff = handoff.clone();
+                    // The realtime callback exclusively owns its resampler.
+                    let mut local_buffer = if continuous {
+                        Some(CaptureBuffer::continuous(
+                            config.sample_rate,
+                            config.channels,
+                        )?)
+                    } else {
+                        None
+                    };
                     let data_health = Arc::clone(&health);
                     let data_full = Arc::clone(&full);
                     let error_health = Arc::clone(&health);
@@ -310,6 +401,20 @@ mod native {
                         config.clone(),
                         move |data: &[$sample], _: &cpal::InputCallbackInfo| {
                             if data_health.failed() || data_full.load(Ordering::Acquire) {
+                                return;
+                            }
+                            if let (Some(local), Some(handoff)) =
+                                (local_buffer.as_mut(), data_handoff.as_ref())
+                            {
+                                if local.$push(data).is_err() {
+                                    data_health.fail();
+                                    return;
+                                }
+                                handoff.push(&local.output);
+                                local.output.clear();
+                                if std::mem::take(&mut local.overrun) {
+                                    data_health.discontinuity();
+                                }
                                 return;
                             }
                             if let Ok(mut guard) = data_buffer.try_lock() {
@@ -346,6 +451,7 @@ mod native {
                 stream: Some(stream),
                 buffer,
                 health,
+                handoff,
                 full,
                 info,
             })
@@ -409,16 +515,25 @@ mod native {
         pub fn info(&self) -> InputInfo {
             self.0.info.clone()
         }
+        pub fn diagnostics(&self) -> CaptureDiagnostics {
+            let mut diagnostics = self.0.health.diagnostics();
+            diagnostics.queue_overruns = self
+                .0
+                .handoff
+                .as_ref()
+                .map_or(0, |handoff| handoff.overruns());
+            diagnostics
+        }
         pub fn poll(&mut self) -> Result<(Vec<f32>, bool), CaptureError> {
             if self.0.failed() {
                 return Err(CaptureError::StreamFailed);
             }
-            let mut guard = self
+            let (samples, overflow) = self
                 .0
-                .buffer
-                .lock()
-                .map_err(|_| CaptureError::StreamFailed)?;
-            let (samples, overflow) = guard.as_mut().ok_or(CaptureError::Empty)?.drain_samples();
+                .handoff
+                .as_ref()
+                .ok_or(CaptureError::StreamFailed)?
+                .drain();
             let discontinuity = self.0.health.take_discontinuity();
             Ok((samples, overflow || discontinuity))
         }

@@ -1,6 +1,6 @@
 //! Continuous local wake recognition; the native audio handle stays on one thread.
 use crate::wake::{DecodeRequest, Phase, WakeDetector, wake_tail};
-use jarvis_voice::capture::InputInfo;
+use jarvis_voice::capture::{CaptureDiagnostics, InputInfo};
 use std::{
     sync::{
         Arc, Mutex,
@@ -37,6 +37,7 @@ pub struct Diagnostics {
     pub commands: u64,
     pub discontinuities: u64,
     pub capture_errors: u64,
+    pub capture: CaptureDiagnostics,
     pub decode_errors: u64,
 }
 #[derive(Clone, Debug)]
@@ -51,7 +52,7 @@ impl Snapshot {
     pub fn diagnostic_line(&self) -> String {
         let d = &self.diagnostics;
         format!(
-            "jarvis_voice state={:?} samples={} rms={:.5} peak={:.5} max_rms={:.5} decodes={} decode_ms={} wakes={} commands={} discontinuities={} capture_errors={} decode_errors={}",
+            "jarvis_voice state={:?} samples={} rms={:.5} peak={:.5} max_rms={:.5} decodes={} decode_ms={} wakes={} commands={} discontinuities={} capture_errors={} decode_errors={} xruns={} route_changes={} queue_overruns={}",
             self.state,
             d.captured_samples,
             d.last_rms,
@@ -64,10 +65,27 @@ impl Snapshot {
             d.discontinuities,
             d.capture_errors,
             d.decode_errors,
+            d.capture.xruns,
+            d.capture.route_changes,
+            d.capture.queue_overruns,
         )
     }
 }
+/// Dedicated spotting result. None from the backend selects the legacy fixture path;
+/// Some with no detection means audio was processed locally without transcription.
+#[derive(Clone, Copy, Debug)]
+pub struct KeywordStatus {
+    pub lookback_samples: Option<usize>,
+}
 pub trait WakeBackend {
+    fn capture_diagnostics(&self) -> CaptureDiagnostics {
+        CaptureDiagnostics::default()
+    }
+    fn keyword_spot(&mut self, _samples: &[f32]) -> Result<Option<KeywordStatus>, &'static str> {
+        Ok(None)
+    }
+    fn reset_keyword(&mut self) {}
+
     fn input_info(&self) -> Option<InputInfo> {
         None
     }
@@ -146,6 +164,13 @@ impl Control {
             .diagnostics
             .input = input;
     }
+    fn capture_diagnostics(&self, diagnostics: CaptureDiagnostics) {
+        self.snapshot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .diagnostics
+            .capture = diagnostics;
+    }
     fn audio(&self, samples: &[f32], overflow: bool) {
         let mut snapshot = self.snapshot.lock().unwrap_or_else(|p| p.into_inner());
         let d = &mut snapshot.diagnostics;
@@ -222,8 +247,15 @@ impl WakeWorker {
             }
             let transcriber = jarvis_voice::Transcriber::load(&path)
                 .map_err(|_| "Check the local Whisper model")?;
+            let keyword_path = std::path::PathBuf::from(
+                settings
+                    .get("JARVIS_KWS_MODEL_DIR")
+                    .ok_or("Set JARVIS_KWS_MODEL_DIR to the local keyword model")?,
+            );
+            let keyword = jarvis_voice::kws::LocalKeywordSpotter::load(&keyword_path)?;
             Ok(Box::new(NativeBackend {
                 transcriber,
+                keyword,
                 capture: None,
                 device_name: settings.get("JARVIS_MICROPHONE_NAME").cloned(),
             }))
@@ -260,6 +292,7 @@ impl WakeWorker {
                 let mut detector = WakeDetector::new();
                 let mut next_decode: Option<DecodeRequest> = None;
                 let mut running = false;
+                let mut keyword_audio = Vec::<f32>::with_capacity(64_000);
                 let mut seen_generation = c.generation.load(Ordering::Acquire);
                 loop {
                     if c.stopped.load(Ordering::Acquire) {
@@ -268,6 +301,8 @@ impl WakeWorker {
                     let generation = c.generation.load(Ordering::Acquire);
                     if generation != seen_generation {
                         backend.stop();
+                        backend.reset_keyword();
+                        keyword_audio.clear();
                         running = false;
                         detector.reset();
                         next_decode = None;
@@ -350,13 +385,53 @@ impl WakeWorker {
                                 continue;
                             }
                         };
+                        c.capture_diagnostics(backend.capture_diagnostics());
                         c.audio(&samples, overflow);
                         if overflow || samples.len() > jarvis_voice::capture::MAX_RECORDING_SAMPLES
                         {
                             detector.reset();
+                            backend.reset_keyword();
+                            keyword_audio.clear();
                             continue;
                         }
-                        detector.ingest(&samples)
+                        if detector.phase() == Phase::Wake {
+                            match backend.keyword_spot(&samples) {
+                                Ok(Some(status)) => {
+                                    // Fixed-size prerecording recovers words spoken immediately
+                                    // after the keyword while the streaming model confirms it.
+                                    let keep = samples.len().min(64_000);
+                                    let excess =
+                                        (keyword_audio.len() + keep).saturating_sub(64_000);
+                                    keyword_audio.drain(..excess.min(keyword_audio.len()));
+                                    keyword_audio
+                                        .extend_from_slice(&samples[samples.len() - keep..]);
+                                    if let Some(lookback) = status.lookback_samples {
+                                        let start = keyword_audio
+                                            .len()
+                                            .saturating_sub(lookback.min(64_000));
+                                        detector.arm_keyword(&keyword_audio[start..]);
+                                        keyword_audio.clear();
+                                        c.wake_matched();
+                                    }
+                                    None
+                                }
+                                Ok(None) => detector.ingest(&samples),
+                                Err(message) => {
+                                    backend.stop();
+                                    running = false;
+                                    detector.reset();
+                                    keyword_audio.clear();
+                                    c.enabled.store(false, Ordering::Release);
+                                    c.publish(State::Failed, message);
+                                    while !c.enabled() && !c.stopped.load(Ordering::Acquire) {
+                                        thread::sleep(Duration::from_millis(20));
+                                    }
+                                    continue;
+                                }
+                            }
+                        } else {
+                            detector.ingest(&samples)
+                        }
                     };
                     if let Some(request) = request {
                         c.publish(
@@ -402,9 +477,12 @@ impl WakeWorker {
                                 continue;
                             }
                         };
+                        c.capture_diagnostics(backend.capture_diagnostics());
                         c.audio(&queued, overflow);
                         if overflow || queued.len() > jarvis_voice::capture::MAX_RECORDING_SAMPLES {
                             detector.reset();
+                            backend.reset_keyword();
+                            keyword_audio.clear();
                             continue;
                         }
                         match result {
@@ -414,6 +492,12 @@ impl WakeWorker {
                                 }
                                 let outcome = detector.accept_transcript_with_audio(&text, &queued);
                                 next_decode = outcome.next;
+                                if detector.phase() == Phase::Wake
+                                    && request.phase == Phase::Command
+                                {
+                                    backend.reset_keyword();
+                                    keyword_audio.clear();
+                                }
                                 if let Some(command) = outcome.command {
                                     let mut slot =
                                         c.command.lock().unwrap_or_else(|p| p.into_inner());
@@ -469,11 +553,27 @@ impl Drop for WakeWorker {
 #[cfg(target_os = "macos")]
 struct NativeBackend {
     transcriber: jarvis_voice::Transcriber,
+    keyword: jarvis_voice::kws::LocalKeywordSpotter,
     capture: Option<jarvis_voice::capture::ContinuousCapture>,
     device_name: Option<String>,
 }
 #[cfg(target_os = "macos")]
 impl WakeBackend for NativeBackend {
+    fn capture_diagnostics(&self) -> CaptureDiagnostics {
+        self.capture
+            .as_ref()
+            .map_or_else(CaptureDiagnostics::default, |capture| capture.diagnostics())
+    }
+    fn keyword_spot(&mut self, samples: &[f32]) -> Result<Option<KeywordStatus>, &'static str> {
+        self.keyword.accept(samples).map(|result| {
+            Some(KeywordStatus {
+                lookback_samples: result.map(|detection| detection.lookback_samples),
+            })
+        })
+    }
+    fn reset_keyword(&mut self) {
+        self.keyword.reset();
+    }
     fn input_info(&self) -> Option<InputInfo> {
         self.capture.as_ref().map(|capture| capture.info())
     }
