@@ -24,7 +24,9 @@ impl VoiceHandoff {
             .is_some_and(|revision| revision != reply.revision)
         {
             match reply.state {
-                chat::State::Reply if !conversation.busy() && !playback.busy() => {
+                chat::State::Reply | chat::State::Failed | chat::State::Unavailable
+                    if !conversation.busy() && !playback.busy() =>
+                {
                     let mut end = reply.text.len().min(speech::MAX_TEXT_BYTES);
                     while !reply.text.is_char_boundary(end) {
                         end -= 1;
@@ -32,10 +34,7 @@ impl VoiceHandoff {
                     let _ = playback.speak(reply.text[..end].to_owned());
                     self.pending_reply_after = None;
                 }
-                chat::State::Failed
-                | chat::State::Cancelled
-                | chat::State::Unavailable
-                | chat::State::Stopped => {
+                chat::State::Cancelled | chat::State::Stopped => {
                     self.pending_reply_after = None;
                 }
                 _ => {}

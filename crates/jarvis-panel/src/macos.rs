@@ -464,6 +464,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     let mut interaction_revealed = false;
     let mut wake_idle_since: Option<Instant> = None;
     let started = Instant::now();
+    let mut next_voice_diagnostic = Duration::ZERO;
     let mut active_observed = false;
     let mut paused_observed = false;
     let mut resumed_observed = false;
@@ -584,6 +585,14 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             interaction_revealed = true;
         }
         let voice_snapshot = voice.control.snapshot();
+        // An explicit, bounded two-minute diagnostic session, never ambient text.
+        if options.voice_diagnostics
+            && started.elapsed() < Duration::from_secs(120)
+            && started.elapsed() >= next_voice_diagnostic
+        {
+            eprintln!("{}", voice_snapshot.diagnostic_line());
+            next_voice_diagnostic = started.elapsed() + Duration::from_secs(2);
+        }
         if voice_snapshot.state == wakeworker::State::WakeListening {
             interaction_revealed = false;
         }
@@ -640,6 +649,13 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             "Couldn't play audio"
         } else if conversation.control.busy() {
             "Thinking…"
+        } else if chat_snapshot.state == chat::State::Failed
+            && !matches!(
+                voice_snapshot.state,
+                wakeworker::State::CommandListening | wakeworker::State::Decoding
+            )
+        {
+            "Request failed · ready to retry"
         } else {
             match voice_snapshot.state {
                 wakeworker::State::WakeListening => "Listening for Jarvis",
@@ -655,7 +671,10 @@ pub fn run(options: Options) -> Result<(), &'static str> {
         };
         detail.setStringValue(&NSString::from_str(message));
         detail.setTextColor(Some(&NSColor::labelColor()));
-        let activity_color = if blocked || voice_snapshot.state == wakeworker::State::Failed {
+        let activity_color = if blocked
+            || voice_snapshot.state == wakeworker::State::Failed
+            || chat_snapshot.state == chat::State::Failed
+        {
             NSColor::systemOrangeColor()
         } else if voice.control.enabled() {
             NSColor::systemGreenColor()
@@ -668,7 +687,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
         } else if chat_snapshot.state == chat::State::Unavailable {
             "Open Details to finish setup.".to_owned()
         } else if chat_snapshot.state == chat::State::Failed {
-            "That didn't finish. Open Details to retry.".to_owned()
+            chat_snapshot.text.chars().take(180).collect::<String>()
         } else if chat_snapshot.state == chat::State::Reply && !chat_snapshot.text.is_empty() {
             chat_snapshot
                 .text

@@ -8,6 +8,7 @@ struct Options {
     root: PathBuf,
     database: PathBuf,
     smoke_test: bool,
+    voice_diagnostics: bool,
     project_dir: Option<PathBuf>,
 }
 
@@ -16,6 +17,7 @@ fn options() -> Result<Options, &'static str> {
     let mut root = None;
     let mut database = None;
     let mut smoke_test = false;
+    let mut voice_diagnostics = false;
     let mut project_dir = None;
     while let Some(argument) = args.next() {
         match argument.to_str() {
@@ -35,9 +37,10 @@ fn options() -> Result<Options, &'static str> {
                 ));
             }
             Some("--smoke-test") if !smoke_test => smoke_test = true,
+            Some("--voice-diagnostics") if !voice_diagnostics => voice_diagnostics = true,
             _ => {
                 return Err(
-                    "usage: jarvis-panel --root <directory> --db <database> [--project-dir <directory>] [--smoke-test]",
+                    "usage: jarvis-panel --root <directory> --db <database> [--project-dir <directory>] [--smoke-test] [--voice-diagnostics]",
                 );
             }
         }
@@ -46,6 +49,7 @@ fn options() -> Result<Options, &'static str> {
         root: root.ok_or("--root is required; no folders are collected by default")?,
         database: database.ok_or("--db is required")?,
         smoke_test,
+        voice_diagnostics,
         project_dir,
     })
 }
@@ -76,7 +80,12 @@ fn main() {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (parsed.root, parsed.database, parsed.smoke_test);
+        let _ = (
+            parsed.root,
+            parsed.database,
+            parsed.smoke_test,
+            parsed.voice_diagnostics,
+        );
         eprintln!("jarvis-panel requires macOS; use the jarvis CLI on this platform");
         std::process::exit(1);
     }

@@ -874,3 +874,41 @@ fn fatal_capture_error_remains_visible_and_requires_explicit_retry() {
     );
     stop(&mut worker);
 }
+
+#[test]
+fn opt_in_diagnostic_line_contains_only_fixed_state_and_numeric_health() {
+    use jarvis_panel::wakeworker::{Diagnostics, Snapshot};
+    let snapshot = Snapshot {
+        state: State::WakeListening,
+        message: "PRIVATE_TRANSCRIPT_SENTINEL api-key-secret",
+        revision: 99,
+        diagnostics: Diagnostics {
+            input: Some(jarvis_voice::capture::InputInfo {
+                name: "PRIVATE_DEVICE_OWNER_SENTINEL\nforged diagnostic".into(),
+                sample_rate: 48000,
+                channels: 2,
+            }),
+            captured_samples: 32000,
+            last_rms: 0.025,
+            last_peak: 0.5,
+            max_rms: 0.25,
+            decode_count: 7,
+            last_decode_ms: 350,
+            wake_matches: 2,
+            commands: 1,
+            discontinuities: 3,
+            capture_errors: 4,
+            decode_errors: 5,
+            ..Default::default()
+        },
+    };
+    let line = snapshot.diagnostic_line();
+    assert!(!line.contains("PRIVATE_"));
+    assert!(!line.contains("secret"));
+    assert!(!line.contains("forged"));
+    assert_eq!(line.lines().count(), 1);
+    assert_eq!(
+        line,
+        "jarvis_voice state=WakeListening samples=32000 rms=0.02500 peak=0.50000 max_rms=0.25000 decodes=7 decode_ms=350 wakes=2 commands=1 discontinuities=3 capture_errors=4 decode_errors=5"
+    );
+}

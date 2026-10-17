@@ -46,6 +46,27 @@ pub struct Snapshot {
     pub revision: u64,
     pub diagnostics: Diagnostics,
 }
+impl Snapshot {
+    /// Numeric opt-in diagnostics. No device names, messages, audio or transcripts.
+    pub fn diagnostic_line(&self) -> String {
+        let d = &self.diagnostics;
+        format!(
+            "jarvis_voice state={:?} samples={} rms={:.5} peak={:.5} max_rms={:.5} decodes={} decode_ms={} wakes={} commands={} discontinuities={} capture_errors={} decode_errors={}",
+            self.state,
+            d.captured_samples,
+            d.last_rms,
+            d.last_peak,
+            d.max_rms,
+            d.decode_count,
+            d.last_decode_ms,
+            d.wake_matches,
+            d.commands,
+            d.discontinuities,
+            d.capture_errors,
+            d.decode_errors,
+        )
+    }
+}
 pub trait WakeBackend {
     fn input_info(&self) -> Option<InputInfo> {
         None

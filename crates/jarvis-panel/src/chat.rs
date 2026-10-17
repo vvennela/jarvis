@@ -1,5 +1,8 @@
 //! One cancellable conversation worker, independent of file awareness.
-use jarvis::conversation::{Conversation, ConversationError};
+use jarvis::{
+    conversation::{Conversation, ConversationError, Reply},
+    providers::ProviderError,
+};
 use std::{
     path::PathBuf,
     sync::{
@@ -7,11 +10,14 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
+    time::Duration,
 };
 use tokio::sync::{mpsc, watch};
 
 pub const MAX_QUESTION_BYTES: usize = 8192;
 pub const MAX_DISPLAY_BYTES: usize = 32768;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const RETRY_DELAY: Duration = Duration::from_millis(350);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -146,8 +152,8 @@ impl ConversationWorker {
             runtime.block_on(async move {
                 let mut conversation = match factory() {
                     Ok(conversation) => conversation,
-                    Err(_) => {
-                        worker_control.update(State::Unavailable, "Add CRUSOE_API_KEY to .env and check provider settings, then restart Jarvis. File awareness still works.", false);
+                    Err(error) => {
+                        worker_control.update(State::Unavailable, error_message(error), false);
                         return;
                     }
                 };
@@ -168,7 +174,10 @@ impl ConversationWorker {
                     }
                     worker_control.update(State::Thinking, "Thinking with relevant context…", false);
                     let result = {
-                        let ask = conversation.ask(&request.question);
+                        let ask = tokio::time::timeout(
+                            REQUEST_TIMEOUT,
+                            ask_with_retry(&mut conversation, &request.question, &worker_control),
+                        );
                         tokio::pin!(ask);
                         loop {
                             tokio::select! {
@@ -176,14 +185,16 @@ impl ConversationWorker {
                                 _ = cancelled.changed() => {
                                     if worker_control.stopping.load(Ordering::Acquire) || *cancelled.borrow() != request.epoch { break None; }
                                 }
-                                result = &mut ask => { break Some(result); }
+                                result = &mut ask => {
+                                    break Some(result.unwrap_or(Err(ConversationError::Provider(ProviderError::Timeout))));
+                                }
                             }
                         }
                     }; // Dropping ask on cancellation prevents successful-turn history commit.
                     match result {
                         None => worker_control.update(State::Cancelled, "Request cancelled. File awareness is unchanged.", false),
                         Some(Ok(reply)) => worker_control.update(State::Reply, &reply.text, reply.routing_degraded),
-                        Some(Err(_)) => worker_control.update(State::Failed, "I couldn't complete that request. Check the connection and provider settings, then try again.", false),
+                        Some(Err(error)) => worker_control.update(State::Failed, error_message(error), false),
                     }
                     worker_control.busy.store(false, Ordering::Release);
                 }
@@ -209,6 +220,91 @@ impl ConversationWorker {
                 .map_err(|_| "Conversation worker terminated unexpectedly")?;
         }
         Ok(())
+    }
+}
+
+/// These requests only generate text. A failed attempt has not committed a
+/// conversation turn; retrying cannot repeat a tool write or send a message.
+/// The caller's timeout and cancellation select wrap both attempts and delay.
+async fn ask_with_retry(
+    conversation: &mut Conversation,
+    question: &str,
+    control: &Control,
+) -> Result<Reply, ConversationError> {
+    let result = conversation.ask(question).await;
+    if matches!(&result, Err(ConversationError::Provider(error)) if error.retryable()) {
+        control.update(
+            State::Thinking,
+            "The model connection had a temporary problem. Retrying once…",
+            false,
+        );
+        tokio::time::sleep(RETRY_DELAY).await;
+        conversation.ask(question).await
+    } else {
+        result
+    }
+}
+
+// Do not interpolate configuration values, provider response bodies, or
+// transport errors into UI text. Each message identifies only the safe class.
+fn error_message(error: ConversationError) -> &'static str {
+    match error {
+        ConversationError::MissingKey("CRUSOE_API_KEY") => {
+            "CRUSOE_API_KEY is missing from configuration. Add it to .env and restart Jarvis. File awareness still works."
+        }
+        ConversationError::MissingKey(_) => {
+            "A required provider setting is missing. Check local configuration and restart Jarvis. File awareness still works."
+        }
+        ConversationError::Configuration => {
+            "Jarvis couldn't read the local .env configuration. Check that it is an accessible regular file. File awareness still works."
+        }
+        ConversationError::ConfigurationTooLarge => {
+            "The local .env configuration exceeds the 16 KiB limit. Reduce its size and restart Jarvis. File awareness still works."
+        }
+        ConversationError::ConfigurationEncoding => {
+            "The local .env configuration must use UTF-8 text. Save it as UTF-8 and restart Jarvis. File awareness still works."
+        }
+        ConversationError::InvalidQuestion => {
+            "That request is empty, invalid, or too long. Please shorten it and try again."
+        }
+        ConversationError::Context => {
+            "Jarvis couldn't read its local context index. Check the database location and access, then try again."
+        }
+        ConversationError::Provider(provider) => match provider {
+            ProviderError::InvalidConfiguration => {
+                "The model provider configuration is invalid. Check the configured model and credential format, then restart Jarvis."
+            }
+            ProviderError::InvalidInput => {
+                "The model request exceeded its input limits or contained invalid text. Please shorten the request."
+            }
+            ProviderError::Authentication => {
+                "Model provider authentication failed. Check access in your provider account settings."
+            }
+            ProviderError::RateLimited => {
+                "The model provider is limiting requests. Please try again shortly."
+            }
+            ProviderError::ServerUnavailable => {
+                "The model provider is temporarily unavailable. Please try again shortly."
+            }
+            ProviderError::Rejected => {
+                "The model provider rejected this request. Check that the configured model is available for your account."
+            }
+            ProviderError::Transport => {
+                "Jarvis couldn't reach the model provider. Check your network connection and try again."
+            }
+            ProviderError::Timeout => {
+                "The model provider took too long to answer. Please try again."
+            }
+            ProviderError::ResponseTooLarge => {
+                "The model response exceeded the size limit. Please ask for a shorter answer."
+            }
+            ProviderError::InvalidResponse => {
+                "The model provider returned an unreadable response. Please try again."
+            }
+            ProviderError::IncompleteOutput => {
+                "The model response was cut short. Please ask for a shorter answer."
+            }
+        },
     }
 }
 impl Drop for ConversationWorker {

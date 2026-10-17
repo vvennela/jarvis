@@ -37,6 +37,9 @@ struct Peer {
 }
 impl Peer {
     fn new(reply: &str) -> Self {
+        Self::responding(reply, 200, Duration::ZERO)
+    }
+    fn responding(reply: &str, status: u16, delay: Duration) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -87,12 +90,14 @@ impl Peer {
                         }
                     }
                 }
+                thread::sleep(delay);
                 let wire = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 );
-                socket.write_all(wire.as_bytes()).unwrap();
+                // A cancelled request intentionally closes its HTTP connection.
+                let _ = socket.write_all(wire.as_bytes());
             }
         });
         Self {
@@ -249,4 +254,149 @@ fn woken_question_uses_shared_context_and_reply_reaches_owned_speech_child_once(
     wake.join().unwrap();
     chat.join().unwrap();
     speech.join().unwrap();
+}
+
+struct FailureLoop {
+    dir: TempDir,
+    chat: ConversationWorker,
+    speech: SpeechWorker,
+    wake: WakeWorker,
+    audio: Arc<AudioFixture>,
+    handoff: jarvis_panel::voicehandoff::VoiceHandoff,
+}
+impl FailureLoop {
+    fn new(peer: &Peer) -> Self {
+        let dir = TempDir::new();
+        let database = dir.join("context.db");
+        drop(ContextStore::open(&database, Limits::default()).unwrap());
+        let client = CrusoeClient::new(
+            "fixture-secret",
+            NEMOTRON_MODEL,
+            ProviderConfig::loopback_for_tests(&peer.url, Duration::from_secs(3)).unwrap(),
+        )
+        .unwrap();
+        let chat =
+            ConversationWorker::with_factory(move || Ok(Conversation::new(database, None, client)))
+                .unwrap();
+        let executable = dir.join("silent-speaker");
+        fs::write(&executable, "#!/bin/sh\nfixture_dir=${0%/*}\ncat > \"$fixture_dir/spoken\"\nprintf 'played\\n' >> \"$fixture_dir/plays\"\nwhile [ ! -e \"$fixture_dir/release\" ]; do sleep 0.01; done\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let speech = SpeechWorker::with_executable(executable).unwrap();
+        let audio = Arc::new(AudioFixture::default());
+        let backend = audio.clone();
+        let wake = WakeWorker::with_backend(move || Ok(Box::new(Backend(backend)))).unwrap();
+        wait(|| speech.control.available() && chat.control.available());
+        wake.control.set_enabled(true);
+        Self {
+            dir,
+            chat,
+            speech,
+            wake,
+            audio,
+            handoff: Default::default(),
+        }
+    }
+    fn tick(&mut self) {
+        self.handoff
+            .tick(&self.wake.control, &self.chat.control, &self.speech.control);
+    }
+    fn settle(&mut self) {
+        for _ in 0..30 {
+            self.tick();
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+impl Drop for FailureLoop {
+    fn drop(&mut self) {
+        self.wake.control.shutdown();
+        self.chat.control.stop();
+        self.speech.control.shutdown();
+        self.wake.join().unwrap();
+        self.chat.join().unwrap();
+        self.speech.join().unwrap();
+    }
+}
+
+#[test]
+fn voice_provider_auth_failure_is_spoken_once_and_wake_resumes_after_playback() {
+    let peer = Peer::responding(
+        "UNTRUSTED_PROVIDER_BODY fixture-secret",
+        401,
+        Duration::ZERO,
+    );
+    let mut fixture = FailureLoop::new(&peer);
+    fixture.audio.utterance("Jarvis where was I?");
+    wait(|| {
+        fixture.tick();
+        fixture.dir.join("plays").exists()
+    });
+    let spoken = fs::read_to_string(fixture.dir.join("spoken")).unwrap();
+    assert!(!spoken.trim().is_empty());
+    assert_eq!(spoken, fixture.chat.control.snapshot().text);
+    wait(|| {
+        fixture.tick();
+        fixture.wake.control.snapshot().state == jarvis_panel::wakeworker::State::Suppressed
+    });
+    assert_eq!(
+        fixture.chat.control.snapshot().state,
+        jarvis_panel::chat::State::Failed
+    );
+    assert!(!spoken.contains("UNTRUSTED_PROVIDER_BODY"));
+    assert!(!spoken.contains("fixture-secret"));
+    fs::write(fixture.dir.join("release"), b"done").unwrap();
+    wait(|| {
+        fixture.tick();
+        !fixture.speech.control.busy()
+            && fixture.wake.control.snapshot().state
+                == jarvis_panel::wakeworker::State::WakeListening
+    });
+    fixture.settle();
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("plays")).unwrap(),
+        "played\n"
+    );
+    assert_eq!(peer.requests.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn typed_provider_failure_does_not_speak_or_disable_wake() {
+    let peer = Peer::responding("provider unavailable", 500, Duration::ZERO);
+    let mut fixture = FailureLoop::new(&peer);
+    fixture.chat.control.submit("Where was I?".into()).unwrap();
+    wait(|| {
+        fixture.tick();
+        fixture.chat.control.snapshot().state == jarvis_panel::chat::State::Failed
+            && !fixture.chat.control.busy()
+    });
+    fixture.settle();
+    assert!(!fixture.dir.join("plays").exists());
+    assert_eq!(
+        fixture.wake.control.snapshot().state,
+        jarvis_panel::wakeworker::State::WakeListening
+    );
+}
+
+#[test]
+fn cancelled_voice_request_does_not_speak_late_provider_failure() {
+    let peer = Peer::responding("late provider failure", 500, Duration::from_millis(250));
+    let mut fixture = FailureLoop::new(&peer);
+    fixture.audio.utterance("Jarvis where was I?");
+    wait(|| {
+        fixture.tick();
+        !peer.requests.lock().unwrap().is_empty()
+    });
+    fixture.chat.control.cancel();
+    wait(|| {
+        fixture.tick();
+        fixture.chat.control.snapshot().state == jarvis_panel::chat::State::Cancelled
+            && !fixture.chat.control.busy()
+    });
+    thread::sleep(Duration::from_millis(300));
+    fixture.settle();
+    assert!(!fixture.dir.join("plays").exists());
+    assert_eq!(
+        fixture.wake.control.snapshot().state,
+        jarvis_panel::wakeworker::State::WakeListening
+    );
 }

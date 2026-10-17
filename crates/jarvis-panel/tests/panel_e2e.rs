@@ -78,6 +78,14 @@ fn invalid_cli_requests_fail_without_default_collection_or_database_creation() {
             "root",
             "--db",
             "state.db",
+            "--voice-diagnostics",
+            "--voice-diagnostics",
+        ],
+        vec![
+            "--root",
+            "root",
+            "--db",
+            "state.db",
             "--smoke-test",
             "--smoke-test",
         ],
@@ -87,6 +95,7 @@ fn invalid_cli_requests_fail_without_default_collection_or_database_creation() {
             !output.status.success(),
             "invalid arguments succeeded: {args:?}"
         );
+        assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty());
         assert_eq!(
             fs::read_dir(dir.path()).unwrap().count(),
@@ -170,4 +179,62 @@ fn real_appkit_smoke_exercises_awareness_pause_resume_and_quit() {
     let store =
         jarvis::context::ContextStore::open(&dir.join("state.db"), Default::default()).unwrap();
     assert_eq!(store.search("mango", 10).unwrap().len(), 1);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "explicit short native smoke; coordinate with running app; never opens microphone"]
+fn opt_in_voice_diagnostics_flag_emits_health_without_fixture_or_configuration_contents() {
+    let dir = TempDir::new();
+    fs::create_dir(dir.join("approved")).unwrap();
+    fs::write(dir.join("approved/private.md"), "PRIVATE_FILE_SENTINEL").unwrap();
+    fs::write(
+        dir.join(".env"),
+        "CRUSOE_API_KEY=SYNTHETIC_KEY_SENTINEL\nELEVENLABS_API_KEY=SYNTHETIC_KEY_SENTINEL\n",
+    )
+    .unwrap();
+    let output = run_bounded(
+        &dir,
+        &[
+            "--root",
+            "approved",
+            "--db",
+            "state.db",
+            "--smoke-test",
+            "--voice-diagnostics",
+        ],
+        Duration::from_secs(12),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let lines: Vec<_> = stderr
+        .lines()
+        .filter(|line| line.starts_with("jarvis_voice "))
+        .collect();
+    assert!(!lines.is_empty(), "requested diagnostics were not emitted");
+    assert!(lines.len() <= 6, "diagnostics exceeded two-second cadence");
+    for line in lines {
+        for field in [
+            "state=",
+            "samples=",
+            "rms=",
+            "peak=",
+            "decodes=",
+            "wakes=",
+            "commands=",
+            "discontinuities=",
+            "capture_errors=",
+        ] {
+            assert!(line.contains(field), "missing diagnostic field {field}");
+        }
+        assert!(line.len() < 400);
+    }
+    assert!(!stderr.contains("PRIVATE_FILE_SENTINEL"));
+    assert!(!stderr.contains("SYNTHETIC_KEY_SENTINEL"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("SYNTHETIC_KEY_SENTINEL"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("\"microphone_active\":false"));
 }
