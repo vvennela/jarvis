@@ -4,7 +4,7 @@ Maintained development note, October 17, 2026. This records the project prioriti
 
 ## Next action
 
-Finish the installed-app rehearsal: reliable voice request, fresh shared context, an actual tool action, and a background result opened for review. The next checkpoint is **3:23 PM Pacific today (22:23 UTC)**, followed by two hours of product fixes requested by Vishnu.
+Finish the installed-app rehearsal: reliable voice request, fresh shared context, an actual tool action, and a background result opened for review. Current product fixes target microphone recovery and carrying a clarified request through to execution.
 
 ## Current priorities
 
@@ -15,6 +15,8 @@ Finish the installed-app rehearsal: reliable voice request, fresh shared context
 
 ## Verified now
 
+- The public page-opening flow now resolves trusted intent into the installed typed tool, with the same authorization and canonical-article verification. Live “open the page for Napoleon” passed in 3.013 seconds. “Open the Wikipedia page” → clarification → “Napoleon.” passed in 2.156 seconds, with exactly one actual browser open. These checks use typed input; human voice acceptance remains separate.
+- Microphone recovery has bounded reconnect attempts, physical-device tracking across Bluetooth format changes, and a spoken/visible notice when switching inputs. Current live capture recovered and recorded a wake plus two commands; first-attempt human reliability remains under rehearsal. Integration fixtures cover retry limits, stale audio cancellation, and exact fallback notices.
 - Nemotron Nano through Crusoe completes live native function-call/result continuation. Lightning's earlier HTTP 429 was a model quota response, not a missing API key. The configured conversation and worker model is `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`.
 - Live conversation → file-edit tool → background worker → verified review artifact → restart recovery passed in 2.098 seconds using a fictional Markdown fixture. Original content stayed unchanged. Malformed reasoning delimiters block publication.
 - Production You search → canonical Spotify identity → native playback passed in 3.276 seconds. The later full conversational tool path passed in 4.531 seconds; both checks exclude human voice.

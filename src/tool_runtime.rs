@@ -201,6 +201,29 @@ impl ToolRuntime {
         tools
     }
 
+    /// Resolve an installed article tool from trusted intent, retaining the same
+    /// execution gate and canonical-page verification as a model proposal.
+    pub async fn handle_page_intent(&self, user_request: &str) -> Option<ToolResult> {
+        self.web_opener.as_ref()?;
+        let topic = crate::request_intent::wikipedia_page_intent(user_request)?;
+        if topic.is_empty() {
+            let mut result = acknowledgment("Which page would you like me to open?");
+            result.needs_followup = true;
+            return Some(result);
+        }
+        Some(
+            self.execute(
+                user_request,
+                &ToolCall {
+                    id: "trusted-page-intent".into(),
+                    name: "open_webpage".into(),
+                    arguments: json!({"site":"wikipedia", "topic":topic}),
+                },
+            )
+            .await,
+        )
+    }
+
     /// Clear, approved app commands need neither a model nor provider keys.
     pub async fn handle_direct(&self, user_request: &str) -> Option<ToolResult> {
         let apps = self.apps.as_ref()?;

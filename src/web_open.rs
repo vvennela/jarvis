@@ -245,47 +245,9 @@ pub fn authorize_page_request(request: &str, site: &str, topic: &str) -> Result<
     {
         return Err(WebOpenError::NotAuthorized);
     }
-    let original = normalized(request.trim().trim_end_matches(['.', '!', '?']));
     let target = normalized(topic);
-    let mut request = original.as_str();
-    for _ in 0..4 {
-        let Some(rest) = [
-            "please ",
-            "can you ",
-            "could you ",
-            "would you ",
-            "i want you to ",
-        ]
-        .iter()
-        .find_map(|prefix| request.strip_prefix(prefix)) else {
-            break;
-        };
-        request = rest;
-    }
-    for _ in 0..2 {
-        let Some(rest) = [" please", " for me"]
-            .iter()
-            .find_map(|suffix| request.strip_suffix(suffix))
-        else {
-            break;
-        };
-        request = rest;
-    }
-    let matches = [
-        "open the wikipedia page for ",
-        "open the wikipedia page about ",
-        "open wikipedia page for ",
-        "open the wikipedia article about ",
-        "open the wikipedia article for ",
-        "open wikipedia for ",
-        "open wikipedia about ",
-    ]
-    .iter()
-    .any(|prefix| request.strip_prefix(prefix) == Some(target.as_str()))
-        || request
-            .strip_prefix("open ")
-            .and_then(|rest| rest.strip_suffix(" on wikipedia"))
-            == Some(target.as_str());
+    let matches = crate::request_intent::wikipedia_page_intent(request)
+        .is_some_and(|requested| !requested.is_empty() && requested == target);
     if !matches {
         return Err(WebOpenError::NotAuthorized);
     }

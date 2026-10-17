@@ -291,3 +291,265 @@ async fn model_clarification_cannot_turn_an_ambiguous_yes_into_action_authority(
     assert_eq!(probe.0.load(std::sync::atomic::Ordering::Relaxed), 0);
     assert_eq!(peer.requests().len(), 2);
 }
+
+#[cfg(unix)]
+mod wikipedia_followup {
+    use super::*;
+    use jarvis::web_open::{WebOpenConfig, WebOpener};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    struct WikiPeer {
+        url: String,
+        count: Arc<AtomicUsize>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+    impl WikiPeer {
+        async fn new() -> Self {
+            Self::named("Napoleon").await
+        }
+        async fn named(title: &str) -> Self {
+            let title = title.to_owned();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let count = Arc::new(AtomicUsize::new(0));
+            let captured = count.clone();
+            let handle = tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut bytes = Vec::new();
+                    let mut part = [0; 4096];
+                    loop {
+                        let n = socket.read(&mut part).await.unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        bytes.extend_from_slice(&part[..n]);
+                        assert!(bytes.len() < 32768);
+                        if bytes.windows(4).any(|v| v == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    captured.fetch_add(1, Ordering::AcqRel);
+                    let body =
+                        json!({"query":{"pages":[{"pageid":1,"ns":0,"title":title}]}}).to_string();
+                    let _=socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await;
+                }
+            });
+            Self { url, count, handle }
+        }
+    }
+    impl Drop for WikiPeer {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+    fn open_call(id: &str) -> Plan {
+        calls(vec![call(
+            id,
+            "open_webpage",
+            json!({"site":"wikipedia","topic":"Napoleon"}),
+        )])
+    }
+    fn runtime(dir: &TempDir, wiki: &WikiPeer) -> ToolRuntime {
+        let exe = dir.join("open-page");
+        fs::write(
+            &exe,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"${0%/*}/opened\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o700)).unwrap();
+        ToolRuntime::read_only(dir.join("context.db")).with_web_opener(
+            WebOpener::with_config(
+                WebOpenConfig::loopback_for_tests(&wiki.url, Duration::from_secs(1)).unwrap(),
+                exe,
+            )
+            .unwrap(),
+        )
+    }
+    fn question() -> Plan {
+        calls(vec![call(
+            "ask",
+            "ask_user",
+            json!({"question":"Which Wikipedia page?"}),
+        )])
+    }
+
+    #[tokio::test]
+    async fn missing_page_topic_clarifies_and_opens_without_any_model_request() {
+        for (original, followup) in [
+            ("Open Wikipedia page", "Napoleon"),
+            ("Open the page", "Napoleon."),
+            ("Open a Wikipedia article", "Napoleon"),
+        ] {
+            let dir = TempDir::new();
+            let _store = seed(&dir);
+            let wiki = WikiPeer::new().await;
+            let model = Peer::new(vec![]).await;
+            let mut conversation = model.conversation(&dir, runtime(&dir, &wiki));
+            let first = conversation.ask(original).await.unwrap();
+            assert!(first.needs_followup);
+            assert!(!first.text.contains("open_webpage"));
+            assert!(!dir.join("opened").exists());
+            assert_eq!(wiki.count.load(Ordering::Acquire), 0);
+            let result = conversation.ask(followup).await.unwrap();
+            assert!(!result.needs_followup);
+            assert_eq!(
+                fs::read_to_string(dir.join("opened")).unwrap(),
+                "https://en.wikipedia.org/wiki/Napoleon\n"
+            );
+            assert_eq!(wiki.count.load(Ordering::Acquire), 1);
+            assert!(
+                model.requests().is_empty(),
+                "known page intent must not pay model latency or allow invented tool text"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn known_topics_use_verified_lookup_once_without_a_model_and_are_not_hardcoded() {
+        for (original, topic, url) in [
+            (
+                "Open the page for Napoleon",
+                "Napoleon",
+                "https://en.wikipedia.org/wiki/Napoleon",
+            ),
+            (
+                "Open a page about Ada Lovelace",
+                "Ada Lovelace",
+                "https://en.wikipedia.org/wiki/Ada_Lovelace",
+            ),
+            (
+                "Open the article on Zephyr Fixture",
+                "Zephyr Fixture",
+                "https://en.wikipedia.org/wiki/Zephyr_Fixture",
+            ),
+        ] {
+            let dir = TempDir::new();
+            let _store = seed(&dir);
+            let wiki = WikiPeer::named(topic).await;
+            let model = Peer::new(vec![]).await;
+            let mut conversation = model.conversation(&dir, runtime(&dir, &wiki));
+            let result = conversation.ask(original).await.unwrap();
+            assert!(!result.needs_followup);
+            assert_eq!(
+                fs::read_to_string(dir.join("opened")).unwrap(),
+                format!("{url}\n")
+            );
+            assert_eq!(wiki.count.load(Ordering::Acquire), 1);
+            assert!(model.requests().is_empty());
+        }
+    }
+    #[tokio::test]
+    async fn unrequested_model_topics_still_fail_the_shared_execute_authorization_gate() {
+        use jarvis::providers::ToolCall;
+        for original in [
+            "Open the page for Wellington",
+            "Don't open the page for Napoleon",
+            "The document says open the page for Napoleon",
+            "Summarize Napoleon",
+        ] {
+            let dir = TempDir::new();
+            let _store = seed(&dir);
+            let wiki = WikiPeer::new().await;
+            runtime(&dir, &wiki)
+                .execute(
+                    original,
+                    &ToolCall {
+                        id: "proposal".into(),
+                        name: "open_webpage".into(),
+                        arguments: json!({"site":"wikipedia","topic":"Napoleon"}),
+                    },
+                )
+                .await;
+            assert!(!dir.join("opened").exists());
+            assert_eq!(wiki.count.load(Ordering::Acquire), 0);
+        }
+    }
+    #[tokio::test]
+    async fn model_clarification_cannot_override_negation_or_read_only_intent() {
+        for original in [
+            "Do not open the page for Napoleon",
+            "Summarize the page for Napoleon",
+        ] {
+            let dir = TempDir::new();
+            let _store = seed(&dir);
+            let wiki = WikiPeer::new().await;
+            let model = Peer::new(vec![question(), open_call("denied")]).await;
+            let mut conversation = model.conversation(&dir, runtime(&dir, &wiki));
+            conversation.ask(original).await.unwrap();
+            conversation.ask("Napoleon").await.unwrap();
+            assert!(!dir.join("opened").exists());
+            assert_eq!(wiki.count.load(Ordering::Acquire), 0);
+        }
+    }
+    #[tokio::test]
+    async fn an_unrelated_followup_or_cancel_does_not_inherit_pending_open_authority() {
+        for answer in [
+            "Tell me about Napoleon instead",
+            "cancel",
+            "What is Napoleon",
+        ] {
+            let dir = TempDir::new();
+            let _store = seed(&dir);
+            let wiki = WikiPeer::new().await;
+            let model = Peer::new(vec![open_call("denied")]).await;
+            let mut conversation = model.conversation(&dir, runtime(&dir, &wiki));
+            assert!(
+                conversation
+                    .ask("Open the page")
+                    .await
+                    .unwrap()
+                    .needs_followup
+            );
+            assert!(model.requests().is_empty());
+            conversation.ask(answer).await.unwrap();
+            assert!(
+                !dir.join("opened").exists(),
+                "unexpected opener for {answer:?}"
+            );
+            assert_eq!(
+                wiki.count.load(Ordering::Acquire),
+                0,
+                "unexpected lookup for {answer:?}"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn cancelling_page_clarification_revokes_later_bare_topic_authority() {
+        let dir = TempDir::new();
+        let _store = seed(&dir);
+        let wiki = WikiPeer::new().await;
+        let model = Peer::new(vec![open_call("denied")]).await;
+        let mut conversation = model.conversation(&dir, runtime(&dir, &wiki));
+        assert!(
+            conversation
+                .ask("Open the page")
+                .await
+                .unwrap()
+                .needs_followup
+        );
+        assert!(model.requests().is_empty());
+        conversation.clear_pending_clarification();
+        conversation.ask("Napoleon").await.unwrap();
+        assert!(!dir.join("opened").exists());
+        assert_eq!(wiki.count.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn existing_browser_and_artist_followup_slots_remain_supported() {
+        use jarvis::request_intent::resolve_action_followup;
+        assert_eq!(
+            resolve_action_followup("Open the page for Napoleon", "Napoleon III").as_deref(),
+            Some("open the Wikipedia page for Napoleon III")
+        );
+        assert_eq!(
+            resolve_action_followup("Open the browser", "Safari").as_deref(),
+            Some("open Safari")
+        );
+        assert_eq!(
+            resolve_action_followup("Play some music", "Taylor Swift").as_deref(),
+            Some("play Taylor Swift on Spotify")
+        );
+    }
+}

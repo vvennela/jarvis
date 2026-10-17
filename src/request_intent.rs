@@ -152,7 +152,7 @@ fn plain_name(answer: &str) -> Option<&str> {
     if answer.len() > 128 || answer.chars().any(char::is_control) {
         return None;
     }
-    let answer = answer.trim();
+    let answer = answer.trim().trim_end_matches(['.', '!', '?']).trim_end();
     if answer.is_empty()
         || answer.len() > 128
         || quoted(answer)
@@ -163,7 +163,13 @@ fn plain_name(answer: &str) -> Option<&str> {
         return None;
     }
     let lower = answer.to_ascii_lowercase();
-    if restrictive(&lower)
+    if matches!(
+        lower.as_str(),
+        "cancel" | "stop" | "wait" | "nevermind" | "never mind"
+    ) || matches!(
+        word(&lower),
+        "what" | "who" | "why" | "how" | "where" | "when" | "tell" | "explain"
+    ) || restrictive(&lower)
         || lower.split_ascii_whitespace().any(|token| {
             ACTIONS.contains(&token)
                 || matches!(
@@ -187,6 +193,79 @@ fn plain_name(answer: &str) -> Option<&str> {
     Some(answer)
 }
 
+/// Recognize a trusted request to open an article. Wikipedia is the installed
+/// article provider when the user says only "page" or "article". An empty topic
+/// is a missing slot, not an executable target.
+pub fn wikipedia_page_intent(request: &str) -> Option<String> {
+    if request.is_empty()
+        || request.len() > MAX_REQUEST
+        || request
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '"' | '`' | '$' | ';' | '|' | '<' | '>'))
+    {
+        return None;
+    }
+    let normalized = request
+        .trim()
+        .trim_end_matches(['.', '!', '?'])
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    let mut body = normalized.as_str();
+    for _ in 0..4 {
+        let Some(rest) = [
+            "please ",
+            "can you ",
+            "could you ",
+            "would you ",
+            "will you ",
+            "i want you to ",
+        ]
+        .iter()
+        .find_map(|prefix| body.strip_prefix(prefix)) else {
+            break;
+        };
+        body = rest;
+    }
+    for _ in 0..2 {
+        let Some(rest) = [" please", " for me"]
+            .iter()
+            .find_map(|suffix| body.strip_suffix(suffix))
+        else {
+            break;
+        };
+        body = rest;
+    }
+    let rest = body.strip_prefix("open ")?;
+    if let Some(topic) = rest.strip_suffix(" on wikipedia") {
+        return (!topic.is_empty()).then(|| topic.to_owned());
+    }
+    let rest = rest
+        .strip_prefix("the ")
+        .or_else(|| rest.strip_prefix("a "))
+        .unwrap_or(rest);
+    for noun in [
+        "wikipedia page",
+        "wikipedia article",
+        "wikipedia",
+        "page",
+        "article",
+    ] {
+        if rest == noun {
+            return Some(String::new());
+        }
+        if let Some(tail) = rest.strip_prefix(noun) {
+            for link in [" for ", " about ", " on "] {
+                if let Some(topic) = tail.strip_prefix(link) {
+                    return (!topic.is_empty()).then(|| topic.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Fill only a supported explicit user-request slot. A model's question cannot
 /// turn a summary or general conversation into permission to perform an action.
 pub fn resolve_action_followup(original: &str, answer: &str) -> Option<String> {
@@ -202,6 +281,15 @@ pub fn resolve_action_followup(original: &str, answer: &str) -> Option<String> {
     }
     let body = imperative(&lower);
     let answer = plain_name(answer)?;
+    if let Some(topic) = wikipedia_page_intent(original) {
+        let named = answer.to_lowercase();
+        // A missing topic can be filled; an existing topic can be repeated or
+        // narrowed ("Napoleon III"), but a bare reply cannot replace it wholesale.
+        if topic.is_empty() || named == topic || named.starts_with(&format!("{topic} ")) {
+            return Some(format!("open the Wikipedia page for {answer}"));
+        }
+        return None;
+    }
     match body {
         "open the browser" | "open a browser" | "launch the browser" | "launch a browser" => {
             // The shipped app preferences approve Safari. Execution still checks
@@ -214,9 +302,6 @@ pub fn resolve_action_followup(original: &str, answer: &str) -> Option<String> {
         | "play music"
         | "play some music on spotify"
         | "play music on spotify" => Some(format!("play {answer} on Spotify")),
-        "open wikipedia" | "open the wikipedia page" | "open a wikipedia page" => {
-            Some(format!("open the Wikipedia page for {answer}"))
-        }
         _ => None,
     }
 }
