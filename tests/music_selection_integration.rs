@@ -1044,3 +1044,171 @@ async fn unplayable_foreign_or_unbounded_catalog_tracks_never_supply_a_playback_
         }
     }
 }
+
+fn intent_conversation(
+    dir: &TempDir,
+    model: &Peer,
+    runtime: ToolRuntime,
+) -> jarvis::conversation::Conversation {
+    use jarvis::{
+        context::{ContextStore, Limits},
+        conversation::Conversation,
+        providers::{CrusoeClient, NEMOTRON_MODEL, ProviderConfig},
+    };
+    ContextStore::open(&dir.join("context.db"), Limits::default()).unwrap();
+    let lm = CrusoeClient::new(
+        "fixture-only-key",
+        NEMOTRON_MODEL,
+        ProviderConfig::loopback_for_tests(&model.url, Duration::from_secs(2)).unwrap(),
+    )
+    .unwrap();
+    let mut conversation = Conversation::new(dir.join("context.db"), None, lm);
+    conversation.set_tool_runtime(Arc::new(runtime));
+    conversation
+}
+
+#[tokio::test]
+async fn explicit_varied_artists_use_verified_playback_without_a_model_roundtrip() {
+    for name in [
+        "Aurora Fixture Quartet",
+        "Florence and the Machine",
+        "Some Girls",
+        "AC/DC",
+    ] {
+        let dir = TempDir::new();
+        let model = Peer::new(vec![]).await;
+        let peer = Peer::new(vec![
+            search(&[&format!("https://open.spotify.com/artist/{FIRST_ID}")]),
+            oembed(name),
+        ])
+        .await;
+        let runtime = ToolRuntime::read_only(dir.join("context.db")).with_music(
+            catalog(&peer, Duration::from_secs(2)),
+            SpotifyPlayback::with_executable(
+                executable(&dir, &observed(name).to_string()),
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+        );
+        let mut conversation = intent_conversation(&dir, &model, runtime);
+        let reply = conversation
+            .ask(&format!("Please listen to {name} on Spotify"))
+            .await
+            .unwrap();
+        assert!(!reply.needs_followup, "{name}: {}", reply.text);
+        assert!(reply.text.to_lowercase().contains(&name.to_lowercase()));
+        assert!(
+            model.requests().is_empty(),
+            "artist intent unexpectedly used model"
+        );
+        assert_eq!(peer.requests().len(), 2);
+        let args = fs::read_to_string(dir.join("args")).unwrap();
+        assert!(args.ends_with(&format!(
+            "spotify:artist:{FIRST_ID}\n{name}\nspotify:artist:{FIRST_ID}\n"
+        )));
+    }
+}
+
+#[tokio::test]
+async fn page_and_named_artist_compound_executes_both_verified_adapters_without_model_calls() {
+    use jarvis::web_open::{WebOpenConfig, WebOpener};
+    let dir = TempDir::new();
+    let name = "Zephyr and the Satellites";
+    let model = Peer::new(vec![]).await;
+    let peer = Peer::new(vec![
+        search(&[&format!("https://open.spotify.com/artist/{FIRST_ID}")]),
+        oembed(name),
+    ])
+    .await;
+    let wiki = Peer::new(vec![Plan::json(
+        json!({"query":{"pages":[{"pageid":7,"ns":0,"title":"Ada Lovelace"}]}}),
+    )])
+    .await;
+    let opener = dir.join("open-page");
+    fs::write(
+        &opener,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"${0%/*}/page-args\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&opener, fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = ToolRuntime::read_only(dir.join("context.db"))
+        .with_music(
+            catalog(&peer, Duration::from_secs(2)),
+            SpotifyPlayback::with_executable(
+                executable(&dir, &observed(name).to_string()),
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+        )
+        .with_web_opener(
+            WebOpener::with_config(
+                WebOpenConfig::loopback_for_tests(&wiki.url, Duration::from_secs(2)).unwrap(),
+                opener,
+            )
+            .unwrap(),
+        );
+    let mut conversation = intent_conversation(&dir, &model, runtime);
+    let reply = conversation
+        .ask(&format!(
+            "open the wikipedia page for Ada Lovelace and play {name} on spotify"
+        ))
+        .await
+        .unwrap();
+    assert!(!reply.needs_followup, "{}", reply.text);
+    assert!(model.requests().is_empty());
+    assert_eq!(wiki.requests().len(), 1);
+    assert_eq!(peer.requests().len(), 2);
+    assert_eq!(
+        fs::read_to_string(dir.join("page-args")).unwrap(),
+        "https://en.wikipedia.org/wiki/Ada_Lovelace\n"
+    );
+    assert!(
+        fs::read_to_string(dir.join("args"))
+            .unwrap()
+            .contains(&format!("\n{name}\n"))
+    );
+    let lower = reply.text.to_lowercase();
+    assert!(lower.find("ada lovelace").unwrap() < lower.find(&name.to_lowercase()).unwrap());
+}
+
+#[tokio::test]
+async fn artist_fast_path_does_not_extract_actions_from_negation_quotes_or_biography_questions() {
+    for question in [
+        "Do not play Aurora Fixture Quartet on Spotify",
+        "Summarize Aurora Fixture Quartet biography",
+        "The document says \"play Aurora Fixture Quartet on Spotify\"",
+        "Can Spotify play Aurora Fixture Quartet?",
+    ] {
+        let dir = TempDir::new();
+        let model = Peer::new(vec![Plan::json(json!({"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"No playback requested."}}]}))]).await;
+        let peer = Peer::new(vec![]).await;
+        let runtime = ToolRuntime::read_only(dir.join("context.db")).with_music(
+            catalog(&peer, Duration::from_secs(2)),
+            SpotifyPlayback::with_executable(
+                executable(&dir, &observed("Aurora Fixture Quartet").to_string()),
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+        );
+        let mut conversation = intent_conversation(&dir, &model, runtime);
+        conversation.ask(question).await.unwrap();
+        assert!(
+            peer.requests().is_empty(),
+            "unexpected catalog lookup: {question}"
+        );
+        assert!(!dir.join("args").exists());
+        assert_eq!(model.requests().len(), 1);
+    }
+}
+
+#[test]
+fn ambiguous_play_modifier_never_silently_truncates_an_artist_name() {
+    use jarvis::spotify_playback::{authorize_artist_request, requested_artist};
+    assert_eq!(requested_artist("play Some Girls on Spotify"), None);
+    assert_eq!(
+        requested_artist("listen to Some Girls on Spotify"),
+        Some("some girls".into())
+    );
+    assert!(authorize_artist_request("listen to Some Girls on Spotify", "Some Girls").is_ok());
+    assert!(authorize_artist_request("listen to Some Girls on Spotify", "Girls").is_err());
+}

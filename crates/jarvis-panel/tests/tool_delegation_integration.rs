@@ -248,7 +248,7 @@ async fn direct_approved_app_works_without_model_keys_but_quoted_or_negated_text
 }
 
 #[tokio::test]
-async fn named_artist_uses_model_catalog_and_verified_playback_instead_of_legacy_clarification() {
+async fn named_artist_uses_catalog_and_verified_playback_without_model_or_legacy_clarification() {
     use jarvis::{
         music_catalog::{CatalogConfig, MusicCatalog},
         spotify_playback::SpotifyPlayback,
@@ -297,8 +297,8 @@ async fn named_artist_uses_model_catalog_and_verified_playback_instead_of_legacy
     assert!(!dir.join("legacy-called").exists());
     assert_eq!(
         model.packets().len(),
-        1,
-        "verified action must not cause another model call"
+        0,
+        "explicit artist intent must not require a model call"
     );
     assert_eq!(discovery.packets().len(), 2);
     let args = fs::read_to_string(dir.join("artist-args")).unwrap();

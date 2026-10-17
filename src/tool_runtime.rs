@@ -201,27 +201,34 @@ impl ToolRuntime {
         tools
     }
 
-    /// Resolve an installed article tool from trusted intent, retaining the same
-    /// execution gate and canonical-page verification as a model proposal.
-    pub async fn handle_page_intent(&self, user_request: &str) -> Option<ToolResult> {
-        self.web_opener.as_ref()?;
-        let topic = crate::request_intent::wikipedia_page_intent(user_request)?;
-        if topic.is_empty() {
-            let mut result = acknowledgment("Which page would you like me to open?");
-            result.needs_followup = true;
-            return Some(result);
-        }
-        Some(
-            self.execute(
-                user_request,
-                &ToolCall {
-                    id: "trusted-page-intent".into(),
-                    name: "open_webpage".into(),
-                    arguments: json!({"site":"wikipedia", "topic":topic}),
-                },
-            )
-            .await,
-        )
+    /// Resolve installed tools from unambiguous trusted intent, retaining the
+    /// same authorization, catalog lookup, and postconditions as model proposals.
+    pub async fn handle_resolved_intent(&self, user_request: &str) -> Option<ToolResult> {
+        let proposal = if self.web_opener.is_some()
+            && let Some(topic) = crate::request_intent::wikipedia_page_intent(user_request)
+        {
+            if topic.is_empty() {
+                let mut result = acknowledgment("Which page would you like me to open?");
+                result.needs_followup = true;
+                return Some(result);
+            }
+            ToolCall {
+                id: "trusted-page-intent".into(),
+                name: "open_webpage".into(),
+                arguments: json!({"site":"wikipedia", "topic":topic}),
+            }
+        } else if self.music.is_some()
+            && let Some(artist) = crate::spotify_playback::requested_artist(user_request)
+        {
+            ToolCall {
+                id: "trusted-artist-intent".into(),
+                name: "spotify_play_artist".into(),
+                arguments: json!({"artist":artist}),
+            }
+        } else {
+            return None;
+        };
+        Some(self.execute(user_request, &proposal).await)
     }
 
     /// Clear, approved app commands need neither a model nor provider keys.

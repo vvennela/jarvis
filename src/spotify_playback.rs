@@ -49,22 +49,16 @@ fn normalized(value: &str) -> String {
         .to_lowercase()
 }
 
-/// Original utterance authority is checked independently of catalog/model data.
-/// The artist is a variable target, never a built-in name or guessed ID.
-pub fn authorize_artist_request(request: &str, artist_name: &str) -> Result<(), PlaybackError> {
+fn artist_candidates(request: &str) -> Option<Vec<String>> {
     if request.is_empty()
         || request.len() > 8192
-        || artist_name.trim().is_empty()
-        || artist_name.len() > 256
         || request
             .chars()
-            .any(|c| c.is_control() || matches!(c, '"' | '`' | '$' | ';'))
-        || artist_name.chars().any(char::is_control)
+            .any(|c| c.is_control() || matches!(c, '"' | '`' | '$' | ';' | '“' | '”'))
     {
-        return Err(PlaybackError::NotAuthorized);
+        return None;
     }
     let original = normalized(request.trim().trim_end_matches(['.', '!', '?']));
-    let target = normalized(artist_name);
     let mut request = original.as_str();
     for _ in 0..4 {
         let Some(rest) = [
@@ -103,7 +97,7 @@ pub fn authorize_artist_request(request: &str, artist_name: &str) -> Result<(), 
         .strip_prefix("open spotify and ")
         .or_else(|| request.strip_prefix("launch spotify and "))
         .unwrap_or(request);
-    let matches_artist = [
+    let candidates: Vec<String> = [
         "play music by ",
         "play songs by ",
         "play something by ",
@@ -114,8 +108,95 @@ pub fn authorize_artist_request(request: &str, artist_name: &str) -> Result<(), 
         "put on ",
     ]
     .iter()
-    .any(|prefix| request.strip_prefix(prefix) == Some(target.as_str()));
-    if !matches_artist {
+    .filter_map(|prefix| request.strip_prefix(prefix))
+    .filter(|target| valid_artist_target(target))
+    .map(str::to_owned)
+    .collect();
+    (!candidates.is_empty()).then_some(candidates)
+}
+fn valid_artist_target(target: &str) -> bool {
+    if target.is_empty()
+        || target.len() > 256
+        || target.starts_with('\'')
+        || target.ends_with('\'')
+        || matches!(
+            target,
+            "music"
+                | "some music"
+                | "a song"
+                | "some songs"
+                | "songs"
+                | "song"
+                | "something"
+                | "anything"
+                | "whatever"
+                | "current selection"
+                | "the current selection"
+                | "this"
+                | "that"
+                | "it"
+                | "my music"
+                | "the music"
+                | "a track"
+                | "track"
+        )
+        || target.split_whitespace().any(|word| {
+            matches!(
+                word,
+                "if" | "unless" | "when" | "then" | "not" | "never" | "don't" | "dont"
+            )
+        })
+    {
+        return false;
+    }
+    for separator in [" and ", " or "] {
+        if target.split(separator).skip(1).any(|tail| {
+            let tail = tail.strip_prefix("please ").unwrap_or(tail);
+            matches!(
+                tail.split_whitespace().next(),
+                Some(
+                    "open"
+                        | "launch"
+                        | "play"
+                        | "pause"
+                        | "send"
+                        | "delete"
+                        | "pay"
+                        | "purchase"
+                        | "run"
+                        | "execute"
+                        | "write"
+                        | "create"
+                        | "ignore"
+                )
+            )
+        }) {
+            return false;
+        }
+    }
+    true
+}
+
+/// A clear artist target from the original user's playback request. Modifier
+/// forms with multiple exact interpretations remain for catalog/model planning;
+/// never truncate an artist name such as "Some Girls" to "Girls".
+pub fn requested_artist(request: &str) -> Option<String> {
+    let mut candidates = artist_candidates(request)?;
+    (candidates.len() == 1).then(|| candidates.remove(0))
+}
+
+/// Original utterance authority is independent of catalog/model data. Compare
+/// complete parsed targets; a modifier can itself be part of an artist's name.
+pub fn authorize_artist_request(request: &str, artist_name: &str) -> Result<(), PlaybackError> {
+    if artist_name.trim().is_empty()
+        || artist_name.len() > 256
+        || artist_name.chars().any(char::is_control)
+    {
+        return Err(PlaybackError::NotAuthorized);
+    }
+    let target = normalized(artist_name);
+    let candidates = artist_candidates(request).ok_or(PlaybackError::NotAuthorized)?;
+    if !candidates.iter().any(|candidate| candidate == &target) {
         return Err(PlaybackError::NotAuthorized);
     }
     Ok(())

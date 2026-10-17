@@ -304,7 +304,7 @@ impl Conversation {
         input: &str,
         runtime: Arc<ToolRuntime>,
     ) -> Result<ToolReply, ConversationError> {
-        if let Some(result) = runtime.handle_page_intent(question).await {
+        if let Some(result) = runtime.handle_resolved_intent(question).await {
             return Ok(ToolReply {
                 text: result
                     .acknowledgment

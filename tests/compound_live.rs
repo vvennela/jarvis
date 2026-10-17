@@ -71,7 +71,7 @@ async fn real_model_opens_requested_article_and_plays_requested_artist() {
     let started = Instant::now();
     let reply = tokio::time::timeout(
         Duration::from_secs(60),
-        conversation.ask("open the wikipedia page for napoleon and play some taylor swift"),
+        conversation.ask("open the wikipedia page for napoleon and play taylor swift on spotify"),
     )
     .await
     .expect("compound request exceeded deadline")
