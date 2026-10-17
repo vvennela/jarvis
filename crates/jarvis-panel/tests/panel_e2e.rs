@@ -168,6 +168,9 @@ fn real_appkit_smoke_exercises_awareness_pause_resume_and_quit() {
         "\"menu_toggle_revealed\":true",
         "\"review_initially_disabled\":true",
         "\"task_worker_stopped\":true",
+        "\"spinner_indeterminate\":true",
+        "\"spinner_busy_visible\":true",
+        "\"spinner_idle_hidden\":true",
     ] {
         assert!(
             stdout.contains(field),

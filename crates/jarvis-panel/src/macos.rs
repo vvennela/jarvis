@@ -19,9 +19,9 @@ use objc2::{
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSColor,
     NSEventMask, NSFloatingWindowLevel, NSFont, NSGlassEffectView, NSGlassEffectViewStyle, NSImage,
-    NSPanel, NSScreen, NSScrollView, NSStatusBar, NSTextField, NSTextView, NSView,
-    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
-    NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSPanel, NSProgressIndicator, NSProgressIndicatorStyle, NSScreen, NSScrollView, NSStatusBar,
+    NSTextField, NSTextView, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
+    NSVisualEffectState, NSVisualEffectView, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSDate, NSDefaultRunLoopMode, NSObject, NSObjectProtocol, NSPoint, NSRect,
@@ -438,6 +438,19 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     preview.setTextColor(Some(&NSColor::secondaryLabelColor()));
     let activity = label(mtm, "●", rect(18.0, 84.0, 12.0, 18.0), 9.0);
     activity.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    let spinner = NSProgressIndicator::initWithFrame(
+        NSProgressIndicator::alloc(mtm),
+        rect(16.0, 86.0, 16.0, 16.0),
+    );
+    spinner.setStyle(NSProgressIndicatorStyle::Spinning);
+    spinner.setIndeterminate(true);
+    spinner.setDisplayedWhenStopped(false);
+    spinner.setHidden(true);
+    let spinner_indeterminate =
+        spinner.isIndeterminate() && spinner.style() == NSProgressIndicatorStyle::Spinning;
+    let mut spinner_active = false;
+    let mut spinner_busy_visible = false;
+    let mut spinner_idle_hidden = false;
     // SAFETY: Target owns this exact single-object selector for the entire UI loop.
     let dismiss_button = unsafe {
         NSButton::buttonWithTitle_target_action(
@@ -455,6 +468,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     )));
     header.addSubview(&dismiss_button);
     header.addSubview(&activity);
+    header.addSubview(&spinner);
     header.addSubview(&title);
     header.addSubview(&detail);
     header.addSubview(&preview);
@@ -662,6 +676,43 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             interaction_revealed = true;
         }
         let voice_snapshot = voice.control.snapshot();
+        let working = conversation.control.busy()
+            || tasks.control.busy()
+            || speech.control.busy()
+            || speech.control.snapshot().state == speech::State::Starting
+            || matches!(
+                voice_snapshot.state,
+                wakeworker::State::Loading
+                    | wakeworker::State::Starting
+                    | wakeworker::State::Decoding
+                    | wakeworker::State::CommandReady
+                    | wakeworker::State::CommandListening
+                    | wakeworker::State::Suppressed
+            )
+            || (options.smoke_test && smoke_phase == 1);
+        if working != spinner_active {
+            // SAFETY: Native animation receives nil sender and stays owned by
+            // this retained main-thread AppKit view throughout the event loop.
+            unsafe {
+                if working {
+                    spinner.startAnimation(None);
+                } else {
+                    spinner.stopAnimation(None);
+                }
+            }
+            spinner.setHidden(!working);
+            activity.setHidden(working);
+            spinner_active = working;
+        }
+        if options.smoke_test {
+            if spinner_active && panel.isVisible() && !spinner.isHidden() && activity.isHidden() {
+                spinner_busy_visible = true;
+            }
+            if spinner_busy_visible && !spinner_active && spinner.isHidden() && !activity.isHidden()
+            {
+                spinner_idle_hidden = true;
+            }
+        }
         // An explicit, bounded two-minute diagnostic session, never ambient text.
         if options.voice_diagnostics
             && started.elapsed() < Duration::from_secs(120)
@@ -898,6 +949,10 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             application.updateWindows();
         });
     }
+    // SAFETY: The retained native indicator is still alive on the main thread.
+    unsafe {
+        spinner.stopAnimation(None);
+    }
     panel.orderOut(None);
     status_bar.removeStatusItem(&status_item);
     worker.join()?;
@@ -909,7 +964,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     let task_worker_stopped = tasks.is_finished();
     if options.smoke_test {
         println!(
-            "{{\"panel_created\":true,\"active_observed\":{active_observed},\"paused_observed\":{paused_observed},\"resumed_observed\":{resumed_observed},\"microphone_active\":false,\"compact_width\":{compact_width},\"compact_height\":{compact_height},\"expanded_observed\":{expanded_observed},\"collapsed_observed\":{collapsed_observed},\"translucent\":{translucent},\"native_glass\":{native_glass},\"nonactivating\":{nonactivating},\"initial_hidden\":{initial_hidden},\"menu_bar_present\":{menu_bar_present},\"wake_revealed\":{wake_revealed},\"dismissed_hidden\":{dismissed_hidden},\"workers_alive_after_dismiss\":{workers_alive_after_dismiss},\"voice_unchanged_after_dismiss\":{voice_unchanged_after_dismiss},\"menu_toggle_revealed\":{menu_toggle_revealed},\"review_initially_disabled\":{review_initially_disabled},\"task_worker_stopped\":{task_worker_stopped}}}"
+            "{{\"panel_created\":true,\"active_observed\":{active_observed},\"paused_observed\":{paused_observed},\"resumed_observed\":{resumed_observed},\"microphone_active\":false,\"compact_width\":{compact_width},\"compact_height\":{compact_height},\"expanded_observed\":{expanded_observed},\"collapsed_observed\":{collapsed_observed},\"translucent\":{translucent},\"native_glass\":{native_glass},\"nonactivating\":{nonactivating},\"initial_hidden\":{initial_hidden},\"menu_bar_present\":{menu_bar_present},\"wake_revealed\":{wake_revealed},\"dismissed_hidden\":{dismissed_hidden},\"workers_alive_after_dismiss\":{workers_alive_after_dismiss},\"voice_unchanged_after_dismiss\":{voice_unchanged_after_dismiss},\"menu_toggle_revealed\":{menu_toggle_revealed},\"review_initially_disabled\":{review_initially_disabled},\"task_worker_stopped\":{task_worker_stopped},\"spinner_indeterminate\":{spinner_indeterminate},\"spinner_busy_visible\":{spinner_busy_visible},\"spinner_idle_hidden\":{spinner_idle_hidden}}}"
         );
         if had_error
             || !active_observed
@@ -926,6 +981,9 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             || !menu_toggle_revealed
             || !review_initially_disabled
             || !task_worker_stopped
+            || !spinner_indeterminate
+            || !spinner_busy_visible
+            || !spinner_idle_hidden
         {
             return Err("Panel smoke test did not complete its observer lifecycle");
         }
