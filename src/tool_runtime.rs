@@ -140,10 +140,10 @@ impl ToolRuntime {
             }
             "open_application" => {
                 let Ok(args) = serde_json::from_value::<AppArgs>(call.arguments.clone()) else {
-                    return acknowledgment("I need the name of an approved app to open.");
+                    return acknowledgment("Which app should I open?");
                 };
                 let Some(apps) = &self.apps else {
-                    return acknowledgment("App controls aren't available in this session.");
+                    return acknowledgment("I can't open apps from here just yet.");
                 };
                 match apps.open_application(user_request, &args.app).await {
                     Ok(result) => acknowledgment(&result.text),
@@ -152,32 +152,28 @@ impl ToolRuntime {
             }
             "spotify_control" => {
                 let Ok(args) = serde_json::from_value::<SpotifyArgs>(call.arguments.clone()) else {
-                    return acknowledgment("Please specify play or pause for Spotify.");
+                    return acknowledgment("Should I play your music or pause it?");
                 };
                 let action = match args.action.as_str() {
                     "play" => Action::PlaySpotify,
                     "pause" => Action::PauseSpotify,
-                    _ => return acknowledgment("Please specify play or pause for Spotify."),
+                    _ => return acknowledgment("Should I play your music or pause it?"),
                 };
                 let Some(actions) = &self.actions else {
-                    return acknowledgment("Spotify controls aren't available in this session.");
+                    return acknowledgment("Spotify isn't connected to this window yet.");
                 };
                 match actions.execute(user_request, action).await {
                     Ok(result) => acknowledgment(&result.text),
-                    Err(err) => acknowledgment(&err.to_string()),
+                    Err(err) => acknowledgment(&crate::actions::friendly_error(user_request, &err)),
                 }
             }
             "delegate_draft" => {
                 let started = Instant::now();
                 if call.arguments != json!({}) || !explicit_draft_request(user_request) {
-                    return acknowledgment(
-                        "Tell me what you'd like me to write, and I'll prepare a draft for your review.",
-                    );
+                    return acknowledgment("What would you like me to write?");
                 }
                 let Some(drafts) = &self.drafts else {
-                    return acknowledgment(
-                        "The background writing worker isn't available in this session.",
-                    );
+                    return acknowledgment("I can't start a background draft just now.");
                 };
                 if gate(
                     Operation::DraftMessage,
@@ -186,17 +182,15 @@ impl ToolRuntime {
                     1000,
                 ) != GateDecision::Allow
                 {
-                    return acknowledgment(
-                        "That request expired before I could start the draft. Please try again.",
-                    );
+                    return acknowledgment("That draft didn't start in time. Try me again.");
                 }
                 match drafts.submit(user_request) {
-                    Ok(()) => acknowledgment(
-                        "I'm working on that in the background. I'll leave the finished draft ready for your review.",
-                    ),
+                    Ok(()) => {
+                        acknowledgment("I'm on it. I'll leave the draft ready for your review.")
+                    }
                     // Host error details may contain paths or private content.
                     Err(_) => acknowledgment(
-                        "The writing worker is busy or unavailable. Your current work is unchanged.",
+                        "I couldn't start that draft just now. Let's try again in a moment.",
                     ),
                 }
             }

@@ -251,7 +251,7 @@ impl ConversationWorker {
                                     // Tool failures have static, actionable text. They
                                     // are never provider errors and are never retried.
                                     return Ok(Reply {
-                                        text: result.map(|result| result.text).unwrap_or_else(|error| error.to_string()),
+                                        text: result.map(|result| result.text).unwrap_or_else(|error| jarvis::actions::friendly_error(&request.question, &error)),
                                         routing_degraded: false,
                                     });
                                 }

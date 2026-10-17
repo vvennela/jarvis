@@ -35,17 +35,73 @@ pub enum ActionError {
 impl fmt::Display for ActionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::InvalidConfiguration => "Spotify controls need a valid local adapter.",
-            Self::NotAuthorized | Self::Clarification => "Please ask me to open Spotify, play music on Spotify, or pause Spotify. For a specific song, select it in Spotify first.",
-            Self::PermissionDenied => "Allow Jarvis to control Spotify in System Settings, Privacy & Security, Automation, then try again.",
-            Self::Unavailable => "Install or open the Spotify desktop app, then try again.",
-            Self::Timeout => "Spotify took too long to respond. Check Spotify before trying again.",
-            Self::Verification => "I couldn't verify Spotify's state. Check Spotify before trying again.",
-            Self::NoSelection => "Spotify is open, but playback didn't start. Select a track in Spotify, then ask me to play.",
+            Self::InvalidConfiguration => "Spotify controls need a quick setup fix.",
+            Self::NotAuthorized | Self::Clarification => "Do you want me to open Spotify, resume it, or pause it?",
+            Self::PermissionDenied => "I need permission to control Spotify. Enable Jarvis under System Settings, Privacy & Security, Automation.",
+            Self::Unavailable => "I couldn't reach the Spotify desktop app. Is it installed?",
+            Self::Timeout => "Spotify isn't responding yet. I couldn't confirm the change.",
+            Self::Verification => "I couldn't confirm Spotify's playback state.",
+            Self::NoSelection => "Spotify's open, but nothing started playing. It may need a track selected first.",
         })
     }
 }
 impl std::error::Error for ActionError {}
+
+/// Request-aware copy is for the user only, never an executable proposal. A
+/// named selection must not silently become resume-current-selection.
+pub fn friendly_error(request: &str, error: &ActionError) -> String {
+    if matches!(
+        error,
+        ActionError::NotAuthorized | ActionError::Clarification
+    ) && let Some(selection) = named_selection(request)
+    {
+        return format!("I can resume Spotify, but I can't pick {selection} yet.");
+    }
+    error.to_string()
+}
+
+fn named_selection(request: &str) -> Option<String> {
+    let normalized = normalize(request)?;
+    let normalized = normalized
+        .strip_suffix(" in the background")
+        .unwrap_or(&normalized);
+    let selection = normalized.strip_prefix("play ")?;
+    let selection = selection
+        .strip_suffix(" on spotify")
+        .or_else(|| selection.strip_suffix(" in spotify"))
+        .or_else(|| selection.strip_suffix(" using spotify"))?;
+    if selection.is_empty()
+        || selection.len() > 80
+        || matches!(selection, "music" | "some music" | "my music" | "playback")
+        || !selection
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '/' | '&'))
+        || selection.split_whitespace().any(|word| {
+            matches!(
+                word,
+                "and"
+                    | "then"
+                    | "send"
+                    | "pay"
+                    | "delete"
+                    | "not"
+                    | "never"
+                    | "open"
+                    | "launch"
+                    | "resume"
+                    | "pause"
+                    | "stop"
+            )
+        })
+    {
+        return None;
+    }
+    // ASCII case normalization preserves byte offsets, including Unicode names.
+    let original = request.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lower = original.to_ascii_lowercase();
+    let start = lower.find("play ")? + "play ".len();
+    Some(original[start..start + selection.len()].to_owned())
+}
 
 fn normalize(request: &str) -> Option<String> {
     if request.is_empty() || request.len() > 8192 || request.chars().any(char::is_control) {
@@ -59,6 +115,7 @@ fn normalize(request: &str) -> Option<String> {
     let request = request
         .strip_prefix("can you ")
         .or_else(|| request.strip_prefix("could you "))
+        .or_else(|| request.strip_prefix("would you "))
         .unwrap_or(request);
     let request = request.strip_prefix("please ").unwrap_or(request);
     let request = request.strip_suffix(" please").unwrap_or(request);
@@ -68,16 +125,42 @@ fn normalize(request: &str) -> Option<String> {
 /// The fast path recognizes complete requests, never substrings in documents,
 /// explanations, negations, named-song requests, or chains of commands.
 pub fn recognize(request: &str) -> Option<Action> {
-    match normalize(request)?.as_str() {
-        "open spotify" | "launch spotify" | "start spotify" => Some(Action::OpenSpotify),
+    let normalized = normalize(request)?;
+    let playback = normalized
+        .strip_suffix(" in the background")
+        .unwrap_or(&normalized);
+    if [
+        "open spotify and ",
+        "launch spotify and ",
+        "start spotify and ",
+    ]
+    .iter()
+    .filter_map(|prefix| playback.strip_prefix(prefix))
+    .any(|tail| {
+        matches!(
+            tail,
+            "play"
+                | "play music"
+                | "play some music"
+                | "resume"
+                | "resume music"
+                | "resume playback"
+        )
+    }) || matches!(
+        playback,
         "play spotify"
-        | "resume spotify"
-        | "play music on spotify"
-        | "play some music on spotify"
-        | "play music in spotify"
-        | "resume music on spotify"
-        | "resume playback on spotify"
-        | "start playing music on spotify" => Some(Action::PlaySpotify),
+            | "resume spotify"
+            | "play music on spotify"
+            | "play some music on spotify"
+            | "play music in spotify"
+            | "resume music on spotify"
+            | "resume playback on spotify"
+            | "start playing music on spotify"
+    ) {
+        return Some(Action::PlaySpotify);
+    }
+    match normalized.as_str() {
+        "open spotify" | "launch spotify" | "start spotify" => Some(Action::OpenSpotify),
         "pause spotify"
         | "pause music on spotify"
         | "pause playback on spotify"
@@ -135,6 +218,13 @@ pub fn is_action_request(request: &str) -> bool {
 /// The only admitted app is the fixed Spotify bundle ID. A planner may select
 /// an action but cannot broaden the user's scope or the native tool catalog.
 pub fn gate_proposal(request: &str, action: Action) -> Result<(), ActionError> {
+    if let Some(authorized) = recognize(request) {
+        return if action == authorized {
+            Ok(())
+        } else {
+            Err(ActionError::NotAuthorized)
+        };
+    }
     let request = normalize(request).ok_or(ActionError::NotAuthorized)?;
     let words: Vec<_> = request.split_whitespace().collect();
     if !request_phrase(&request)
@@ -331,9 +421,9 @@ impl ActionExecutor {
             .map_err(|_| ActionError::Verification)?
             .trim();
         let text = match (action, output) {
-            (Action::OpenSpotify, "verified:running") => "Spotify is open.",
-            (Action::PlaySpotify, "verified:playing") => "Spotify is playing.",
-            (Action::PauseSpotify, "verified:paused") => "Spotify is paused.",
+            (Action::OpenSpotify, "verified:running") => "Spotify's open.",
+            (Action::PlaySpotify, "verified:playing") => "On it—Spotify's playing.",
+            (Action::PauseSpotify, "verified:paused") => "Paused.",
             (Action::PauseSpotify, "verified:stopped" | "not_running") => "Spotify isn't playing.",
             (_, "permission_denied") => return Err(ActionError::PermissionDenied),
             (_, "unavailable") => return Err(ActionError::Unavailable),

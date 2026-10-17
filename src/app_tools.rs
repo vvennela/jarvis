@@ -206,13 +206,19 @@ pub enum AppError {
 impl fmt::Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::Preferences => "Check Jarvis's app preferences before opening apps.",
-            Self::NotAllowed => "That app isn't in your approved app list.",
-            Self::Clarification => "Tell me which approved app you'd like me to open.",
-            Self::PermissionDenied => "Allow Jarvis to control this app in System Settings, Privacy & Security, Automation, then try again.",
-            Self::Unavailable => "That app isn't available. Check that it's installed on this Mac.",
-            Self::Timeout => "The app took too long to respond. Check it before trying again.",
-            Self::Verification => "I couldn't verify that the app opened. Check it before trying again.",
+            Self::Preferences => {
+                "I couldn't read your app preferences. Check Jarvis's approved app list."
+            }
+            Self::NotAllowed => {
+                "That app isn't approved yet. Add it to Jarvis's app preferences first."
+            }
+            Self::Clarification => "Which app would you like me to open?",
+            Self::PermissionDenied => {
+                "macOS needs your permission. Enable Jarvis under Privacy & Security, Automation."
+            }
+            Self::Unavailable => "I couldn't reach that app. Is it installed on this Mac?",
+            Self::Timeout => "I didn't get a response in time. Did the app open?",
+            Self::Verification => "I couldn't confirm it opened. Is it on your screen?",
         })
     }
 }

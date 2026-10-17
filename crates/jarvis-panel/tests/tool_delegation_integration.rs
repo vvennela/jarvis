@@ -158,7 +158,12 @@ async fn model_tool_call_enqueues_real_draft_once_and_chat_continues_before_revi
     let request = "Draft a Beacon handoff for Brian, ready for my review";
     chat.control.submit(request.into()).unwrap();
     wait(|| !chat.control.busy()).await;
-    assert!(chat.control.snapshot().text.contains("background"));
+    let acknowledgment = chat.control.snapshot().text;
+    assert!(acknowledgment.contains("review"));
+    assert!(
+        !acknowledgment.contains("I finished") && !acknowledgment.contains("is ready"),
+        "queue acknowledgment claimed a completed artifact"
+    );
     assert_eq!(model.packets().len(), 1);
     chat.control
         .submit("What did we just start?".into())

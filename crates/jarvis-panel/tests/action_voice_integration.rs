@@ -91,43 +91,66 @@ fn stop(chat: &mut ConversationWorker) {
 }
 #[test]
 fn spoken_spotify_request_executes_and_speaks_verified_result_without_any_model() {
-    let dir = TempDir::new();
-    assert!(dir.path().is_dir());
-    let mut chat = no_provider_worker(
-        &dir,
-        "printf '%s\\n' \"$@\" > \"$fixture_dir/action-args\"\nprintf 'verified:running\\n'",
-    );
-    let mut speech = speaker(&dir);
-    wait(|| chat.control.available() && speech.control.available());
-    let mut wake = wake("Jarvis open Spotify");
-    let mut handoff = VoiceHandoff::new();
-    wait(|| {
-        handoff.tick(&wake.control, &chat.control, &speech.control);
-        dir.join("plays").exists() && !speech.control.busy()
-    });
-    assert_eq!(chat.control.snapshot().state, State::Reply);
-    assert_eq!(
-        fs::read_to_string(dir.join("spoken")).unwrap(),
-        chat.control.snapshot().text
-    );
-    assert!(chat.control.snapshot().text.contains("Spotify"));
-    assert!(
-        fs::read_to_string(dir.join("action-args"))
-            .unwrap()
-            .starts_with("-e\n")
-    );
-    for _ in 0..20 {
-        handoff.tick(&wake.control, &chat.control, &speech.control);
-        thread::sleep(Duration::from_millis(2));
+    for (utterance, postcondition, expected) in [
+        ("Jarvis open Spotify", "verified:running", "open"),
+        (
+            "Jarvis can you open Spotify and play some music",
+            "verified:playing",
+            "playing",
+        ),
+        (
+            "Jarvis open Spotify and play in the background",
+            "verified:playing",
+            "playing",
+        ),
+    ] {
+        let dir = TempDir::new();
+        assert!(dir.path().is_dir());
+        let mut chat = no_provider_worker(
+            &dir,
+            &format!(
+                "printf '%s\\n' \"$@\" > \"$fixture_dir/action-args\"\nprintf '{postcondition}\\n'"
+            ),
+        );
+        let mut speech = speaker(&dir);
+        wait(|| chat.control.available() && speech.control.available());
+        let mut wake = wake(utterance);
+        let mut handoff = VoiceHandoff::new();
+        wait(|| {
+            handoff.tick(&wake.control, &chat.control, &speech.control);
+            dir.join("plays").exists() && !speech.control.busy()
+        });
+        assert_eq!(chat.control.snapshot().state, State::Reply);
+        assert_eq!(
+            fs::read_to_string(dir.join("spoken")).unwrap(),
+            chat.control.snapshot().text
+        );
+        assert!(
+            chat.control
+                .snapshot()
+                .text
+                .to_lowercase()
+                .contains(expected)
+        );
+        assert!(chat.control.snapshot().text.split_whitespace().count() <= 12);
+        assert!(
+            fs::read_to_string(dir.join("action-args"))
+                .unwrap()
+                .starts_with("-e\n")
+        );
+        for _ in 0..20 {
+            handoff.tick(&wake.control, &chat.control, &speech.control);
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(fs::read_to_string(dir.join("plays")).unwrap(), "played\n");
+        wake.control.shutdown();
+        wait(|| wake.is_finished());
+        wake.join().unwrap();
+        speech.control.shutdown();
+        wait(|| speech.is_finished());
+        speech.join().unwrap();
+        stop(&mut chat);
     }
-    assert_eq!(fs::read_to_string(dir.join("plays")).unwrap(), "played\n");
-    wake.control.shutdown();
-    wait(|| wake.is_finished());
-    wake.join().unwrap();
-    speech.control.shutdown();
-    wait(|| speech.is_finished());
-    speech.join().unwrap();
-    stop(&mut chat);
 }
 #[test]
 fn cancellation_of_action_drops_owned_process_without_publishing_late_success() {
@@ -163,24 +186,30 @@ fn cancellation_of_action_drops_owned_process_without_publishing_late_success() 
 }
 #[test]
 fn ambiguous_spotify_request_asks_for_clarification_without_native_execution() {
-    let dir = TempDir::new();
-    let mut chat = no_provider_worker(
-        &dir,
-        "printf 'invoked' > \"$fixture_dir/executed\"\nprintf 'verified:playing\\n'",
-    );
-    wait(|| chat.control.available());
-    chat.control
-        .submit("play a song on Spotify".into())
-        .unwrap();
-    wait(|| !chat.control.busy());
-    let result = chat.control.snapshot();
-    assert_eq!(result.state, State::Reply);
-    assert!(
-        result.text.to_ascii_lowercase().contains("select"),
-        "ambiguous request should clarify the missing selection rather than claim playback"
-    );
-    assert!(!dir.join("executed").exists());
-    stop(&mut chat);
+    for (request, selection) in [
+        ("play a song on Spotify", "a song"),
+        ("play Metallica on Spotify", "Metallica"),
+    ] {
+        let dir = TempDir::new();
+        let mut chat = no_provider_worker(
+            &dir,
+            "printf 'invoked' > \"$fixture_dir/executed\"\nprintf 'verified:playing\\n'",
+        );
+        wait(|| chat.control.available());
+        chat.control.submit(request.into()).unwrap();
+        wait(|| !chat.control.busy());
+        let result = chat.control.snapshot();
+        assert_eq!(result.state, State::Reply);
+        assert!(
+            result.text.contains("can't pick") && result.text.contains(selection),
+            "unsupported selection should be explained honestly: {}",
+            result.text
+        );
+        assert!(!result.text.contains("playing"));
+        assert!(result.text.split_whitespace().count() <= 20);
+        assert!(!dir.join("executed").exists());
+        stop(&mut chat);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -351,7 +380,7 @@ async fn only_verified_action_results_reach_followup_conversation_history() {
             assert_eq!(history[0]["user"], "open Spotify");
             let text = history[0]["assistant"].as_str().unwrap();
             assert!(text.contains("Verified app action result at that time"));
-            assert!(text.contains("Spotify is open"));
+            assert!(text.contains("Spotify's open"));
         } else {
             assert!(
                 history.is_empty(),

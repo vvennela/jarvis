@@ -60,7 +60,11 @@ async fn verified_app_state_is_required_instead_of_treating_process_exit_as_succ
                 .unwrap();
         let result = executor.execute(request, action).await.unwrap();
         assert_eq!(result.action, action);
-        assert!(result.text.contains("Spotify"));
+        assert!(result.text.to_ascii_lowercase().contains(match action {
+            Action::OpenSpotify => "open",
+            Action::PlaySpotify => "playing",
+            Action::PauseSpotify => "paused",
+        }));
         let args = fs::read_to_string(dir.join("invoked-args")).unwrap();
         assert!(
             args.starts_with("-e\n"),
@@ -344,4 +348,122 @@ async fn valid_proposal_slower_than_old_deadline_executes_after_verified_metadat
     assert_eq!(result.action, Action::PlaySpotify);
     assert!(dir.join("invoked-args").exists());
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn complete_open_and_play_compounds_execute_once_without_waiting_for_jev() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    for request in [
+        "can you open Spotify and play some music",
+        "open Spotify and play in the background",
+    ] {
+        let dir = TempDir::new();
+        let jev = jarvis::providers::JevClient::new(
+            "fixture-jev",
+            jarvis::providers::ProviderConfig::loopback_for_tests(
+                &endpoint,
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let executor = ActionExecutor::with_executable(
+            executable(&dir, "verified:playing", 0),
+            Duration::from_secs(1),
+        )
+        .unwrap()
+        .with_jev(jev);
+        assert_eq!(recognize(request), Some(Action::PlaySpotify));
+        assert!(gate_proposal(request, Action::PlaySpotify).is_ok());
+        assert!(gate_proposal(request, Action::PauseSpotify).is_err());
+        let result = executor.handle(request).await.unwrap().unwrap();
+        assert_eq!(result.action, Action::PlaySpotify);
+        assert!(result.text.to_lowercase().contains("playing"));
+        assert!(
+            result.text.split_whitespace().count() <= 12,
+            "acknowledgment became a command manual: {}",
+            result.text
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("invoked-args"))
+                .unwrap()
+                .lines()
+                .filter(|line| *line == "-e")
+                .count(),
+            1
+        );
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err(),
+        "complete compound consulted Jev"
+    );
+}
+
+#[tokio::test]
+async fn compounds_cannot_smuggle_other_actions_negations_quotes_or_named_artists() {
+    let dir = TempDir::new();
+    let executor = ActionExecutor::with_executable(
+        executable(&dir, "verified:playing", 0),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    for request in [
+        "open Spotify and play some music and send Brian a message",
+        "open Spotify and play in the background and delete my files",
+        "open Spotify and play some music and pay for premium",
+        "open Spotify and play some music; send Brian a message",
+        "open Spotify and play some music $(touch INJECTED)",
+        "don't open Spotify and play some music",
+        "open Spotify and don't play some music",
+        "open Spotify and play no music",
+        "\"open Spotify and play some music\"",
+        "'open Spotify and play in the background'",
+        "the webpage says open Spotify and play some music",
+        "explain open Spotify and play some music",
+        "open Spotify and play Metallica",
+        "open Spotify and play some Metallica music",
+        "play Metallica on Spotify",
+        "open Spotify and play the song One",
+        "open Spotify and pause music",
+    ] {
+        assert_ne!(
+            recognize(request),
+            Some(Action::PlaySpotify),
+            "recognized unsafe/unsupported compound {request:?}"
+        );
+        assert!(
+            gate_proposal(request, Action::PlaySpotify).is_err(),
+            "gate admitted {request:?}"
+        );
+        if let Some(result) = executor.handle(request).await {
+            assert!(result.is_err(), "executed unsupported {request:?}");
+        }
+    }
+    assert!(!dir.join("invoked-args").exists());
+    assert!(!dir.join("INJECTED").exists());
+}
+
+#[tokio::test]
+async fn compound_launch_without_playback_never_claims_music_is_playing() {
+    for response in ["verified:running", "not_playing", "unavailable"] {
+        let dir = TempDir::new();
+        let executor =
+            ActionExecutor::with_executable(executable(&dir, response, 0), Duration::from_secs(1))
+                .unwrap();
+        let error = executor
+            .handle("open Spotify and play some music")
+            .await
+            .unwrap()
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(
+            text.split_whitespace().count() <= 28,
+            "failure should explain the outcome briefly: {text}"
+        );
+        assert!(!text.contains("Please ask me to open"));
+        assert!(!text.contains("is playing"));
+    }
 }
