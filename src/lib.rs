@@ -5,6 +5,7 @@
 
 pub mod awareness;
 pub mod bridge;
+pub mod broker;
 pub mod context;
 pub mod conversation;
 pub mod draft;

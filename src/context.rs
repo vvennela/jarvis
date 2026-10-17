@@ -128,6 +128,30 @@ impl Drop for WriteScope<'_> {
 }
 
 impl ContextStore {
+    /// Open an existing index for retrieval without creating or migrating it.
+    pub fn open_readonly(path: &Path) -> Result<Self, ContextError> {
+        let connection =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(Duration::from_secs(2))?;
+        connection.execute_batch("PRAGMA query_only=ON; PRAGMA cache_size=-2048;")?;
+        Ok(Self {
+            connection,
+            limits: Limits::default(),
+        })
+    }
+
+    /// Hold one WAL read snapshot across the broker's bounded source queries.
+    /// The closure only receives shared access; writes require a mutable store.
+    pub fn read_snapshot<T>(
+        &self,
+        read: impl FnOnce(&Self) -> Result<T, ContextError>,
+    ) -> Result<T, ContextError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let result = read(self)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
     pub fn open(path: &Path, limits: Limits) -> Result<Self, ContextError> {
         if limits.max_resources == 0
             || limits.max_resources > 10000
@@ -471,6 +495,58 @@ impl ContextStore {
             });
         }
         Ok(result)
+    }
+
+    /// Source-scoped natural-language retrieval; terms are literal FTS tokens,
+    /// joined with OR so question phrasing does not suppress relevant evidence.
+    pub fn search_source(
+        &self,
+        query: &str,
+        source: Source,
+        limit: usize,
+    ) -> Result<Vec<Resource>, ContextError> {
+        if query.is_empty() || query.len() > MAX_QUERY_BYTES || limit == 0 || limit > MAX_RESULTS {
+            return Err(ContextError::InvalidInput);
+        }
+        let terms: Vec<_> = query
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|term| !term.is_empty())
+            .take(16)
+            .map(|term| format!("\"{term}\""))
+            .collect();
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT r.id,r.version,r.content,r.source,r.observed_at_ms \
+             FROM search_index JOIN resources r ON search_index.resource_id=r.id \
+             WHERE search_index MATCH ?1 AND r.source=?2 ORDER BY rank,r.id LIMIT ?3",
+        )?;
+        Ok(statement
+            .query_map(
+                params![terms.join(" OR "), source.label(), limit as i64],
+                resource_row,
+            )?
+            .collect::<Result<_, _>>()?)
+    }
+
+    /// Current resources, rather than change events, preserve unchanged context
+    /// when another collector generates a large burst of activity.
+    pub fn latest_source(
+        &self,
+        source: Source,
+        limit: usize,
+    ) -> Result<Vec<Resource>, ContextError> {
+        if limit == 0 || limit > MAX_RESULTS {
+            return Err(ContextError::InvalidInput);
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT id,version,content,source,observed_at_ms FROM resources \
+             WHERE source=?1 ORDER BY observed_at_ms DESC,id LIMIT ?2",
+        )?;
+        Ok(statement
+            .query_map(params![source.label(), limit as i64], resource_row)?
+            .collect::<Result<_, _>>()?)
     }
 }
 fn resource_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Resource> {

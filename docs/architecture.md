@@ -103,6 +103,10 @@ No background semantic summarization is required. Optional episode summaries are
 
 ## Evidence, history and provenance
 
+The implemented conversation broker reads one SQLite WAL snapshot through a read-only connection. It reserves space for the indexed foreground app, relevant files, and browser resources, then associates cached tab/page resources by URL where available. That association does not establish that both belong to the same current document. It returns at most eight evidence items with bounded excerpts, source, version, observation time, age, and selection reason. File churn cannot evict browser or foreground evidence from the selected packet. Literal OR search over bounded content terms handles natural questions; source-specific recent resources supply fallback context. Simple greetings and runtime-readiness questions omit unrelated work evidence.
+
+This local read runs concurrently with Jev routing. The source queries share one transaction for consistency; they are not separate parallel database snapshots. The packet records retrieval-time context, not focus frozen at speech onset. Coverage describes selected evidence, not proof that all apps or tabs were observed. Trusted conversation configuration is supplied separately from document content, so a setup guide does not establish missing credentials.
+
 A resource record holds stable ID, version, content hash, observed time, freshness and source. Events reference old/new versions rather than duplicating full contents. Activity episodes are provisional groupings; viewing a page does not prove agreement with its content.
 
 Every retrieved item preserves source and trust labels. User speech, configured preferences, observed application text, and model inference are different classes. Proposed arguments reference supporting evidence. The gate checks those references against original records; the model cannot self-certify authorization. A page can supply an address but cannot authorize payment.
