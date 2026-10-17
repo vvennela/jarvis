@@ -28,7 +28,7 @@ Copy `.env.example` to `.env` and set:
 - `TYPESAFE_API_KEY` — [Jev](https://console.typesafe.ai/)
 - `CRUSOE_API_KEY` — [Crusoe inference](https://crusoe.ai/)
 
-Model: `nvidia/nemotron-3.5-lightning-30b-a3b`.
+Model: `nvidia/Nemotron-3.5-Lightning-30B-A3B`.
 
 ## Build and test
 

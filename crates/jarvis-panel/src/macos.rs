@@ -1,7 +1,12 @@
 //! AppKit-only unsafe boundary. All objects stay on the process main thread;
 //! the worker receives paths and a Rust control handle, never Objective-C values.
 use super::Options;
-use jarvis_panel::worker::{Control, State, Worker};
+use jarvis_panel::{
+    chat::{self, ConversationWorker},
+    speech::{self, SpeechWorker},
+    voiceworker::{self, VoiceWorker},
+    worker::{Control, State, Worker},
+};
 use objc2::{
     DefinedClass, MainThreadOnly, define_class, msg_send,
     rc::{Retained, autoreleasepool},
@@ -10,8 +15,8 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSColor,
-    NSEventMask, NSFloatingWindowLevel, NSFont, NSPanel, NSScreen, NSTextField,
-    NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSEventMask, NSFloatingWindowLevel, NSFont, NSPanel, NSScreen, NSScrollView, NSTextField,
+    NSTextView, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSDate, NSDefaultRunLoopMode, NSObject, NSObjectProtocol, NSPoint, NSRect,
@@ -24,6 +29,10 @@ use std::{
 
 struct ActionIvars {
     control: Arc<Control>,
+    chat: Arc<chat::Control>,
+    speech: Arc<speech::Control>,
+    voice: Arc<voiceworker::Control>,
+    input: Retained<NSTextField>,
 }
 define_class!(
     // SAFETY: NSObject has no additional subclass invariants; this class has no
@@ -41,12 +50,63 @@ define_class!(
             else { self.ivars().control.pause(); }
         }
         #[unsafe(method(quitPanel:))]
-        fn quit_panel(&self, _sender: Option<&AnyObject>) { self.ivars().control.stop(); }
+        fn quit_panel(&self, _sender: Option<&AnyObject>) {
+            self.ivars().voice.shutdown();
+            self.ivars().speech.shutdown();
+            self.ivars().chat.stop();
+            self.ivars().control.stop();
+        }
+        #[unsafe(method(sendQuestion:))]
+        fn send_question(&self, _sender: Option<&AnyObject>) {
+            let question = self.ivars().input.stringValue().to_string();
+            if self.ivars().chat.submit(question).is_ok() {
+                self.ivars().input.setStringValue(&NSString::from_str(""));
+            }
+        }
+        #[unsafe(method(cancelQuestion:))]
+        fn cancel_question(&self, _sender: Option<&AnyObject>) {
+            self.ivars().voice.cancel();
+            self.ivars().speech.stop_speaking();
+            self.ivars().chat.cancel();
+        }
+        #[unsafe(method(readAloud:))]
+        fn read_aloud(&self, _sender: Option<&AnyObject>) {
+            let reply = self.ivars().chat.snapshot();
+            if reply.state == chat::State::Reply {
+                let mut end = reply.text.len().min(speech::MAX_TEXT_BYTES);
+                while !reply.text.is_char_boundary(end) { end -= 1; }
+                let _ = self.ivars().speech.speak(reply.text[..end].to_owned());
+            }
+        }
+        #[unsafe(method(stopSpeaking:))]
+        fn stop_speaking(&self, _sender: Option<&AnyObject>) { self.ivars().speech.stop_speaking(); }
+        #[unsafe(method(toggleRecording:))]
+        fn toggle_recording(&self, _sender: Option<&AnyObject>) {
+            if matches!(self.ivars().voice.snapshot().state, voiceworker::State::Recording | voiceworker::State::StartingMicrophone) {
+                self.ivars().voice.finish_recording();
+            } else {
+                self.ivars().speech.stop_speaking();
+                let _ = self.ivars().voice.record();
+            }
+        }
     }
 );
 impl PanelActions {
-    fn new(mtm: MainThreadMarker, control: Arc<Control>) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(ActionIvars { control });
+    fn new(
+        mtm: MainThreadMarker,
+        control: Arc<Control>,
+        chat: Arc<chat::Control>,
+        speech: Arc<speech::Control>,
+        voice: Arc<voiceworker::Control>,
+        input: Retained<NSTextField>,
+    ) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(ActionIvars {
+            control,
+            chat,
+            speech,
+            voice,
+            input,
+        });
         // SAFETY: Correct NSObject init signature, initialized ivars remain owned.
         unsafe { msg_send![super(this), init] }
     }
@@ -65,14 +125,17 @@ fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
 pub fn run(options: Options) -> Result<(), &'static str> {
     let mtm = MainThreadMarker::new().ok_or("Panel must run on the main thread")?;
     // Validate explicit scope before showing the panel. No user folders inferred.
-    let mut worker = Worker::start(options.root, options.database)?;
+    let mut worker = Worker::start(options.root, options.database.clone())?;
+    let mut conversation = ConversationWorker::start(options.database)?;
+    let mut speech = SpeechWorker::start()?;
+    let mut voice = VoiceWorker::from_env()?;
     let application = NSApplication::sharedApplication(mtm);
     application.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     application.finishLaunching();
     let screen = NSScreen::mainScreen(mtm).ok_or("No display is available for the panel")?;
     let frame = screen.visibleFrame();
-    let width = 360.0;
-    let height = 154.0;
+    let width = 480.0;
+    let height = 480.0;
     // Retain the panel throughout the event loop; disable release-on-close below.
     let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
         NSPanel::alloc(mtm),
@@ -105,17 +168,52 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     let view = panel
         .contentView()
         .ok_or("Panel content view unavailable")?;
-    let title = label(mtm, "JARVIS", rect(18.0, 119.0, 324.0, 22.0), 13.0);
+    let title = label(mtm, "JARVIS", rect(18.0, 445.0, 444.0, 22.0), 13.0);
     title.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
-    let status = label(mtm, "Starting…", rect(18.0, 87.0, 324.0, 26.0), 19.0);
+    let status = label(mtm, "Starting…", rect(18.0, 414.0, 444.0, 26.0), 19.0);
     let detail = label(
         mtm,
         "Microphone off · models idle",
-        rect(18.0, 63.0, 324.0, 20.0),
+        rect(18.0, 390.0, 444.0, 20.0),
         12.0,
     );
     detail.setTextColor(Some(&NSColor::secondaryLabelColor()));
-    let actions = PanelActions::new(mtm, Arc::clone(&worker.control));
+    let chat_status = label(
+        mtm,
+        "Preparing conversation…",
+        rect(18.0, 362.0, 444.0, 20.0),
+        12.0,
+    );
+    let scroll =
+        NSScrollView::initWithFrame(NSScrollView::alloc(mtm), rect(18.0, 124.0, 444.0, 230.0));
+    scroll.setHasVerticalScroller(true);
+    let response = NSTextView::initWithFrame(NSTextView::alloc(mtm), rect(0.0, 0.0, 424.0, 230.0));
+    response.setEditable(false);
+    response.setSelectable(true);
+    response.setRichText(false);
+    response.setFont(Some(&NSFont::systemFontOfSize(14.0)));
+    response.setVerticallyResizable(true);
+    response.setHorizontallyResizable(false);
+    response.setMinSize(NSSize::new(424.0, 230.0));
+    response.setMaxSize(NSSize::new(424.0, 1_000_000.0));
+    scroll.setDocumentView(Some(&response));
+    let input = NSTextField::initWithFrame(NSTextField::alloc(mtm), rect(18.0, 82.0, 350.0, 30.0));
+    input.setPlaceholderString(Some(&NSString::from_str("Ask Jarvis about your work…")));
+    input.setFont(Some(&NSFont::systemFontOfSize(14.0)));
+    let actions = PanelActions::new(
+        mtm,
+        Arc::clone(&worker.control),
+        Arc::clone(&conversation.control),
+        Arc::clone(&speech.control),
+        Arc::clone(&voice.control),
+        input.clone(),
+    );
+    // SAFETY: This retained target implements sendQuestion: with the standard
+    // single-object action signature and outlives the entry field.
+    unsafe {
+        input.setTarget(Some(&actions));
+        input.setAction(Some(sel!(sendQuestion:)));
+    }
     // SAFETY: Targets are this retained MainThreadOnly class, both selectors have
     // the expected single-object argument, and actions outlive the buttons.
     let (pause_button, quit_button) = unsafe {
@@ -135,13 +233,69 @@ pub fn run(options: Options) -> Result<(), &'static str> {
         )
     };
     pause_button.setFrame(rect(16.0, 16.0, 94.0, 30.0));
-    quit_button.setFrame(rect(260.0, 16.0, 82.0, 30.0));
+    quit_button.setFrame(rect(380.0, 16.0, 82.0, 30.0));
+    // SAFETY: The retained target declares these exact single-object selectors.
+    let (send_button, cancel_button) = unsafe {
+        (
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Ask"),
+                Some(&actions),
+                Some(sel!(sendQuestion:)),
+                mtm,
+            ),
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Cancel"),
+                Some(&actions),
+                Some(sel!(cancelQuestion:)),
+                mtm,
+            ),
+        )
+    };
+    send_button.setFrame(rect(378.0, 82.0, 84.0, 30.0));
+    cancel_button.setFrame(rect(118.0, 16.0, 130.0, 30.0));
+    // SAFETY: Both selectors are declared on the retained main-thread target.
+    let (read_button, stop_speech_button) = unsafe {
+        (
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Read aloud"),
+                Some(&actions),
+                Some(sel!(readAloud:)),
+                mtm,
+            ),
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Stop speaking"),
+                Some(&actions),
+                Some(sel!(stopSpeaking:)),
+                mtm,
+            ),
+        )
+    };
+    read_button.setFrame(rect(16.0, 48.0, 110.0, 28.0));
+    stop_speech_button.setFrame(rect(132.0, 48.0, 140.0, 28.0));
+    // SAFETY: The retained target implements this single-object selector.
+    let record_button = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            &NSString::from_str("Record"),
+            Some(&actions),
+            Some(sel!(toggleRecording:)),
+            mtm,
+        )
+    };
+    record_button.setFrame(rect(282.0, 48.0, 180.0, 28.0));
     // Subviews remain owned by both retained handles and AppKit's hierarchy.
     view.addSubview(&title);
     view.addSubview(&status);
     view.addSubview(&detail);
     view.addSubview(&pause_button);
     view.addSubview(&quit_button);
+    view.addSubview(&chat_status);
+    view.addSubview(&scroll);
+    view.addSubview(&input);
+    view.addSubview(&send_button);
+    view.addSubview(&cancel_button);
+    view.addSubview(&read_button);
+    view.addSubview(&stop_speech_button);
+    view.addSubview(&record_button);
     // Deliberately neither activate the application nor make this panel key.
     panel.orderFrontRegardless();
     let started = Instant::now();
@@ -151,6 +305,8 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     let mut smoke_phase = 0;
     let mut last_state = None;
     let mut had_error = false;
+    let mut chat_revision = None;
+    let mut voice_revision = None;
     loop {
         let snapshot = worker.control.snapshot();
         if snapshot.state == State::Active {
@@ -191,6 +347,76 @@ pub fn run(options: Options) -> Result<(), &'static str> {
         if snapshot.state == State::Blocked {
             detail.setStringValue(&NSString::from_str(snapshot.message));
         }
+        let chat_snapshot = conversation.control.snapshot();
+        if chat_revision != Some(chat_snapshot.revision) {
+            response.setString(&NSString::from_str(&chat_snapshot.text));
+            let message = match chat_snapshot.state {
+                chat::State::Starting => "Preparing conversation…",
+                chat::State::Ready => "Ready for your question",
+                chat::State::Thinking => "Thinking…",
+                chat::State::Cancelling => "Cancelling…",
+                chat::State::Reply if chat_snapshot.routing_degraded => {
+                    "Reply ready · direct model route"
+                }
+                chat::State::Reply => "Reply ready",
+                chat::State::Cancelled => "Cancelled · ready for another question",
+                chat::State::Unavailable => "Add your model key to enable conversation",
+                chat::State::Failed => "Ready to retry",
+                chat::State::Stopped => "Conversation stopped",
+            };
+            chat_status.setStringValue(&NSString::from_str(message));
+            chat_revision = Some(chat_snapshot.revision);
+        }
+        let voice_snapshot = voice.control.snapshot();
+        if voice_revision != Some(voice_snapshot.revision) {
+            if voice_snapshot.state == voiceworker::State::Transcript {
+                input.setStringValue(&NSString::from_str(&voice_snapshot.transcript));
+            }
+            record_button.setToolTip(Some(&NSString::from_str(voice_snapshot.message)));
+            voice_revision = Some(voice_snapshot.revision);
+        }
+        let recording = matches!(
+            voice_snapshot.state,
+            voiceworker::State::Recording | voiceworker::State::StartingMicrophone
+        );
+        record_button.setTitle(&NSString::from_str(if recording {
+            "Finish recording"
+        } else {
+            "Record"
+        }));
+        record_button.setEnabled(voice.control.available() && (!voice.control.busy() || recording));
+        input.setEnabled(!voice.control.busy());
+        send_button.setEnabled(
+            conversation.control.available()
+                && !conversation.control.busy()
+                && !voice.control.busy(),
+        );
+        cancel_button.setEnabled(conversation.control.busy() || voice.control.busy());
+        read_button.setEnabled(
+            chat_snapshot.state == chat::State::Reply
+                && speech.control.available()
+                && !speech.control.busy()
+                && !voice.control.busy(),
+        );
+        stop_speech_button.setEnabled(speech.control.busy());
+        if snapshot.state != State::Blocked {
+            let message = if !matches!(voice_snapshot.state, voiceworker::State::Ready) {
+                voice_snapshot.message
+            } else if speech.control.busy() {
+                "Microphone off · reading reply aloud"
+            } else if conversation.control.busy() {
+                "Microphone off · model request active"
+            } else {
+                "Microphone off · ready to record"
+            };
+            detail.setStringValue(&NSString::from_str(message));
+            let color = if voice_snapshot.state == voiceworker::State::Recording {
+                NSColor::systemRedColor()
+            } else {
+                NSColor::secondaryLabelColor()
+            };
+            detail.setTextColor(Some(&color));
+        }
         if options.smoke_test {
             if smoke_phase == 0 && active_observed {
                 actions.toggle_pause(sel!(togglePause:), None);
@@ -203,13 +429,21 @@ pub fn run(options: Options) -> Result<(), &'static str> {
                 smoke_phase = 3;
             }
             if started.elapsed() > Duration::from_secs(8) || had_error {
+                voice.control.shutdown();
+                speech.control.shutdown();
+                conversation.control.stop();
                 worker.control.stop();
             }
         }
-        if worker.control.stop_requested() && worker.is_finished() {
+        if worker.control.stop_requested()
+            && worker.is_finished()
+            && conversation.is_finished()
+            && speech.is_finished()
+            && voice.is_finished()
+        {
             break;
         }
-        if worker.is_finished() && !had_error {
+        if worker.is_finished() && !worker.control.stop_requested() && !had_error {
             had_error = true;
             status.setStringValue(&NSString::from_str("Observer stopped unexpectedly"));
         }
@@ -230,6 +464,9 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     }
     panel.orderOut(None);
     worker.join()?;
+    conversation.join()?;
+    speech.join()?;
+    voice.join()?;
     if options.smoke_test {
         println!(
             "{{\"panel_created\":true,\"active_observed\":{active_observed},\"paused_observed\":{paused_observed},\"resumed_observed\":{resumed_observed},\"microphone_active\":false}}"

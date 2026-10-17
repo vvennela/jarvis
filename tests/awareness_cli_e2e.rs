@@ -146,7 +146,12 @@ fn missing_keys_and_invalid_key_configuration_fail_without_network_or_secret_out
     ] {
         let output = run(&directory, &arguments);
         assert_eq!(output.status.code(), Some(2));
-        assert!(String::from_utf8_lossy(&output.stderr).contains("TYPESAFE_API_KEY is missing"));
+        let expected = if arguments[0] == "ask" {
+            "CRUSOE_API_KEY is missing"
+        } else {
+            "TYPESAFE_API_KEY is missing"
+        };
+        assert!(String::from_utf8_lossy(&output.stderr).contains(expected));
     }
     let invalid = command(&directory, &["route", "what now"])
         .env("TYPESAFE_API_KEY", format!("{SECRET}\ninvalid-header"))
@@ -188,9 +193,7 @@ fn explicit_root_and_bounded_duration_are_required() {
     }
     let help = run(&directory, &["--help"]);
     assert!(help.status.success());
-    assert!(
-        String::from_utf8_lossy(&help.stdout).contains("no desktop UI or autonomous workers yet")
-    );
+    assert!(String::from_utf8_lossy(&help.stdout).contains("Jarvis context and review CLI"));
 }
 
 #[test]

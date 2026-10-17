@@ -3,3 +3,9 @@
 
 #[cfg(unix)]
 pub mod worker;
+
+pub mod chat;
+
+pub mod speech;
+
+pub mod voiceworker;

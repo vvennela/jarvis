@@ -1,0 +1,95 @@
+//! Pure callback-buffer integration. These tests never open an input device.
+use jarvis_voice::capture::{CaptureBuffer, MAX_RECORDING_SAMPLES};
+
+#[test]
+fn capture_format_validation_rejects_unbounded_or_invalid_device_shapes() {
+    for (rate, channels) in [(0, 1), (7999, 1), (192001, 1), (16000, 0), (16000, 9)] {
+        assert!(CaptureBuffer::new(rate, channels).is_err());
+    }
+    for (rate, channels) in [(8000, 1), (16000, 2), (44100, 2), (48000, 8), (192000, 1)] {
+        assert!(CaptureBuffer::new(rate, channels).is_ok());
+    }
+    assert!(CaptureBuffer::new(16000, 1).unwrap().finish().is_err());
+}
+
+#[test]
+fn stereo_downmix_and_sample_format_normalization_produce_valid_mono() {
+    let mut stereo = CaptureBuffer::new(16000, 2).unwrap();
+    stereo.push_f32(&[0.75, -0.75].repeat(100)).unwrap();
+    let output = stereo.finish().unwrap();
+    assert!(!output.is_empty());
+    assert!(output.iter().all(|sample| sample.abs() < 0.00001));
+    let mut signed = CaptureBuffer::new(16000, 1).unwrap();
+    signed.push_i16(&[i16::MIN, 0, i16::MAX, 0]).unwrap();
+    let samples = signed.finish().unwrap();
+    assert_eq!(samples[0], -1.0);
+    assert_eq!(samples[1], 0.0);
+    assert!(samples[2] > 0.99 && samples[2] <= 1.0);
+    let mut unsigned = CaptureBuffer::new(16000, 1).unwrap();
+    unsigned.push_u16(&[0, 32768, u16::MAX, 32768]).unwrap();
+    let samples = unsigned.finish().unwrap();
+    assert_eq!(samples[0], -1.0);
+    assert!(samples[1].abs() < 0.0001);
+    assert!(samples[2] > 0.99 && samples[2] <= 1.0);
+}
+
+#[test]
+fn channel_fragments_and_arbitrary_callback_boundaries_do_not_change_resampling() {
+    for rate in [8000, 16000, 44100, 48000, 192000] {
+        let input: Vec<f32> = (0..1000)
+            .flat_map(|i| {
+                let value = (i as f32 / 1000.0) - 0.5;
+                [value, value * 0.5]
+            })
+            .collect();
+        let mut whole = CaptureBuffer::new(rate, 2).unwrap();
+        whole.push_f32(&input).unwrap();
+        let expected = whole.finish().unwrap();
+        let mut fragmented = CaptureBuffer::new(rate, 2).unwrap();
+        let mut index = 0;
+        for length in [1, 7, 2, 9, 3, 15].into_iter().cycle() {
+            if index >= input.len() {
+                break;
+            }
+            let end = (index + length).min(input.len());
+            fragmented.push_f32(&input[index..end]).unwrap();
+            index = end;
+        }
+        let actual = fragmented.finish().unwrap();
+        assert_eq!(
+            actual, expected,
+            "callback boundaries changed output at {rate}Hz"
+        );
+        let approximate = 1000.0 * 16000.0 / f64::from(rate);
+        assert!((actual.len() as f64 - approximate).abs() <= 3.0);
+        assert!(
+            actual
+                .iter()
+                .all(|sample| sample.is_finite() && (-1.0..=1.0).contains(sample))
+        );
+    }
+}
+
+#[test]
+fn invalid_floats_are_rejected_instead_of_entering_transcription() {
+    for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let mut buffer = CaptureBuffer::new(16000, 1).unwrap();
+        assert!(buffer.push_f32(&[value]).is_err());
+    }
+}
+
+#[test]
+fn long_recordings_stop_growing_at_the_fifteen_second_cap() {
+    let mut buffer = CaptureBuffer::new(16000, 1).unwrap();
+    let _ = buffer.push_f32(&vec![0.25; MAX_RECORDING_SAMPLES + 100]);
+    assert!(buffer.is_full());
+    assert!(buffer.output_len() <= MAX_RECORDING_SAMPLES);
+    let before = buffer.output_len();
+    for _ in 0..100 {
+        let _ = buffer.push_f32(&[0.5; 1000]);
+        assert_eq!(buffer.output_len(), before);
+    }
+    let samples = buffer.finish().unwrap();
+    assert_eq!(samples.len(), MAX_RECORDING_SAMPLES);
+    assert!(samples.iter().all(|sample| *sample == 0.25));
+}

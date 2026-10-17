@@ -6,6 +6,9 @@
 pub mod awareness;
 pub mod bridge;
 pub mod context;
+pub mod conversation;
+pub mod draft;
+pub mod elevenlabs;
 pub mod install;
 pub mod providers;
 

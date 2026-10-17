@@ -87,13 +87,13 @@ fn invalid_output_target_has_no_success_announcement() {
 }
 
 #[test]
-fn help_is_explicit_about_current_fixture_limitations() {
+fn help_lists_context_and_review_commands() {
     let dir = TempDir::new();
     let output = cli(&dir, &["--help"]);
     assert!(output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stdout).contains("no desktop UI or autonomous workers yet")
-    );
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("Jarvis context and review CLI"));
+    assert!(help.contains("jarvis draft --db <path> --request <text> --output <file>"));
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 

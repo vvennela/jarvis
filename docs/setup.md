@@ -7,13 +7,13 @@ The working CLI supports local awareness and read-only model conversation. Nativ
 Only two keys are required for the implemented live-provider path:
 
 1. **`TYPESAFE_API_KEY`** from the [TypeSafe console](https://console.typesafe.ai/). Jev requests use bearer authentication at `https://api.typesafe.ai/v1/systemone`, model `jev-latest`. Jev returns structured routing choices; it is not a chat-completions substitute. [Official quickstart](https://docs.typesafe.ai/introduction/quickstart).
-2. **`CRUSOE_API_KEY`** with serverless inference access. The client calls `https://api.inference.crusoecloud.com/v1/chat/completions`. The default selected model is **Nemotron 3.5 Lightning**, `nvidia/nemotron-3.5-lightning-30b-a3b`, published in the [Crusoe catalog](https://docs.crusoecloud.com/serverless-inference/index.html). Account access still needs a live verification.
+2. **`CRUSOE_API_KEY`** with serverless inference access. The client calls `https://api.inference.crusoecloud.com/v1/chat/completions`. The default selected model is **Nemotron 3.5 Lightning**, `nvidia/Nemotron-3.5-Lightning-30B-A3B`, published in the [Crusoe catalog](https://docs.crusoecloud.com/serverless-inference/index.html). Account access still needs a live verification.
 
 Optional configuration:
 
 ```dotenv
-JARVIS_CONVERSATION_MODEL=nvidia/nemotron-3.5-lightning-30b-a3b
-JARVIS_WORKER_MODEL=nvidia/nemotron-3.5-lightning-30b-a3b
+JARVIS_CONVERSATION_MODEL=nvidia/Nemotron-3.5-Lightning-30B-A3B
+JARVIS_WORKER_MODEL=nvidia/Nemotron-3.5-Lightning-30B-A3B
 ```
 
 The conversation override is used by `ask`. The worker value is reserved; no worker loop currently consumes it. One Crusoe key suffices for both planned roles if the account allows the models.

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 pub const JEV_ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
 pub const CRUSOE_ENDPOINT: &str = "https://api.inference.crusoecloud.com/v1/chat/completions";
-pub const NEMOTRON_MODEL: &str = "nvidia/nemotron-3.5-lightning-30b-a3b";
+pub const NEMOTRON_MODEL: &str = "nvidia/Nemotron-3.5-Lightning-30B-A3B";
 pub const MAX_INPUT_BYTES: usize = 64 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const MAX_OUTPUT_TOKENS: u32 = 4096;
@@ -396,6 +396,11 @@ impl CrusoeClient {
             ],
             max_tokens: max_output_tokens,
             stream: false,
+            // Verified against Crusoe's live model catalog and endpoint. Keep
+            // short conversational calls in direct-answer mode for this model.
+            chat_template_kwargs: (self.model == NEMOTRON_MODEL).then_some(ThinkingOptions {
+                enable_thinking: false,
+            }),
         };
         let bytes = self.transport.post(&request).await?;
         let response: ChatResponse =
@@ -439,6 +444,13 @@ struct ChatRequest<'a> {
     messages: [ChatMessage<'a>; 2],
     max_tokens: u32,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template_kwargs: Option<ThinkingOptions>,
+}
+
+#[derive(Serialize)]
+struct ThinkingOptions {
+    enable_thinking: bool,
 }
 
 #[derive(Serialize)]

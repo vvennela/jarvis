@@ -517,3 +517,28 @@ async fn deadline_covers_a_body_that_stalls_after_successful_headers() {
     peer.abort();
     let _ = peer.await;
 }
+
+#[tokio::test]
+async fn only_exact_verified_nemotron_id_disables_thinking_in_request_template() {
+    for model in [
+        NEMOTRON_MODEL,
+        "fixture/other-model",
+        "nvidia/nemotron-3.5-lightning-30b-a3b",
+    ] {
+        let server = Server::new(response("200 OK", valid_chat()));
+        let client = CrusoeClient::new(TEST_KEY, model, config(&server)).unwrap();
+        client.complete("system", "user", 100).await.unwrap();
+        let requests = server.requests();
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["model"], model);
+        if model == NEMOTRON_MODEL {
+            assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        } else {
+            assert!(
+                body.get("chat_template_kwargs").is_none(),
+                "model-specific extension leaked to {model}"
+            );
+        }
+    }
+}
