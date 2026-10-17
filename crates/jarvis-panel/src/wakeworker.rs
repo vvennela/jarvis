@@ -1,5 +1,5 @@
 //! Continuous local wake recognition; the native audio handle stays on one thread.
-use crate::wake::{Phase, WakeDetector};
+use crate::wake::{DecodeRequest, Phase, WakeDetector};
 use std::{
     sync::{
         Arc, Mutex,
@@ -44,7 +44,7 @@ pub struct Control {
     generation: AtomicU64,
     cancelled: Arc<AtomicBool>,
     snapshot: Mutex<Snapshot>,
-    command: Mutex<Option<String>>,
+    command: Mutex<Option<(u64, String)>>,
 }
 impl Control {
     pub fn enabled(&self) -> bool {
@@ -73,6 +73,13 @@ impl Control {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .take()
+            .filter(|(generation, _)| {
+                *generation == self.generation.load(Ordering::Acquire)
+                    && self.enabled()
+                    && !self.suppressed.load(Ordering::Acquire)
+                    && !self.stopped.load(Ordering::Acquire)
+            })
+            .map(|(_, command)| command)
     }
     pub fn snapshot(&self) -> Snapshot {
         self.snapshot
@@ -147,6 +154,7 @@ impl WakeWorker {
                     }
                 };
                 let mut detector = WakeDetector::new();
+                let mut next_decode: Option<DecodeRequest> = None;
                 let mut running = false;
                 let mut seen_generation = c.generation.load(Ordering::Acquire);
                 loop {
@@ -158,6 +166,7 @@ impl WakeWorker {
                         backend.stop();
                         running = false;
                         detector.reset();
+                        next_decode = None;
                         seen_generation = generation;
                     }
                     let suppressed = c.suppressed.load(Ordering::Acquire);
@@ -167,6 +176,7 @@ impl WakeWorker {
                             running = false;
                         }
                         detector.reset();
+                        next_decode = None;
                         c.publish(
                             if suppressed {
                                 State::Suppressed
@@ -216,21 +226,28 @@ impl WakeWorker {
                             "Listening to your request…"
                         },
                     );
-                    let (samples, overflow) = match backend.poll() {
-                        Ok(v) => v,
-                        Err(message) => {
-                            backend.stop();
-                            running = false;
-                            c.enabled.store(false, Ordering::Release);
-                            c.publish(State::Failed, message);
+                    let request = if let Some(request) = next_decode.take() {
+                        Some(request)
+                    } else {
+                        let (samples, overflow) = match backend.poll() {
+                            Ok(v) => v,
+                            Err(message) => {
+                                backend.stop();
+                                running = false;
+                                detector.reset();
+                                c.enabled.store(false, Ordering::Release);
+                                c.publish(State::Failed, message);
+                                continue;
+                            }
+                        };
+                        if overflow || samples.len() > jarvis_voice::capture::MAX_RECORDING_SAMPLES
+                        {
+                            detector.reset();
                             continue;
                         }
+                        detector.ingest(&samples)
                     };
-                    if overflow || samples.len() > jarvis_voice::capture::MAX_RECORDING_SAMPLES {
-                        detector.reset();
-                        continue;
-                    }
-                    if let Some(request) = detector.ingest(&samples) {
+                    if let Some(request) = request {
                         c.publish(
                             State::Decoding,
                             if request.phase == Phase::Wake {
@@ -246,16 +263,56 @@ impl WakeWorker {
                             detector.reset();
                             continue;
                         }
+                        // Capture continues during synchronous decoding. An endpoint
+                        // is provisional until queued audio has been checked for a
+                        // resumed phrase; no command escapes before this read.
+                        let queued = backend.poll();
+                        if generation != c.generation.load(Ordering::Acquire)
+                            || c.stopped.load(Ordering::Acquire)
+                        {
+                            detector.reset();
+                            continue;
+                        }
+                        let (queued, overflow) = match queued {
+                            Ok(audio) => audio,
+                            Err(message) => {
+                                backend.stop();
+                                running = false;
+                                detector.reset();
+                                c.enabled.store(false, Ordering::Release);
+                                c.publish(State::Failed, message);
+                                continue;
+                            }
+                        };
+                        if overflow || queued.len() > jarvis_voice::capture::MAX_RECORDING_SAMPLES {
+                            detector.reset();
+                            continue;
+                        }
                         match result {
                             Ok(text) => {
-                                if let Some(command) = detector.accept_transcript(&text) {
-                                    *c.command.lock().unwrap_or_else(|p| p.into_inner()) =
-                                        Some(command);
-                                    c.publish(State::CommandReady, "Request heard");
+                                let outcome = detector.accept_transcript_with_audio(&text, &queued);
+                                next_decode = outcome.next;
+                                if let Some(command) = outcome.command {
+                                    let mut slot =
+                                        c.command.lock().unwrap_or_else(|p| p.into_inner());
+                                    if generation == c.generation.load(Ordering::Acquire)
+                                        && c.enabled()
+                                        && !c.suppressed.load(Ordering::Acquire)
+                                        && !c.stopped.load(Ordering::Acquire)
+                                    {
+                                        *slot = Some((generation, command));
+                                        c.publish(State::CommandReady, "Request heard");
+                                    }
                                 }
                             }
-                            Err(_) => detector.reset(),
+                            Err(_) => {
+                                detector.reset();
+                                next_decode = detector.ingest(&queued);
+                            }
                         }
+                    }
+                    if next_decode.is_some() {
+                        continue;
                     }
                     thread::sleep(Duration::from_millis(20));
                 }

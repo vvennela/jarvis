@@ -14,8 +14,8 @@ use std::{
 fn utterance(detector: &mut WakeDetector) -> DecodeRequest {
     assert!(detector.ingest(&vec![0.1; 16000]).is_none());
     detector
-        .ingest(&vec![0.0; 12000])
-        .expect("speech plus .75s silence should produce endpoint")
+        .ingest(&vec![0.0; 17600])
+        .expect("speech plus 1.1s silence should produce endpoint")
 }
 
 #[test]
@@ -171,7 +171,7 @@ fn feed(probe: &Probe, text: &str) {
     probe.texts.lock().unwrap().push_back(text.into());
     let mut queue = probe.chunks.lock().unwrap();
     queue.push_back((vec![0.1; 16000], false));
-    queue.push_back((vec![0.0; 12000], false));
+    queue.push_back((vec![0.0; 17600], false));
 }
 fn stop(worker: &mut WakeWorker) {
     worker.control.shutdown();
@@ -265,7 +265,7 @@ fn streaming_wake_waits_for_command_endpoint_and_invalid_text_cannot_escape() {
     assert!(detector.accept_transcript("Jarvis find").is_none());
     assert_eq!(detector.phase(), Phase::Command);
     assert!(detector.ingest(&vec![0.1; 8000]).is_none());
-    let request = detector.ingest(&vec![0.0; 12000]).unwrap();
+    let request = detector.ingest(&vec![0.0; 17600]).unwrap();
     assert!(request.endpoint);
     assert_eq!(
         detector
@@ -340,7 +340,7 @@ fn opt_in_real_whisper_audio_reaches_wake_command_without_microphone() {
     let mut commands = Vec::new();
     for chunk in samples
         .chunks(320)
-        .chain(std::iter::repeat_n(&[0.0; 320][..], 40))
+        .chain(std::iter::repeat_n(&[0.0; 320][..], 60))
     {
         if let Some(request) = detector.ingest(chunk) {
             let text = transcriber.transcribe(&request.samples).unwrap();
@@ -427,7 +427,7 @@ fn long_idle_silence_does_not_spend_the_next_utterance_decode_budget() {
             );
         }
         let mut endpoint = None;
-        for _ in 0..40 {
+        for _ in 0..60 {
             if let Some(request) = detector.ingest(&[0.0; 320]) {
                 endpoint = Some(request);
                 break;
@@ -482,4 +482,209 @@ fn worker_ignores_extended_silence_and_ambient_speech_then_accepts_wake() {
         Some("resume my work")
     );
     stop(&mut worker);
+}
+
+#[test]
+fn conversational_midphrase_pauses_and_quiet_trailing_words_do_not_submit_early() {
+    for pause_ms in [700, 800, 900] {
+        let mut detector = WakeDetector::new();
+        utterance(&mut detector);
+        detector.accept_transcript("Jarvis");
+        assert_eq!(detector.phase(), Phase::Command);
+        assert!(detector.ingest(&vec![0.1; 16000]).is_none());
+        assert!(
+            detector.ingest(&vec![0.0; pause_ms * 16]).is_none(),
+            "{pause_ms}ms midphrase pause submitted prematurely"
+        );
+        // Quieter words after speech has started must reset endpoint silence.
+        assert!(
+            detector.ingest(&vec![0.007; 8000]).is_none(),
+            "quiet trailing words were treated as silence"
+        );
+        assert!(
+            detector.ingest(&vec![0.0; 16000]).is_none(),
+            "endpoint occurred before1.1seconds of silence"
+        );
+        let request = detector
+            .ingest(&vec![0.0; 1600])
+            .expect("1.1s finalsilence should endpoint");
+        assert!(request.endpoint);
+        assert!(
+            request
+                .samples
+                .iter()
+                .any(|sample| (*sample - 0.007).abs() < 0.00001)
+        );
+        assert_eq!(
+            detector
+                .accept_transcript("find my notes and summarize them")
+                .as_deref(),
+            Some("find my notes and summarize them")
+        );
+        assert!(detector.accept_transcript("duplicate").is_none());
+    }
+}
+
+#[test]
+fn resumed_speech_during_slow_decode_replaces_provisional_command_with_complete_utterance() {
+    struct ResumeFixture {
+        chunks: Mutex<VecDeque<Vec<f32>>>,
+        decodes: AtomicUsize,
+        release: AtomicBool,
+        complete_audio: AtomicBool,
+    }
+    struct Resuming(Arc<ResumeFixture>);
+    impl WakeBackend for Resuming {
+        fn start(&mut self) -> Result<(), &'static str> {
+            Ok(())
+        }
+        fn stop(&mut self) {}
+        fn poll(&mut self) -> Result<(Vec<f32>, bool), &'static str> {
+            Ok((
+                self.0
+                    .chunks
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_default(),
+                false,
+            ))
+        }
+        fn transcribe(
+            &mut self,
+            samples: &[f32],
+            _: Arc<AtomicBool>,
+        ) -> Result<String, &'static str> {
+            let number = self.0.decodes.fetch_add(1, Ordering::AcqRel);
+            if number == 0 {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !self.0.release.load(Ordering::Acquire) {
+                    assert!(Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Ok("Jarvis find my notes".into())
+            } else {
+                let original = samples.iter().any(|sample| (*sample - 0.1).abs() < 0.00001);
+                let resumed = samples
+                    .iter()
+                    .any(|sample| (*sample - 0.05).abs() < 0.00001);
+                self.0
+                    .complete_audio
+                    .store(original && resumed, Ordering::Release);
+                Ok("Jarvis find my notes and summarize them".into())
+            }
+        }
+    }
+    let probe = Arc::new(ResumeFixture {
+        chunks: Mutex::new(VecDeque::new()),
+        decodes: AtomicUsize::new(0),
+        release: AtomicBool::new(false),
+        complete_audio: AtomicBool::new(false),
+    });
+    let backend = probe.clone();
+    let mut worker = WakeWorker::with_backend(move || Ok(Box::new(Resuming(backend)))).unwrap();
+    worker.control.set_enabled(true);
+    wait_until(|| worker.control.snapshot().state == State::WakeListening);
+    {
+        let mut q = probe.chunks.lock().unwrap();
+        q.push_back(vec![0.1; 16000]);
+        q.push_back(vec![0.0; 17600]);
+    }
+    wait_until(|| probe.decodes.load(Ordering::Acquire) == 1);
+    {
+        let mut q = probe.chunks.lock().unwrap();
+        q.push_back(vec![0.05; 16000]);
+        q.push_back(vec![0.0; 17600]);
+    }
+    probe.release.store(true, Ordering::Release);
+    wait_until(|| worker.control.snapshot().state == State::CommandReady);
+    assert_eq!(
+        worker.control.take_command().as_deref(),
+        Some("find my notes and summarize them"),
+        "provisional decode escaped before checking resumedaudio"
+    );
+    assert!(
+        probe.complete_audio.load(Ordering::Acquire),
+        "redecode omitted originalprefix or resumedtail"
+    );
+    assert!(worker.control.take_command().is_none());
+    stop(&mut worker);
+}
+
+#[test]
+fn endpoint_revalidation_redecodes_already_finished_resumed_tail_from_original_audio() {
+    let mut detector = WakeDetector::new();
+    let first = utterance(&mut detector);
+    assert!(first.endpoint);
+    let mut queued = vec![0.05; 16000];
+    queued.extend(vec![0.0; 17600]);
+    let outcome = detector.accept_transcript_with_audio("Jarvis find my notes", &queued);
+    assert!(
+        outcome.command.is_none(),
+        "stale provisional transcript must not be forwarded"
+    );
+    let next = outcome
+        .next
+        .expect("resumed tail already reached endpoint so a full redecode should be ready");
+    assert!(next.endpoint);
+    assert!(next.samples.iter().any(|v| (*v - 0.1).abs() < 0.00001));
+    assert!(next.samples.iter().any(|v| (*v - 0.05).abs() < 0.00001));
+    assert!(next.samples.len() <= 15 * 16000);
+    let complete =
+        detector.accept_transcript_with_audio("Jarvis find my notes and summarize them", &[]);
+    assert_eq!(
+        complete.command.as_deref(),
+        Some("find my notes and summarize them")
+    );
+    assert!(complete.next.is_none());
+}
+
+#[test]
+fn audio_overflow_during_decode_discards_provisional_command() {
+    let probe = Arc::new(Probe::default());
+    probe.hold_decode.store(true, Ordering::Release);
+    let mut worker = worker(&probe);
+    worker.control.set_enabled(true);
+    wait_until(|| worker.control.snapshot().state == State::WakeListening);
+    feed(&probe, "Jarvis interrupted request must not escape");
+    wait_until(|| probe.decodes.load(Ordering::Acquire) == 1);
+    probe
+        .chunks
+        .lock()
+        .unwrap()
+        .push_back((vec![0.05; 320], true));
+    probe.release.store(true, Ordering::Release);
+    wait_until(|| worker.control.snapshot().state == State::WakeListening);
+    assert!(worker.control.take_command().is_none());
+    feed(&probe, "Jarvis fresh request");
+    wait_until(|| worker.control.snapshot().state == State::CommandReady);
+    assert_eq!(
+        worker.control.take_command().as_deref(),
+        Some("fresh request")
+    );
+    stop(&mut worker);
+}
+
+#[test]
+fn low_energy_idle_audio_does_not_start_decode_but_active_quiet_tail_is_retained() {
+    let mut detector = WakeDetector::new();
+    let idle = [0.007; 16000];
+    for _ in 0..90 {
+        assert!(
+            detector.ingest(&idle).is_none(),
+            "below-start-gate idle energy must not cause inference"
+        );
+    }
+    assert!(detector.ingest(&vec![0.1; 8000]).is_none());
+    assert!(detector.ingest(&vec![0.007; 8000]).is_none());
+    let request = detector
+        .ingest(&vec![0.0; 17600])
+        .expect("activeutterance endsafter silence");
+    assert!(request.endpoint);
+    assert!(request.samples.len() <= 4 * 16000);
+    assert!(
+        detector
+            .accept_transcript("ambient conversation without the wake word")
+            .is_none()
+    );
 }

@@ -1,7 +1,9 @@
 //! Local speech-energy endpointing and exact wake phrase recognition.
 //! Ambient decode text is inspected transiently, never returned as a command.
 const RATE: usize = 16_000;
-const SILENCE: usize = RATE * 7 / 10;
+const SILENCE: usize = RATE * 11 / 10;
+const START_RMS: f64 = 0.012;
+const CONTINUE_RMS: f64 = 0.006;
 const WAKE_WINDOW: usize = RATE * 4;
 const DECODE_INTERVAL: usize = RATE * 5 / 2;
 const COMMAND_CAP: usize = RATE * 15;
@@ -14,6 +16,10 @@ pub struct DecodeRequest {
     pub samples: Vec<f32>,
     pub phase: Phase,
     pub endpoint: bool,
+}
+pub struct DecodeOutcome {
+    pub command: Option<String>,
+    pub next: Option<DecodeRequest>,
 }
 pub struct WakeDetector {
     phase: Phase,
@@ -65,9 +71,9 @@ impl WakeDetector {
             return None;
         }
         for frame in samples.chunks(320) {
-            let energy =
-                frame.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>() / frame.len() as f64;
-            let voiced = energy >= 0.012_f64.powi(2);
+            // Once speech starts, quieter trailing words still keep the turn
+            // open. Idle background sound must cross the higher start gate.
+            let voiced = voiced_frame(frame, self.active);
             self.waiting += frame.len();
             if voiced {
                 if !self.active {
@@ -120,6 +126,44 @@ impl WakeDetector {
         }
         None
     }
+    /// Audio keeps arriving while local inference runs. An endpoint is only
+    /// final if that backlog contains no resumed speech. Retain both sides of
+    /// a hesitation and decode them together instead of submitting the prefix.
+    pub fn accept_transcript_with_audio(&mut self, text: &str, queued: &[f32]) -> DecodeOutcome {
+        let empty = || DecodeOutcome {
+            command: None,
+            next: None,
+        };
+        let Some((phase, endpoint)) = self.pending else {
+            return empty();
+        };
+        if text.len() > 8192
+            || text.contains('\0')
+            || queued.len() > COMMAND_CAP
+            || queued.iter().any(|sample| !sample.is_finite())
+        {
+            self.reset();
+            return empty();
+        }
+        let resumed = queued.chunks(320).any(|frame| voiced_frame(frame, true));
+        if endpoint && resumed && (phase == Phase::Wake || self.audio.len() < COMMAND_CAP) {
+            self.pending = None;
+            if phase == Phase::Command || wake_tail(text).is_some() {
+                self.phase = Phase::Command;
+            }
+            return DecodeOutcome {
+                command: None,
+                next: self.ingest(queued),
+            };
+        }
+        let command = self.accept_transcript(text);
+        let next = if command.is_none() {
+            self.ingest(queued)
+        } else {
+            None
+        };
+        DecodeOutcome { command, next }
+    }
     pub fn accept_transcript(&mut self, text: &str) -> Option<String> {
         let (phase, endpoint) = self.pending.take()?;
         if text.len() > 8192 || text.contains('\0') {
@@ -150,6 +194,14 @@ impl WakeDetector {
             }
         }
     }
+}
+fn voiced_frame(frame: &[f32], active: bool) -> bool {
+    if frame.is_empty() {
+        return false;
+    }
+    let energy = frame.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>() / frame.len() as f64;
+    let threshold = if active { CONTINUE_RMS } else { START_RMS };
+    energy >= threshold * threshold
 }
 /// Word boundaries prevent accidental matches such as "Jarvises" or "Jarvis123".
 pub fn wake_tail(text: &str) -> Option<&str> {

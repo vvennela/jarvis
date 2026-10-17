@@ -122,7 +122,7 @@ impl AudioFixture {
         self.texts.lock().unwrap().push_back(text.into());
         let mut chunks = self.chunks.lock().unwrap();
         chunks.push_back(vec![0.1; 16000]);
-        chunks.push_back(vec![0.0; 12000]);
+        chunks.push_back(vec![0.0; 17600]);
     }
 }
 struct Backend(Arc<AudioFixture>);
