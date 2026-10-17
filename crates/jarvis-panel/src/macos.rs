@@ -841,7 +841,10 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             "Open Details to check access.".to_owned()
         } else if matches!(
             chat_snapshot.state,
-            chat::State::Unavailable | chat::State::Failed
+            chat::State::Starting
+                | chat::State::Thinking
+                | chat::State::Unavailable
+                | chat::State::Failed
         ) {
             chat_snapshot.text.chars().take(180).collect::<String>()
         } else if chat_snapshot.state == chat::State::Reply && !chat_snapshot.text.is_empty() {

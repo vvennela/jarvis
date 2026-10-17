@@ -14,7 +14,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, watch};
 
@@ -388,11 +388,20 @@ async fn generate_with_retry(
 ) -> Result<DraftOutcome, DraftError> {
     // Only inference failures before artifact publication are retryable. Both
     // attempts and backoff share one deadline; cancellation also covers delay.
+    let started = Instant::now();
     tokio::time::timeout(Duration::from_secs(90), async {
         let result = task
             .generate(instruction, ids, output, control.cancel.clone())
             .await;
-        if matches!(&result, Err(DraftError::Provider(error)) if error.retryable()) {
+        let delay = match &result {
+            Err(DraftError::Provider(error)) => error.retry_delay(0),
+            _ => None,
+        };
+        if let Some(delay) = delay {
+            let delay = delay.max(Duration::from_secs(2));
+            if delay >= Duration::from_secs(90).saturating_sub(started.elapsed()) {
+                return result;
+            }
             control.update(
                 State::Running,
                 "The draft provider is temporarily busy or unreachable. Retrying once…",
@@ -401,7 +410,7 @@ async fn generate_with_retry(
             tokio::select! {
                 biased;
                 _ = cancelled(&control.cancel) => {},
-                _ = tokio::time::sleep(Duration::from_secs(2)) => {},
+                _ = tokio::time::sleep(delay) => {},
             }
             task.generate(instruction, ids, output, control.cancel.clone())
                 .await
@@ -428,9 +437,10 @@ fn error_text(error: DraftError) -> &'static str {
         DraftError::Provider(jarvis::providers::ProviderError::Rejected) => {
             "The draft provider rejected the request. Check the configured worker model and account access."
         }
-        DraftError::Provider(jarvis::providers::ProviderError::RateLimited) => {
-            "The draft provider is rate limiting requests. Please try again shortly."
-        }
+        DraftError::Provider(
+            jarvis::providers::ProviderError::RateLimited
+            | jarvis::providers::ProviderError::RateLimitedAfter(_),
+        ) => "The draft provider is rate limiting requests. Please try again shortly.",
         DraftError::Provider(jarvis::providers::ProviderError::ServerUnavailable) => {
             "The draft provider is temporarily unavailable. Please try again shortly."
         }

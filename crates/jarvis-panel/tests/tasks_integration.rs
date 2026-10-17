@@ -33,17 +33,26 @@ fn wait(mut condition: impl FnMut() -> bool) {
 struct Peer {
     endpoint: String,
     requests: Arc<Mutex<Vec<Value>>>,
+    request_times: Arc<Mutex<Vec<Instant>>>,
     stop: Arc<AtomicBool>,
     hold: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
 impl Peer {
     fn new(statuses: Vec<u16>) -> Self {
+        Self::with_retry_after(statuses, None)
+    }
+    fn with_retry_after(statuses: Vec<u16>, retry_after: Option<&str>) -> Self {
+        let retry_header = retry_after
+            .map(|v| format!("Retry-After: {v}\r\n"))
+            .unwrap_or_default();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let captured = requests.clone();
+        let request_times = Arc::new(Mutex::new(Vec::new()));
+        let times = request_times.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
         let hold = Arc::new(AtomicBool::new(false));
@@ -86,6 +95,7 @@ impl Peer {
                     }
                 };
                 captured.lock().unwrap().push(body);
+                times.lock().unwrap().push(Instant::now());
                 while holding.load(Ordering::Acquire) && !stopped.load(Ordering::Acquire) {
                     thread::sleep(Duration::from_millis(2));
                 }
@@ -98,7 +108,7 @@ impl Peer {
                 // Zero is a fixture plan for malformed JSON under HTTP 200.
                 let status = if status == 0 { 200 } else { status };
                 let response = format!(
-                    "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\n{retry_header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = socket.write_all(response.as_bytes());
@@ -107,6 +117,7 @@ impl Peer {
         Self {
             endpoint,
             requests,
+            request_times,
             stop,
             hold,
             thread: Some(handle),
@@ -608,5 +619,42 @@ fn cancelling_draft_during_retry_backoff_prevents_second_provider_call_and_artif
     thread::sleep(Duration::from_millis(2200));
     assert_eq!(peer.packets().len(), 1, "cancelled retry reached provider");
     assert_eq!(fs::read_dir(temp.join("drafts")).unwrap().count(), 0);
+    finish(&mut worker);
+}
+
+#[test]
+fn draft_respects_server_cooldown_before_publishing_a_single_review_artifact() {
+    let temp = support::TempDir::new();
+    let _db = seed(&temp);
+    let peer = Peer::with_retry_after(vec![429, 200], Some("3"));
+    let mut worker = peer.worker(&temp, opener(&temp));
+    worker
+        .control
+        .submit("Draft a Beacon handoff".into())
+        .unwrap();
+    wait(|| {
+        peer.packets().len() == 1
+            && worker
+                .control
+                .snapshot()
+                .text
+                .to_ascii_lowercase()
+                .contains("retry")
+    });
+    thread::sleep(Duration::from_millis(2200));
+    assert_eq!(
+        peer.packets().len(),
+        1,
+        "draft retried at old2sec delay instead of server3sec"
+    );
+    assert_eq!(fs::read_dir(temp.join("drafts")).unwrap().count(), 0);
+    assert!(worker.control.snapshot().path.is_none());
+    wait(|| !worker.control.busy());
+    assert_eq!(worker.control.snapshot().state, State::ReadyForReview);
+    let times = peer.request_times.lock().unwrap().clone();
+    assert_eq!(times.len(), 2);
+    assert!(times[1].duration_since(times[0]) >= Duration::from_secs(3));
+    assert_eq!(fs::read_dir(temp.join("drafts")).unwrap().count(), 1);
+    assert!(!temp.join("opened-args").exists());
     finish(&mut worker);
 }

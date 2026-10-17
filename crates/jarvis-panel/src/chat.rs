@@ -10,14 +10,13 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, watch};
 
 pub const MAX_QUESTION_BYTES: usize = 8192;
 pub const MAX_DISPLAY_BYTES: usize = 32768;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-const RETRY_DELAY: Duration = Duration::from_millis(350);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -225,24 +224,47 @@ impl ConversationWorker {
 
 /// These requests only generate text. A failed attempt has not committed a
 /// conversation turn; retrying cannot repeat a tool write or send a message.
-/// The caller's timeout and cancellation select wrap both attempts and delay.
+/// The caller's timeout and cancellation select wrap all attempts and delays.
 async fn ask_with_retry(
     conversation: &mut Conversation,
     question: &str,
     control: &Control,
 ) -> Result<Reply, ConversationError> {
-    let result = conversation.ask(question).await;
-    if matches!(&result, Err(ConversationError::Provider(error)) if error.retryable()) {
-        control.update(
-            State::Thinking,
-            "The model connection had a temporary problem. Retrying once…",
-            false,
+    let started = Instant::now();
+    for attempt in 0..3 {
+        let result = conversation.ask(question).await;
+        let Err(ConversationError::Provider(error)) = &result else {
+            return result;
+        };
+        let limited = matches!(
+            error,
+            ProviderError::RateLimited | ProviderError::RateLimitedAfter(_)
         );
-        tokio::time::sleep(RETRY_DELAY).await;
-        conversation.ask(question).await
-    } else {
-        result
+        // One retry for connection failures; at most two for rate limits.
+        // Never retry earlier than the provider permits just to fit a deadline.
+        let Some(delay) = error.retry_delay(attempt) else {
+            return result;
+        };
+        if attempt >= if limited { 2 } else { 1 }
+            || delay >= REQUEST_TIMEOUT.saturating_sub(started.elapsed())
+        {
+            return result;
+        }
+        let message = if limited {
+            format!(
+                "Crusoe is busy. Keeping your question and retrying in {} seconds…",
+                delay
+                    .as_secs()
+                    .saturating_add(u64::from(delay.subsec_nanos() > 0))
+                    .max(1)
+            )
+        } else {
+            "The model connection had a temporary problem. Retrying once…".into()
+        };
+        control.update(State::Thinking, &message, false);
+        tokio::time::sleep(delay).await;
     }
+    unreachable!("the third attempt always returns")
 }
 
 // Do not interpolate configuration values, provider response bodies, or
@@ -280,7 +302,7 @@ fn error_message(error: ConversationError) -> &'static str {
             ProviderError::Authentication => {
                 "Model provider authentication failed. Check access in your provider account settings."
             }
-            ProviderError::RateLimited => {
+            ProviderError::RateLimited | ProviderError::RateLimitedAfter(_) => {
                 "The model provider is limiting requests. Please try again shortly."
             }
             ProviderError::ServerUnavailable => {

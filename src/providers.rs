@@ -2,7 +2,12 @@
 //! executable capabilities. Dropping a call future cancels local waiting; it
 //! does not promise cancellation of provider-side inference or billing.
 
-use std::{fmt, net::IpAddr, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    net::IpAddr,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use reqwest::{Client, Url, header};
 use serde::{Deserialize, Serialize};
@@ -20,6 +25,7 @@ pub enum ProviderError {
     InvalidInput,
     Authentication,
     RateLimited,
+    RateLimitedAfter(Duration),
     ServerUnavailable,
     Rejected,
     Transport,
@@ -35,8 +41,27 @@ impl ProviderError {
     pub fn retryable(self) -> bool {
         matches!(
             self,
-            Self::RateLimited | Self::ServerUnavailable | Self::Transport | Self::Timeout
+            Self::RateLimited
+                | Self::RateLimitedAfter(_)
+                | Self::ServerUnavailable
+                | Self::Transport
+                | Self::Timeout
         )
+    }
+
+    /// Suggested delay for a zero-based retry attempt. The runner must still
+    /// enforce its deadline and attempt limit before waiting or sending again.
+    pub fn retry_delay(&self, attempt: u32) -> Option<Duration> {
+        match self {
+            Self::RateLimitedAfter(delay) => Some((*delay).max(Duration::from_millis(250))),
+            Self::RateLimited => Some(Duration::from_secs(
+                2_u64.saturating_mul(1_u64 << attempt.min(4)).min(30),
+            )),
+            Self::ServerUnavailable | Self::Transport | Self::Timeout => {
+                Some(Duration::from_millis(350))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -46,7 +71,7 @@ impl fmt::Display for ProviderError {
             Self::InvalidConfiguration => "invalid provider configuration",
             Self::InvalidInput => "provider input is empty, invalid, or exceeds its limit",
             Self::Authentication => "provider authentication failed",
-            Self::RateLimited => "provider rate limit reached",
+            Self::RateLimited | Self::RateLimitedAfter(_) => "provider rate limit reached",
             Self::ServerUnavailable => "provider temporarily unavailable",
             Self::Rejected => "provider rejected the request",
             Self::Transport => "provider transport failed",
@@ -179,7 +204,7 @@ impl Transport {
             match response.status().as_u16() {
                 200..=299 => {}
                 401 | 403 => return Err(ProviderError::Authentication),
-                429 => return Err(ProviderError::RateLimited),
+                429 => return Err(rate_limit_error(response.headers(), SystemTime::now())),
                 500..=599 => return Err(ProviderError::ServerUnavailable),
                 _ => return Err(ProviderError::Rejected),
             }
@@ -201,6 +226,34 @@ impl Transport {
         .await
         .map_err(|_| ProviderError::Timeout)?
     }
+}
+
+fn rate_limit_error(headers: &header::HeaderMap, now: SystemTime) -> ProviderError {
+    // Keep only parsed timing metadata, never provider text. If several valid
+    // Retry-After values arrive, respect the longest requested delay.
+    let delay = headers
+        .get_all(header::RETRY_AFTER)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(|value| {
+            let value = value.trim();
+            if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+                // An overflowing decimal means a delay beyond our representable
+                // range. Preserve that as MAX so a runner's budget rejects it.
+                Some(
+                    value
+                        .parse::<u64>()
+                        .map(Duration::from_secs)
+                        .unwrap_or(Duration::MAX),
+                )
+            } else {
+                httpdate::parse_http_date(value)
+                    .ok()
+                    .map(|date| date.duration_since(now).unwrap_or(Duration::ZERO))
+            }
+        })
+        .max();
+    delay.map_or(ProviderError::RateLimited, ProviderError::RateLimitedAfter)
 }
 
 fn transport_error(error: reqwest::Error) -> ProviderError {
