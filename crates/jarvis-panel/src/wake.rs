@@ -5,6 +5,10 @@ const SILENCE: usize = RATE * 11 / 10;
 const START_RMS: f64 = 0.012;
 const CONTINUE_RMS: f64 = 0.006;
 const WAKE_WINDOW: usize = RATE * 4;
+// Speech classification can arrive after a quiet invocation has begun.
+// Preserve its onset for local fallback transcription without changing the
+// speech gate or extending the total four-second wake window.
+const SPEECH_PREROLL: usize = RATE;
 const FIRST_DECODE_INTERVAL: usize = RATE * 6 / 5;
 const DECODE_INTERVAL: usize = RATE * 5 / 2;
 const COMMAND_CAP: usize = RATE * 15;
@@ -131,8 +135,8 @@ impl WakeDetector {
                 break;
             }
             self.since_decode += frame.len();
-            if !self.active && self.audio.len() > RATE / 10 {
-                self.audio.drain(..self.audio.len() - RATE / 10);
+            if !self.active && self.audio.len() > SPEECH_PREROLL {
+                self.audio.drain(..self.audio.len() - SPEECH_PREROLL);
             }
             if self.phase == Phase::Command && !self.active && self.waiting >= RATE * 10 {
                 self.reset();

@@ -28,11 +28,19 @@ fn gain(rate: u32, hz: f64) -> f64 {
 }
 #[test]
 fn microphone_downsampling_preserves_speech_passband_at_common_input_rates() {
-    for rate in [44100, 48000, 96000, 192000] {
+    for rate in [24000, 44100, 48000, 96000, 192000] {
         for hz in [1000., 3000., 5000.] {
             let measured = gain(rate, hz);
+            // Fractional 24 kHz → 16 kHz interpolation introduces a measured 5 kHz
+            // rolloff below 1 dB; integer48k and other rates retain their
+            // original 5% acceptance. This does not establish wake reliability.
+            let minimum = if rate == 24000 {
+                10_f64.powf(-1.0 / 20.0)
+            } else {
+                0.95
+            };
             assert!(
-                (0.95..=1.05).contains(&measured),
+                (minimum..=1.05).contains(&measured),
                 "speech passband gain {measured:.5} at {hz}Hz, input {rate}Hz"
             );
         }
@@ -40,8 +48,11 @@ fn microphone_downsampling_preserves_speech_passband_at_common_input_rates() {
 }
 #[test]
 fn frequencies_above_output_nyquist_do_not_fold_into_the_command_band() {
-    for rate in [44100, 48000, 96000, 192000] {
-        for hz in [9000., 12000., 20000.] {
+    for rate in [24000, 44100, 48000, 96000, 192000] {
+        for hz in [9000., 12000., 20000.]
+            .into_iter()
+            .filter(|&hz| hz < f64::from(rate) / 2.0)
+        {
             let measured = gain(rate, hz);
             let maximum = if hz == 9000. { 0.02 } else { 0.01 };
             assert!(
@@ -53,7 +64,7 @@ fn frequencies_above_output_nyquist_do_not_fold_into_the_command_band() {
 }
 #[test]
 fn dc_gain_duration_and_sixteen_kilohertz_identity_are_preserved() {
-    for rate in [16000, 44100, 48000, 96000, 192000] {
+    for rate in [16000, 24000, 44100, 48000, 96000, 192000] {
         let output = resample(rate, &vec![0.25; rate as usize / 4]);
         assert!((output.len() as isize - 4000).abs() <= 1);
         assert!(output.iter().all(|s| s.is_finite() && s.abs() <= 1.0));
@@ -77,7 +88,7 @@ fn dc_gain_duration_and_sixteen_kilohertz_identity_are_preserved() {
 }
 #[test]
 fn fragmented_stereo_and_consumer_drains_preserve_filter_history_exactly() {
-    for rate in [44100, 48000, 96000, 192000] {
+    for rate in [24000, 44100, 48000, 96000, 192000] {
         let input: Vec<f32> = (0..rate / 8)
             .flat_map(|n| {
                 let low = (TAU * 3000. * f64::from(n) / f64::from(rate)).sin() as f32 * 0.2;
@@ -134,7 +145,7 @@ fn filtered_capture_rejects_nonfinite_input_and_retains_recording_cap() {
 #[test]
 #[ignore = "explicit local callback cost measurement; generated tones, no microphone"]
 fn report_debug_callback_cost_at_common_input_rates() {
-    for rate in [44100, 48000, 96000, 192000] {
+    for rate in [24000, 44100, 48000, 96000, 192000] {
         let input = tone(rate, 3000., 3.0);
         let mut buffer = CaptureBuffer::continuous(rate, 1).unwrap();
         let start = std::time::Instant::now();

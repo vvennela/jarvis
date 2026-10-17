@@ -182,13 +182,23 @@ fn opt_in_real_keyword_and_whisper_worker_preserves_same_breath_request() {
         handoff: jarvis_voice::capture::AudioHandoff,
         resampler: jarvis_voice::capture::CaptureBuffer,
         exhausted: Arc<AtomicBool>,
+        force_keyword_miss: bool,
+        activity_delay_samples: usize,
     }
     impl WakeBackend for LocalBackend {
         fn wake_fallback_enabled(&self) -> bool {
             true
         }
         fn speech_activity(&mut self, samples: &[f32]) -> Result<Option<Vec<bool>>, &'static str> {
-            self.vad.classify(samples).map(Some)
+            let mut flags = self.vad.classify(samples)?;
+            for (flag, frame) in flags.iter_mut().zip(samples.chunks(320)) {
+                if self.activity_delay_samples > 0 {
+                    *flag = false;
+                }
+                self.activity_delay_samples =
+                    self.activity_delay_samples.saturating_sub(frame.len());
+            }
+            Ok(Some(flags))
         }
         fn start(&mut self) -> Result<(), &'static str> {
             Ok(())
@@ -207,8 +217,13 @@ fn opt_in_real_keyword_and_whisper_worker_preserves_same_breath_request() {
             Ok(self.handoff.drain())
         }
         fn keyword_spot(&mut self, samples: &[f32]) -> Result<Option<KeywordStatus>, &'static str> {
+            let detected = self.kws.accept(samples)?;
             Ok(Some(KeywordStatus {
-                lookback_samples: self.kws.accept(samples)?.map(|d| d.lookback_samples),
+                lookback_samples: if self.force_keyword_miss {
+                    None
+                } else {
+                    detected.map(|d| d.lookback_samples)
+                },
             }))
         }
         fn reset_keyword(&mut self) {
@@ -264,9 +279,9 @@ fn opt_in_real_keyword_and_whisper_worker_preserves_same_breath_request() {
         .ok()
         .map(|s| s.parse::<u32>().unwrap())
         .unwrap_or(16000);
-    assert!([16000, 48000].contains(&source_rate));
-    if source_rate == 48000 {
-        // Generate continuous 48kHz microphone-like input from a trusted 16kHz
+    assert!([16000, 24000, 48000].contains(&source_rate));
+    if source_rate != 16000 {
+        // Generate continuous input-rate microphone-like audio from trusted 16kHz
         // speech fixture, then add an independently generated out-of-band tone.
         // The production CaptureBuffer, not the test, must remove that tone.
         let ultrasonic_gain = std::env::var("JARVIS_TEST_HIGH_FREQUENCY_GAIN")
@@ -274,15 +289,17 @@ fn opt_in_real_keyword_and_whisper_worker_preserves_same_breath_request() {
             .map(|s| s.parse::<f32>().unwrap())
             .unwrap_or(0.0);
         let original = std::mem::take(&mut samples);
-        samples = (0..original.len() * 3)
+        samples = (0..original.len() * source_rate as usize / 16000)
             .map(|n| {
-                let index = n / 3;
-                let fraction = (n % 3) as f32 / 3.0;
+                let position = n as f64 * 16000.0 / f64::from(source_rate);
+                let index = position.floor() as usize;
+                let fraction = position.fract() as f32;
                 let next = original.get(index + 1).copied().unwrap_or(original[index]);
                 original[index] * (1.0 - fraction)
                     + next * fraction
                     + ultrasonic_gain
-                        * (std::f64::consts::TAU * 12000.0 * n as f64 / 48000.0).sin() as f32
+                        * (std::f64::consts::TAU * 12000.0 * n as f64 / f64::from(source_rate))
+                            .sin() as f32
             })
             .collect();
     }
@@ -298,6 +315,11 @@ fn opt_in_real_keyword_and_whisper_worker_preserves_same_breath_request() {
             resampler: jarvis_voice::capture::CaptureBuffer::continuous(source_rate, 1).unwrap(),
             handoff: jarvis_voice::capture::AudioHandoff::new(),
             exhausted: backend_exhausted,
+            force_keyword_miss: std::env::var_os("JARVIS_TEST_FORCE_KWS_MISS").is_some(),
+            activity_delay_samples: std::env::var("JARVIS_TEST_VAD_DELAY_MS")
+                .ok()
+                .map(|s| s.parse::<usize>().unwrap() * 16)
+                .unwrap_or(0),
         }))
     })
     .unwrap();

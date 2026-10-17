@@ -1015,3 +1015,37 @@ fn invalid_activity_alignment_clears_wake_authorization_instead_of_guessing_labe
     assert!(invalid.next.is_none());
     assert_eq!(detector.phase(), Phase::Wake);
 }
+
+#[test]
+fn delayed_vad_onset_preserves_quiet_wake_prefix_for_local_recognition() {
+    let mut detector = WakeDetector::new();
+    // The first 400 ms represent a quiet wake word which the classifier labels
+    // nonspeech; the stronger request tail finally crosses its speech gate.
+    let quiet_prefix = vec![0.004; 6400];
+    for frame in quiet_prefix.chunks(320) {
+        assert!(
+            detector
+                .ingest_with_activity(frame, Some(&[false]))
+                .is_none()
+        );
+    }
+    let mut decoded = None;
+    for _ in 0..60 {
+        if let Some(request) = detector.ingest_with_activity(&[0.1; 320], Some(&[true])) {
+            decoded = Some(request);
+            break;
+        }
+    }
+    let request = decoded.expect("voiced tail should trigger a bounded local decode");
+    let preserved_prefix = request
+        .samples
+        .iter()
+        .take_while(|&&sample| sample == 0.004)
+        .count();
+    assert_eq!(
+        preserved_prefix,
+        quiet_prefix.len(),
+        "speech-classifier onset clipped the quiet wake word before Whisper could inspect it"
+    );
+    assert!(request.samples.len() <= 64000);
+}
