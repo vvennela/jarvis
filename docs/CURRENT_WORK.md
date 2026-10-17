@@ -30,7 +30,7 @@ Finish the installed-app rehearsal: reliable voice request, fresh shared context
 
 ## Remaining scope
 
-Current awareness watches the approved project docs and explicitly granted browser sites. Website form interaction, mailbox access, resuming an existing Codex conversation, continuous task reconstruction across every app, utterance-frozen focus, full-duplex voice interruption and speaker identification remain later work.
+Current awareness watches the approved project docs and explicitly granted browser sites. Background navigation of an existing named tab is implemented with fresh document checks, grants for both sites, literal URL-only updates, and verified destination identity. Its extension, authenticated native-host, client, and tool integration checks use controlled fixtures. The installed Arc extension still needs reloading and a live focus-preservation check; browser control was stopped before that check. Clicking, filling drafts, mailbox access, resuming an existing Codex conversation, continuous task reconstruction across every app, utterance-frozen focus, full-duplex voice interruption and speaker identification remain later work.
 
 Independent compound actions and scoped clarification have passing integration fixtures. The full live compound now passed in **5.747 seconds**: Nano planned two parallel clause-specific tool loops, opened the canonical Napoleon Wikipedia page, and verified a Taylor Swift track playing. A separate paused-Metallica → Taylor Swift switch passed in **6.033 seconds**. Requests using “then” stay intact rather than being dispatched as independent parallel actions. These live checks exclude human voice.
 

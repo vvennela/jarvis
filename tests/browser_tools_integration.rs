@@ -343,6 +343,49 @@ async fn actual_native_host_correlates_fresh_reads_and_persists_only_validated_p
         emulator
     );
     assert_eq!(read.unwrap().content, "Fresh fixture browser evidence");
+    let mut navigated_tab = expected_tab.clone();
+    navigated_tab["document_id"] = json!("document-after-navigation");
+    navigated_tab["url"] = json!("https://example.com/destination");
+    let emulator = async {
+        let request = read_frame(&mut extension).await;
+        assert_eq!(request["operation"], "navigate_tab");
+        assert_eq!(
+            request["arguments"]["url"],
+            "https://example.com/destination"
+        );
+        write_frame(&mut extension, &json!({"type":"browser.result","protocol_version":1,"session_id":session,"request_id":request["request_id"],"status":"ok","tabs":[navigated_tab],"page":null})).await;
+    };
+    let (navigated, ()) = tokio::join!(
+        client.navigate_tab(
+            &found[0].resource_id,
+            &found[0].document_id,
+            "https://example.com/destination"
+        ),
+        emulator
+    );
+    let navigated = navigated.unwrap();
+    assert_eq!(navigated.document_id, "document-after-navigation");
+    assert_eq!(
+        client
+            .read_tab(&found[0].resource_id, &found[0].document_id)
+            .await
+            .unwrap_err(),
+        BrowserError::InvalidInput
+    );
+    let emulator = async {
+        let request = read_frame(&mut extension).await;
+        assert_eq!(request["operation"], "read_tab");
+        assert_eq!(
+            request["arguments"]["expected_document_id"],
+            "document-after-navigation"
+        );
+        write_frame(&mut extension, &json!({"type":"browser.result","protocol_version":1,"session_id":session,"request_id":request["request_id"],"status":"ok","tabs":[],"page":{"tab":navigated_tab,"content":"Verified destination fixture","truncated":false,"trust":"untrusted_page"}})).await;
+    };
+    let (read, ()) = tokio::join!(
+        client.read_tab(&navigated.resource_id, &navigated.document_id),
+        emulator
+    );
+    assert_eq!(read.unwrap().content, "Verified destination fixture");
     drop(extension);
     let report = tokio::task::spawn_blocking(move || thread.join().unwrap())
         .await
@@ -462,4 +505,245 @@ async fn conversational_model_searches_then_reads_a_fresh_tab_through_the_tool_r
         requests[2]["chat_template_kwargs"]["enable_thinking"],
         false
     );
+}
+
+#[tokio::test]
+async fn navigation_requires_discovered_document_and_replaces_its_read_authority_after_verified_result()
+ {
+    let mut destination = tab();
+    destination["document_id"] = json!("document-two");
+    destination["url"] = json!("https://example.com/new");
+    let mut new_page = page();
+    new_page["tab"] = destination.clone();
+    let peer = Peer::new(vec![
+        response(vec![tab()], Value::Null),
+        response(vec![destination], Value::Null),
+        response(vec![], new_page),
+    ])
+    .await;
+    let client = peer.client();
+    let id = tab()["resource_id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        client
+            .navigate_tab(&id, "document-one", "https://example.com/new")
+            .await
+            .unwrap_err(),
+        BrowserError::InvalidInput
+    );
+    assert_eq!(peer.count(), 0);
+    client.search_tabs("work").await.unwrap();
+    let result = client
+        .navigate_tab(&id, "document-one", "https://example.com/new")
+        .await
+        .unwrap();
+    assert_eq!(result.document_id, "document-two");
+    assert_eq!(
+        client.read_tab(&id, "document-one").await.unwrap_err(),
+        BrowserError::InvalidInput
+    );
+    assert_eq!(peer.count(), 2);
+    assert_eq!(
+        client.read_tab(&id, "document-two").await.unwrap().tab.url,
+        "https://example.com/new"
+    );
+    let requests = peer.requests.lock().unwrap();
+    assert_eq!(requests[1]["operation"], "navigate_tab");
+    assert_eq!(
+        requests[1]["arguments"],
+        json!({"resource_id":id,"expected_document_id":"document-one","url":"https://example.com/new"})
+    );
+}
+
+#[tokio::test]
+async fn malformed_navigation_success_is_unknown_and_cannot_grant_new_authority_or_retry() {
+    for mutation in [
+        "old-document",
+        "other-url",
+        "other-tab",
+        "other-window",
+        "other-resource",
+        "two-tabs",
+        "page",
+        "correlation",
+    ] {
+        let mut changed = tab();
+        changed["document_id"] = json!("new-document");
+        changed["url"] = json!("https://example.com/new");
+        match mutation {
+            "old-document" => changed["document_id"] = json!("document-one"),
+            "other-url" => changed["url"] = json!("https://evil.example/"),
+            "other-tab" => changed["tab_id"] = json!(9),
+            "other-window" => changed["window_id"] = json!(9),
+            "other-resource" => {
+                changed["resource_id"] = json!(format!("browser-live:{}:9", "a".repeat(64)))
+            }
+            _ => {}
+        }
+        let mut result = response(vec![changed.clone()], Value::Null);
+        if mutation == "two-tabs" {
+            result.value["tabs"] = json!([changed, tab()]);
+        }
+        if mutation == "page" {
+            result.value["page"] = page();
+        }
+        if mutation == "correlation" {
+            result.wrong_id = true;
+        }
+        let peer = Peer::new(vec![response(vec![tab()], Value::Null), result]).await;
+        let client = peer.client();
+        let found = client.search_tabs("work").await.unwrap().remove(0);
+        assert_eq!(
+            client
+                .navigate_tab(
+                    &found.resource_id,
+                    &found.document_id,
+                    "https://example.com/new"
+                )
+                .await
+                .unwrap_err(),
+            BrowserError::OutcomeUnknown,
+            "{mutation}"
+        );
+        assert_eq!(
+            client
+                .read_tab(&found.resource_id, &found.document_id)
+                .await
+                .unwrap_err(),
+            BrowserError::InvalidInput
+        );
+        assert_eq!(peer.count(), 2, "unexpected retry for {mutation}");
+    }
+}
+
+#[tokio::test]
+async fn invalid_navigation_urls_never_write_and_cancelled_navigation_revokes_old_handles() {
+    let peer = Peer::new(vec![response(vec![tab()], Value::Null)]).await;
+    let client = peer.client();
+    let found = client.search_tabs("work").await.unwrap().remove(0);
+    for url in [
+        "javascript:alert(1)",
+        "https://user:pass@example.com/new",
+        "https://example.com/with space",
+        "file:///tmp/private",
+    ] {
+        assert_eq!(
+            client
+                .navigate_tab(&found.resource_id, &found.document_id, url)
+                .await
+                .unwrap_err(),
+            BrowserError::InvalidInput,
+            "{url}"
+        );
+    }
+    assert_eq!(peer.count(), 1);
+    let mut pending = response(vec![], Value::Null);
+    pending.delay = Duration::from_secs(2);
+    let peer = Peer::new(vec![response(vec![tab()], Value::Null), pending]).await;
+    let client = peer.client();
+    let found = client.search_tabs("work").await.unwrap().remove(0);
+    let result = tokio::time::timeout(
+        Duration::from_millis(80),
+        client.navigate_tab(
+            &found.resource_id,
+            &found.document_id,
+            "https://example.com/new",
+        ),
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(
+        client
+            .read_tab(&found.resource_id, &found.document_id)
+            .await
+            .unwrap_err(),
+        BrowserError::InvalidInput
+    );
+    assert_eq!(peer.count(), 2);
+}
+
+#[tokio::test]
+async fn navigation_tool_preserves_original_named_tab_and_destination_authority() {
+    use jarvis::{providers::ToolCall, tool_runtime::ToolRuntime};
+    for (request, args) in [
+        (
+            "Summarize Fixture work",
+            json!({"resource_id":tab()["resource_id"],"expected_document_id":"document-one","url":"https://example.com/new"}),
+        ),
+        (
+            "Do not navigate Fixture work tab to https://example.com/new",
+            json!({"resource_id":tab()["resource_id"],"expected_document_id":"document-one","url":"https://example.com/new"}),
+        ),
+        (
+            "Navigate Fixture work tab to https://example.com/new",
+            json!({"resource_id":tab()["resource_id"],"expected_document_id":"document-one","url":"https://evil.example/"}),
+        ),
+        (
+            "Navigate different tab to https://example.com/new",
+            json!({"resource_id":tab()["resource_id"],"expected_document_id":"document-one","url":"https://example.com/new"}),
+        ),
+        (
+            "Navigate Fixture work tab to https://example.com/new",
+            json!({"resource_id":tab()["resource_id"],"expected_document_id":"document-one","url":"https://example.com/new","active":true}),
+        ),
+    ] {
+        let peer = Peer::new(vec![response(vec![tab()], Value::Null)]).await;
+        let client = peer.client();
+        client.search_tabs("work").await.unwrap();
+        let runtime = ToolRuntime::read_only(peer.dir.join("unused.db")).with_browser(client);
+        let result = runtime
+            .execute(
+                request,
+                &ToolCall {
+                    id: "navigate".into(),
+                    name: "browser_navigate_tab".into(),
+                    arguments: args,
+                },
+            )
+            .await;
+        assert!(result.acknowledgment.is_some());
+        assert_eq!(peer.count(), 1, "unauthorized navigation for {request}");
+    }
+}
+
+#[test]
+fn navigation_parser_preserves_exact_url_punctuation_and_case() {
+    use jarvis::request_intent::tab_navigation_intent;
+    for url in [
+        "https://example.com/Report.",
+        "https://example.com/path!",
+        "https://example.com/search?q=why?",
+        "https://example.com/CaseSensitive",
+    ] {
+        let (query, actual) =
+            tab_navigation_intent(&format!("Navigate work tab to {url}")).unwrap();
+        assert_eq!(query, "work");
+        assert_eq!(actual, url, "destination silently changed");
+    }
+}
+
+#[tokio::test]
+async fn trusted_named_navigation_searches_uniquely_then_changes_only_that_document() {
+    use jarvis::tool_runtime::ToolRuntime;
+    let mut moved = tab();
+    moved["document_id"] = json!("document-after");
+    moved["url"] = json!("https://example.com/New.");
+    let peer = Peer::new(vec![
+        response(vec![tab()], Value::Null),
+        response(vec![moved], Value::Null),
+    ])
+    .await;
+    let runtime = ToolRuntime::read_only(peer.dir.join("unused.db")).with_browser(peer.client());
+    let result = runtime
+        .handle_resolved_intent("Navigate Fixture work tab to https://example.com/New.")
+        .await
+        .unwrap();
+    assert_eq!(
+        result.acknowledgment.as_deref(),
+        Some("The tab is updated in the background.")
+    );
+    let requests = peer.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["operation"], "search_tabs");
+    assert_eq!(requests[1]["operation"], "navigate_tab");
+    assert_eq!(requests[1]["arguments"]["url"], "https://example.com/New.");
 }

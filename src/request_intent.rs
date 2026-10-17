@@ -266,6 +266,58 @@ pub fn wikipedia_page_intent(request: &str) -> Option<String> {
     None
 }
 
+/// A named tab and explicit destination from human speech/text. Document text
+/// and implicit focus cannot supply either part of a navigation authorization.
+pub fn tab_navigation_intent(request: &str) -> Option<(String, String)> {
+    if request.len() > MAX_REQUEST || request.chars().any(char::is_control) || quoted(request) {
+        return None;
+    }
+    let text = request.trim();
+    let lower = text.to_ascii_lowercase();
+    let body = imperative(&lower);
+    let offset = lower.len() - body.len();
+    let original_body = &text[offset..];
+    let (query, destination) = if let Some(rest) = ["navigate ", "change ", "open "]
+        .iter()
+        .find_map(|prefix| body.strip_prefix(prefix))
+        && let Some((query, _)) = rest.split_once(" tab to ")
+    {
+        let destination_start = body.find(" tab to ")? + " tab to ".len();
+        (query, &original_body[destination_start..])
+    } else if let Some(rest) = body.strip_prefix("open ")
+        && let Some((_, query)) = rest.split_once(" in ")
+        && let Some(query) = query.strip_suffix(" tab")
+    {
+        let destination_end = body.find(" in ")?;
+        (query, &original_body["open ".len()..destination_end])
+    } else {
+        return None;
+    };
+    let query = query
+        .strip_prefix("the ")
+        .or_else(|| query.strip_prefix("my "))
+        .unwrap_or(query)
+        .trim();
+    if query.len() < 3
+        || query.len() > 128
+        || restrictive(query)
+        || matches!(query, "this" | "that" | "current" | "active" | "any")
+    {
+        return None;
+    }
+    let url = reqwest::Url::parse(destination).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || destination.len() > 2048
+        || destination.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    Some((query.to_owned(), url.to_string()))
+}
+
 /// Fill only a supported explicit user-request slot. A model's question cannot
 /// turn a summary or general conversation into permission to perform an action.
 pub fn resolve_action_followup(original: &str, answer: &str) -> Option<String> {

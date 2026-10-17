@@ -1,10 +1,13 @@
-//! Fresh, read-only browser requests over the authenticated native-host session.
+//! Fresh, authenticated browser requests over the authenticated native-host session.
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fmt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,6 +22,7 @@ pub enum BrowserError {
     StaleDocument,
     Timeout,
     InvalidResponse,
+    OutcomeUnknown,
 }
 impl fmt::Display for BrowserError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -29,6 +33,7 @@ impl fmt::Display for BrowserError {
             Self::StaleDocument => "That tab changed. Search again to read its current page.",
             Self::Timeout => "The browser took too long to respond. Try again.",
             Self::InvalidResponse => "I couldn't verify the browser response.",
+            Self::OutcomeUnknown => "That tab may have navigated, but I couldn't verify it. Refresh its state before trying again.",
         })
     }
 }
@@ -56,6 +61,12 @@ pub struct BrowserPage {
 pub enum BrowserRequest {
     #[serde(rename = "search_tabs")]
     SearchTabs { query: String },
+    #[serde(rename = "navigate_tab")]
+    NavigateTab {
+        resource_id: String,
+        expected_document_id: String,
+        url: String,
+    },
     #[serde(rename = "read_tab")]
     ReadTab {
         resource_id: String,
@@ -82,6 +93,7 @@ pub(crate) struct Response {
 pub struct BrowserClient {
     path: PathBuf,
     discovered: Arc<Mutex<HashMap<String, BrowserTab>>>,
+    generation: Arc<AtomicU64>,
 }
 impl BrowserClient {
     pub fn native() -> Result<Self, BrowserError> {
@@ -94,17 +106,78 @@ impl BrowserClient {
         Ok(Self {
             path,
             discovered: Arc::new(Mutex::new(HashMap::new())),
+            generation: Arc::new(AtomicU64::new(0)),
         })
+    }
+    pub fn discovered_tab(&self, resource_id: &str) -> Option<BrowserTab> {
+        self.discovered.lock().ok()?.get(resource_id).cloned()
+    }
+    /// Navigate only a previously discovered exact document. A sent navigation
+    /// has no automatic retry: lost or ambiguous acknowledgment is OutcomeUnknown.
+    pub async fn navigate_tab(
+        &self,
+        resource_id: &str,
+        expected_document_id: &str,
+        url: &str,
+    ) -> Result<BrowserTab, BrowserError> {
+        let url = navigation_url(url).ok_or(BrowserError::InvalidInput)?;
+        let expected = self
+            .discovered_tab(resource_id)
+            .filter(|tab| tab.document_id == expected_document_id)
+            .ok_or(BrowserError::InvalidInput)?;
+        let generation = {
+            let mut discovered = self
+                .discovered
+                .lock()
+                .map_err(|_| BrowserError::Unavailable)?;
+            discovered.clear();
+            self.generation
+                .fetch_add(1, Ordering::SeqCst)
+                .wrapping_add(1)
+        };
+        let response = self
+            .request(BrowserRequest::NavigateTab {
+                resource_id: resource_id.to_owned(),
+                expected_document_id: expected_document_id.to_owned(),
+                url: url.clone(),
+            })
+            .await?;
+        if response.page.is_some() || response.tabs.len() != 1 {
+            return Err(BrowserError::OutcomeUnknown);
+        }
+        let tab = response
+            .tabs
+            .into_iter()
+            .next()
+            .ok_or(BrowserError::OutcomeUnknown)?;
+        if !valid_navigation_result(&expected, &tab, &url) {
+            return Err(BrowserError::OutcomeUnknown);
+        }
+        let mut discovered = self
+            .discovered
+            .lock()
+            .map_err(|_| BrowserError::OutcomeUnknown)?;
+        if self.generation.load(Ordering::SeqCst) != generation {
+            return Err(BrowserError::OutcomeUnknown);
+        }
+        discovered.insert(tab.resource_id.clone(), tab.clone());
+        Ok(tab)
     }
     pub async fn search_tabs(&self, query: &str) -> Result<Vec<BrowserTab>, BrowserError> {
         if query.trim().is_empty() || query.len() > 256 || query.chars().any(char::is_control) {
             return Err(BrowserError::InvalidInput);
         }
         // A failed or cancelled new search must not retain old read authority.
-        self.discovered
-            .lock()
-            .map_err(|_| BrowserError::Unavailable)?
-            .clear();
+        let generation = {
+            let mut discovered = self
+                .discovered
+                .lock()
+                .map_err(|_| BrowserError::Unavailable)?;
+            discovered.clear();
+            self.generation
+                .fetch_add(1, Ordering::SeqCst)
+                .wrapping_add(1)
+        };
         let response = self
             .request(BrowserRequest::SearchTabs {
                 query: query.to_owned(),
@@ -125,10 +198,14 @@ impl BrowserClient {
                 return Err(BrowserError::InvalidResponse);
             }
         }
-        *self
+        let mut discovered = self
             .discovered
             .lock()
-            .map_err(|_| BrowserError::Unavailable)? = validated;
+            .map_err(|_| BrowserError::Unavailable)?;
+        if self.generation.load(Ordering::SeqCst) != generation {
+            return Err(BrowserError::StaleDocument);
+        }
+        *discovered = validated;
         Ok(response.tabs)
     }
     pub async fn read_tab(
@@ -156,6 +233,7 @@ impl BrowserClient {
             || page.tab.resource_id != expected.resource_id
             || page.tab.document_id != expected.document_id
             || page.tab.tab_id != expected.tab_id
+            || page.tab.window_id != expected.window_id
             || page.tab.url != expected.url
             || page.content.len() > 65536
             || page.content.contains('\0')
@@ -166,13 +244,18 @@ impl BrowserClient {
         Ok(page)
     }
     async fn request(&self, request: BrowserRequest) -> Result<Response, BrowserError> {
+        let navigation = matches!(&request, BrowserRequest::NavigateTab { .. });
         let request_id = random_id()?;
         let body = serde_json::to_vec(&ClientRequest {
             request_id: request_id.clone(),
             request,
         })
         .map_err(|_| BrowserError::InvalidInput)?;
-        tokio::time::timeout(DEADLINE, async {
+        if body.len() > 4096 {
+            return Err(BrowserError::InvalidInput);
+        }
+        let mut write_started = false;
+        let result = tokio::time::timeout(DEADLINE, async {
             validate_socket(&self.path)?;
             let mut stream = tokio::net::UnixStream::connect(&self.path)
                 .await
@@ -180,6 +263,7 @@ impl BrowserClient {
             if !same_user(&stream) {
                 return Err(BrowserError::Unavailable);
             }
+            write_started = true;
             stream
                 .write_u32_le(body.len() as u32)
                 .await
@@ -211,12 +295,48 @@ impl BrowserClient {
                 "permission_required" => Err(BrowserError::PermissionRequired),
                 "timeout" => Err(BrowserError::Timeout),
                 "unavailable" | "cancelled" => Err(BrowserError::Unavailable),
+                "outcome_unknown" => Err(BrowserError::OutcomeUnknown),
                 _ => Err(BrowserError::InvalidResponse),
             }
         })
         .await
-        .map_err(|_| BrowserError::Timeout)?
+        .map_err(|_| BrowserError::Timeout)
+        .and_then(|result| result);
+        if navigation && write_started {
+            result.map_err(|error| match error {
+                BrowserError::StaleDocument | BrowserError::PermissionRequired => error,
+                _ => BrowserError::OutcomeUnknown,
+            })
+        } else {
+            result
+        }
     }
+}
+pub(crate) fn navigation_url(raw: &str) -> Option<String> {
+    if raw.is_empty()
+        || raw.len() > 2048
+        || raw.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    let url = reqwest::Url::parse(raw).ok()?;
+    (matches!(url.scheme(), "http" | "https")
+        && url.host().is_some()
+        && url.username().is_empty()
+        && url.password().is_none())
+    .then(|| url.into())
+}
+pub(crate) fn valid_navigation_result(
+    expected: &BrowserTab,
+    actual: &BrowserTab,
+    url: &str,
+) -> bool {
+    valid_tab(actual)
+        && actual.resource_id == expected.resource_id
+        && actual.tab_id == expected.tab_id
+        && actual.window_id == expected.window_id
+        && actual.document_id != expected.document_id
+        && actual.url == url
 }
 pub(crate) fn valid_tab(tab: &BrowserTab) -> bool {
     if !(0..=i32::MAX as i64).contains(&tab.tab_id)

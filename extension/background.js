@@ -6,6 +6,20 @@ import {
 const queue = new ObservationQueue();
 const knownTabs = new Map();
 const documents = new Map();
+// Attribute only navigation metadata, never arbitrary later page edits.
+const ownedNavigations = new Map();
+function navigationAttribution(tabId, url, documentId) {
+  const owned = ownedNavigations.get(tabId);
+  if (!owned) return {};
+  if (url === owned.beforeUrl && !owned.documentId && Date.now() <= owned.expires) return {};
+  if (Date.now() > owned.expires || owned.url !== url
+      || (documentId && owned.documentId && owned.documentId !== documentId)) {
+    ownedNavigations.delete(tabId);
+    return {};
+  }
+  if (documentId) owned.documentId = documentId;
+  return { actor: "runner", owner: "runner", command_id: owned.commandId };
+}
 let port = null;
 let sessionId = null;
 let clientNonce = null;
@@ -53,6 +67,7 @@ function disconnect(problem = "") {
   const old = port;
   port = null;
   sessionId = null;
+  ownedNavigations.clear();
   clientNonce = null;
   if (old) { try { old.disconnect(); } catch { /* already disconnected */ } }
   chrome.storage.local.set({ bridgeProblem: problem });
@@ -131,10 +146,13 @@ async function observe(tabId, kind, extra = {}) {
       knownTabs.delete(tabId);
       return;
     }
-    knownTabs.set(tabId, tabEvent(kind, tab, extra));
+    const attribution = kind === "tab.updated"
+      ? navigationAttribution(tabId, tab.url, extra.document_id) : {};
+    const metadata = { ...extra, ...attribution };
+    knownTabs.set(tabId, tabEvent(kind, tab, metadata));
     // Metadata cache bounded independently of the offline outbound queue.
     if (knownTabs.size > 256) knownTabs.delete(knownTabs.keys().next().value);
-    emit(tabEvent(kind, tab, extra));
+    emit(tabEvent(kind, tab, metadata));
     await inject(tabId);
   } catch { /* Tab vanished during observation. */ }
 }
@@ -193,9 +211,13 @@ chrome.tabs.onUpdated.addListener((tabId, change) => {
 chrome.tabs.onRemoved.addListener(tabId => {
   const last = knownTabs.get(tabId);
   knownTabs.delete(tabId);
+  ownedNavigations.delete(tabId);
   documents.delete(tabId);
   queue.delete(tabId);
-  if (last && !paused) emit({ ...last, kind: "tab.closed", observed_at_ms: Date.now() });
+  if (last && !paused) {
+    const { command_id: _commandId, ...metadata } = last;
+    emit({ ...metadata, actor: "unknown", owner: "unknown", kind: "tab.closed", observed_at_ms: Date.now() });
+  }
 });
 chrome.webNavigation.onCommitted.addListener(details => {
   if (details.frameId !== 0) return;
@@ -214,6 +236,7 @@ chrome.webNavigation.onHistoryStateUpdated.addListener(details => {
 
 async function resetCollection() {
   generation++;
+  ownedNavigations.clear();
   queue.clear();
   knownTabs.clear();
   documents.clear();
@@ -252,6 +275,7 @@ async function handleBrowserRequest(message, current) {
   const replySession = sessionId;
   const epoch = generation;
   let finished = false;
+  let mutationStarted = false;
   const send = (status, data = {}) => {
     if (finished || port !== current || sessionId !== replySession) return;
     finished = true;
@@ -260,14 +284,14 @@ async function handleBrowserRequest(message, current) {
     catch { disconnect(); }
   };
   if (readLease !== null || paused) { send("unavailable"); return; }
-  if (!["search_tabs", "read_tab"].includes(message.operation)) { send("unavailable"); return; }
+  if (!["search_tabs", "read_tab", "navigate_tab"].includes(message.operation)) { send("unavailable"); return; }
   const lease = message.request_id;
   readLease = lease;
   const expiry = setTimeout(() => {
     if (readLease === lease) readLease = null;
-    send("timeout");
+    send(mutationStarted ? "outcome_unknown" : "timeout");
   }, 4500);
-  const stillValid = () => readLease === lease && epoch === generation && !paused && port === current && sessionId === replySession;
+  const stillValid = () => !finished && readLease === lease && epoch === generation && !paused && port === current && sessionId === replySession;
   const identity = async tab => {
     if (!stillValid() || !await permitted(tab)) return null;
     const frame = await chrome.webNavigation.getFrame({ tabId: tab.id, frameId: 0 });
@@ -303,6 +327,50 @@ async function handleBrowserRequest(message, current) {
     if (!await permitted(tab)) { send("permission_required"); return; }
     const before = await identity(tab);
     if (!before || before.document_id !== args.expected_document_id) { send("stale_document"); return; }
+    if (message.operation === "navigate_tab") {
+      if (Object.keys(args).length !== 3
+          || !Object.keys(args).every(key => ["resource_id", "expected_document_id", "url"].includes(key))) {
+        send("unavailable"); return;
+      }
+      const destination = httpUrl(args.url);
+      if (typeof args.url !== "string" || new TextEncoder().encode(args.url).length > 8192
+          || /[\u0000-\u001f\u007f]/.test(args.url) || !destination
+          || destination.href !== args.url) { send("unavailable"); return; }
+      const destinationGranted = await chrome.permissions.contains({ origins: [`${destination.origin}/*`] });
+      if (!destinationGranted) { send("permission_required"); return; }
+      // Permission awaits may allow the user to navigate or move this tab.
+      const finalBefore = await identity(await chrome.tabs.get(tab.id));
+      if (!stillValid()) { send("cancelled"); return; }
+      if (!finalBefore || finalBefore.document_id !== before.document_id
+          || finalBefore.url !== before.url || finalBefore.window_id !== before.window_id) {
+        send("stale_document"); return;
+      }
+      ownedNavigations.set(tab.id, { url: destination.href, beforeUrl: before.url, expires: Date.now() + 10000, documentId: null, commandId: lease });
+      while (ownedNavigations.size > 32) ownedNavigations.delete(ownedNavigations.keys().next().value);
+      mutationStarted = true;
+      // Do not set active/highlighted or focus a window. URL is literal data.
+      await chrome.tabs.update(tab.id, { url: destination.href });
+      while (stillValid()) {
+        const currentTab = await chrome.tabs.get(tab.id);
+        if (currentTab.windowId !== before.window_id || !await permitted(currentTab)) {
+          send("outcome_unknown"); return;
+        }
+        const after = await identity(currentTab);
+        if (!stillValid()) break;
+        // URL and frame metadata can briefly disagree while navigation commits.
+        if (after && after.document_id !== before.document_id) {
+          if (after.url !== destination.href) { send("outcome_unknown"); return; }
+          const granted = await chrome.permissions.contains({ origins: [`${destination.origin}/*`] });
+          if (!stillValid() || !granted) { send("outcome_unknown"); return; }
+          navigationAttribution(tab.id, after.url, after.document_id);
+          send("ok", { tabs: [after] });
+          return;
+        }
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      send("outcome_unknown");
+      return;
+    }
     await inject(tab.id);
     if (!stillValid()) { send("cancelled"); return; }
     const response = await chrome.tabs.sendMessage(tab.id, { type: "jarvis.read" }, { documentId: before.document_id });
@@ -311,6 +379,6 @@ async function handleBrowserRequest(message, current) {
     if (!after || after.document_id !== before.document_id || after.url !== before.url) { send("stale_document"); return; }
     if (typeof response?.content !== "string" || new TextEncoder().encode(response.content).length > MAX_CONTENT_BYTES || typeof response.truncated !== "boolean") { send("unavailable"); return; }
     send("ok", { page: { tab: after, content: response.content, truncated: response.truncated, trust: "untrusted_page" } });
-  } catch { send(stillValid() ? "unavailable" : "cancelled"); }
+  } catch { send(mutationStarted ? "outcome_unknown" : stillValid() ? "unavailable" : "cancelled"); }
   finally { clearTimeout(expiry); if (readLease === lease) readLease = null; }
 }

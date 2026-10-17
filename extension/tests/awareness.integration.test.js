@@ -43,6 +43,8 @@ async function background({ tabs = [tab()], approved = true, paused = false } = 
   const tabMap = new Map(tabs.map(item => [item.id, item]));
   const injections = [];
   const controls = [];
+  const updates = [];
+  let updateTab = async (id, properties) => { Object.assign(tabMap.get(id), properties); return structuredClone(tabMap.get(id)); };
   const storage = {};
   let permission = approved;
   let checkPermission = async () => permission;
@@ -66,6 +68,8 @@ async function background({ tabs = [tab()], approved = true, paused = false } = 
     permissions: { contains: async args => checkPermission(args), onAdded: new Event(), onRemoved: new Event() },
     tabs: { get: async id => { if (!tabMap.has(id)) throw new Error("missing tab"); return structuredClone(tabMap.get(id)); },
       query: async () => [...tabMap.values()].map(item => structuredClone(item)),
+      update: async (id, properties) => { updates.push({id, properties:structuredClone(properties)}); return updateTab(id, properties); },
+      highlight: async () => { throw new Error("must not change user focus"); },
       sendMessage: async (...args) => { controls.push(args); return args[1]?.type === "jarvis.read" ? readPage(...args) : { ok: true }; },
       onActivated: new Event(), onUpdated: new Event(), onRemoved: new Event(),
     },
@@ -77,7 +81,8 @@ async function background({ tabs = [tab()], approved = true, paused = false } = 
     setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout, console });
   await tick();
   return {
-    chrome, ports, tabMap, injections, controls, storage, clock,
+    chrome, ports, tabMap, injections, controls, storage, clock, updates,
+    updateTab(fn) { updateTab = fn; },
     permission(value) { permission = value; },
     permissionChecker(fn) { checkPermission = fn; },
     readPage(fn) { readPage = fn; },
@@ -394,4 +399,91 @@ test("a stalled fresh read expires and cannot release a newer lease or publish l
   assert.equal(port.messages.find(m=>m.type==="browser.result"&&m.request_id===newId).page.content,"fresh result");
   assert.equal(port.messages.filter(m=>m.type==="browser.result"&&m.request_id===oldId).length,1);
   assert.ok(!JSON.stringify(port.messages).includes("late stale content"));
+});
+
+async function navigationFixture(options = {}) {
+  const harness = await background(options);
+  const session = "a".repeat(64);
+  const port = await harness.handshake({session_id:session});
+  let sequence = 0;
+  return Object.assign(harness, {
+    port,
+    args: {resource_id:`browser-live:${session}:1`,expected_document_id:"document-current",url:"https://example.com/destination"},
+    async navigate(overrides = {}) {
+      const id = (++sequence).toString(16).padStart(64,"0");
+      port.onMessage.emit({type:"browser.request",protocol_version:1,session_id:session,request_id:id,operation:"navigate_tab",arguments:{...this.args,...overrides}});
+      await tick();
+      return { id, result: () => port.messages.find(m => m.type === "browser.result" && m.request_id === id) };
+    },
+  });
+}
+
+test("background navigation changes only URL and verifies new document without activating the tab", async () => {
+  const h = await navigationFixture();
+  h.getFrame(async ({tabId}) => ({documentId:h.updates.length ? "document-new" : "document-current",url:h.tabMap.get(tabId).url}));
+  const request = await h.navigate();
+  assert.equal(request.result()?.status,"ok");
+  assert.equal(request.result().page,null);
+  assert.equal(request.result().tabs.length,1);
+  assert.equal(request.result().tabs[0].document_id,"document-new");
+  assert.equal(request.result().tabs[0].url,h.args.url);
+  assert.deepEqual(h.updates,[{id:1,properties:{url:h.args.url}}]);
+});
+
+test("navigation denies stale private ungranted and invalid targets before tabs.update", async () => {
+  for (const scenario of ["stale","private","current-grant","destination-grant","javascript","credentials","extra"]) {
+    const h = await navigationFixture(scenario === "private" ? {tabs:[tab(1,{incognito:true})]} : {});
+    if (scenario === "current-grant") h.permission(false);
+    if (scenario === "destination-grant") h.permissionChecker(async ({origins}) => !origins.some(origin=>origin.includes("destination.example")));
+    const override = scenario === "stale" ? {expected_document_id:"stale"} : scenario === "destination-grant" ? {url:"https://destination.example/new"} : scenario === "javascript" ? {url:"javascript:alert(1)"} : scenario === "credentials" ? {url:"https://user:pass@example.com/path"} : scenario === "extra" ? {active:true} : {};
+    const request = await h.navigate(override);
+    assert.notEqual(request.result()?.status,"ok",scenario);
+    assert.equal(h.updates.length,0,scenario);
+  }
+});
+
+test("navigation write timeout is outcome unknown and late completion never repeats or steals a newer lease", async () => {
+  const h = await navigationFixture();
+  let release;
+  h.updateTab(() => new Promise(resolve=>{release=resolve;}));
+  const old = await h.navigate();
+  assert.equal(h.updates.length,1);
+  await h.clock.fire(4500);
+  assert.equal(old.result()?.status,"outcome_unknown");
+  release(tab(1,{url:h.args.url}));
+  await tick();
+  assert.equal(h.port.messages.filter(m=>m.type==="browser.result"&&m.request_id===old.id).length,1);
+  assert.equal(h.updates.length,1,"late callback retried navigation");
+});
+
+test("permission revocation or pause after navigation starts cannot report verified success", async () => {
+  for (const operation of ["pause","revoke"]) {
+    const h = await navigationFixture();
+    let release;
+    h.updateTab(() => new Promise(resolve=>{release=resolve;}));
+    const request = await h.navigate();
+    assert.equal(h.updates.length,1);
+    if (operation === "pause") await h.pause();
+    else { h.permission(false); h.chrome.permissions.onRemoved.emit({origins:["https://example.com/*"]}); await tick(); }
+    release(tab(1,{url:h.args.url})); await tick();
+    assert.equal(request.result()?.status,"outcome_unknown",operation);
+    assert.equal(h.updates.length,1);
+  }
+});
+
+test("a redirected URL or moved window after navigation is unknown rather than a false success", async () => {
+  for (const change of ["redirect","window","old-document"]) {
+    const h = await navigationFixture();
+    h.updateTab(async (id,properties) => {
+      Object.assign(h.tabMap.get(id),properties);
+      if (change === "redirect") h.tabMap.get(id).url="https://example.com/redirected";
+      if (change === "window") h.tabMap.get(id).windowId=99;
+      return structuredClone(h.tabMap.get(id));
+    });
+    h.getFrame(async ({tabId})=>({documentId:h.updates.length && change!=="old-document" ? "new-document" : "document-current",url:h.tabMap.get(tabId).url}));
+    const request=await h.navigate();
+    if (!request.result()) await h.clock.fire(4500);
+    assert.equal(request.result()?.status,"outcome_unknown",change);
+    assert.equal(h.updates.length,1);
+  }
 });

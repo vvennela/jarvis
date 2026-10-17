@@ -1,6 +1,6 @@
-//! Observation-only Chrome Native Messaging transport. The caller must verify
+//! Authenticated Chrome Native Messaging observations and bounded browser commands. The caller must verify
 //! Chrome's supplied origin before invoking this session and install a manifest
-//! with the exact extension allowed_origin. No frame can invoke an action.
+//! with the exact extension allowed_origin. Only validated local requests can invoke actions.
 
 use std::{
     fmt,
@@ -194,6 +194,7 @@ struct BrowserEvent {
     observed_at_ms: i64,
     actor: String,
     owner: String,
+    command_id: Option<String>,
     document_id: Option<String>,
     navigation_id: Option<String>,
     source: Option<String>,
@@ -203,11 +204,25 @@ struct BrowserEvent {
 
 impl BrowserEvent {
     fn validate(&self) -> Result<(), BridgeError> {
+        self.validate_owned(false)
+    }
+    fn validate_owned(&self, owned_navigation: bool) -> Result<(), BridgeError> {
+        let runner = owned_navigation
+            && self.actor == "runner"
+            && self.owner == "runner"
+            && self.kind == EventKind::Updated
+            && self.content.is_none()
+            && self
+                .command_id
+                .as_ref()
+                .is_some_and(|id| id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()));
         if !(0..=i32::MAX as i64).contains(&self.tab_id)
             || !(0..=i32::MAX as i64).contains(&self.window_id)
             || self.observed_at_ms < 0
-            || self.actor != "unknown"
-            || self.owner != "unknown"
+            || (!runner
+                && (self.actor != "unknown"
+                    || self.owner != "unknown"
+                    || self.command_id.is_some()))
             || self.url.is_empty()
             || self.url.len() > MAX_URL_BYTES
             || self
@@ -274,6 +289,8 @@ struct TabMetadata<'a> {
     title: &'a str,
     document_id: Option<&'a str>,
     navigation_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runner_command_id: Option<&'a str>,
 }
 
 fn apply_event(
@@ -296,8 +313,25 @@ fn apply_event(
         title: &event.title,
         document_id: event.document_id.as_deref(),
         navigation_id: event.navigation_id.as_deref(),
+        runner_command_id: event.command_id.as_deref(),
     })
     .map_err(|_| BridgeError::InvalidObservation)?;
+    if event.actor == "runner" {
+        let command_id = event
+            .command_id
+            .as_deref()
+            .ok_or(BridgeError::InvalidObservation)?;
+        store
+            .expect_action(
+                command_id,
+                "browser-navigation",
+                &metadata_id,
+                &metadata,
+                now,
+                now.saturating_add(1000),
+            )
+            .map_err(|_| BridgeError::Store)?;
+    }
     let results = if let Some(content) = &event.content {
         let url_hash = blake3::hash(event.url.as_bytes());
         let page_id = format!("browser-page:{}:{}", event.tab_id, url_hash.to_hex());
@@ -412,7 +446,7 @@ pub fn run_live_session<R: Read + Send + 'static, W: Write>(
     store: &mut ContextStore,
     socket: &std::path::Path,
 ) -> Result<SessionReport, BridgeError> {
-    use crate::browser_tools::{BrowserRequest, DEADLINE, Response};
+    use crate::browser_tools::{BrowserRequest, BrowserTab, DEADLINE, Response};
     use std::{
         collections::HashMap,
         sync::mpsc,
@@ -456,16 +490,29 @@ pub fn run_live_session<R: Read + Send + 'static, W: Write>(
             }
         }
     });
-    let mut pending: Option<(crate::browser_tools::HostCommand, Instant)> = None;
-    let mut discovered = HashMap::new();
+    let mut pending: Option<(
+        crate::browser_tools::HostCommand,
+        Instant,
+        Option<BrowserTab>,
+    )> = None;
+    let mut discovered: HashMap<String, BrowserTab> = HashMap::new();
+    struct OwnedNavigation {
+        request_id: String,
+        expected: BrowserTab,
+        url: String,
+        started: Instant,
+        document_id: Option<String>,
+    }
+    let mut owned_navigations: std::collections::VecDeque<OwnedNavigation> =
+        std::collections::VecDeque::new();
     let mut report = SessionReport::default();
     let mut last_sequence = 0;
     let mut last_clock = 0;
     loop {
-        if pending
-            .as_ref()
-            .is_some_and(|(_, started)| started.elapsed() >= DEADLINE - Duration::from_millis(100))
-            && let Some((command, _)) = pending.take()
+        owned_navigations.retain(|entry| entry.started.elapsed() < Duration::from_secs(10));
+        if pending.as_ref().is_some_and(|(_, started, _)| {
+            started.elapsed() >= DEADLINE - Duration::from_millis(100)
+        }) && let Some((command, _, _)) = pending.take()
         {
             let _ = command.response.try_send(Response {
                 request_id: command.request.request_id,
@@ -478,6 +525,13 @@ pub fn run_live_session<R: Read + Send + 'static, W: Write>(
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(_) => return Ok(report),
             Ok(LiveInput::Command(command)) => {
+                let expected_tab = match &command.request.request {
+                    BrowserRequest::ReadTab { resource_id, .. }
+                    | BrowserRequest::NavigateTab { resource_id, .. } => {
+                        discovered.get(resource_id).cloned()
+                    }
+                    _ => None,
+                };
                 let allowed = match &command.request.request {
                     BrowserRequest::SearchTabs { query } => {
                         !query.trim().is_empty()
@@ -489,7 +543,18 @@ pub fn run_live_session<R: Read + Send + 'static, W: Write>(
                         expected_document_id,
                     } => discovered
                         .get(resource_id)
-                        .is_some_and(|doc: &String| doc == expected_document_id),
+                        .is_some_and(|tab| &tab.document_id == expected_document_id),
+                    BrowserRequest::NavigateTab {
+                        resource_id,
+                        expected_document_id,
+                        url,
+                    } => {
+                        discovered
+                            .get(resource_id)
+                            .is_some_and(|tab| &tab.document_id == expected_document_id)
+                            && crate::browser_tools::navigation_url(url)
+                                .is_some_and(|canonical| canonical == *url)
+                    }
                 };
                 if pending.is_some() || !allowed {
                     let _ = command.response.try_send(Response {
@@ -500,6 +565,23 @@ pub fn run_live_session<R: Read + Send + 'static, W: Write>(
                     });
                     continue;
                 }
+                if let BrowserRequest::NavigateTab { url, .. } = &command.request.request {
+                    discovered.clear();
+                    if owned_navigations.len() == 32 {
+                        owned_navigations.pop_front();
+                    }
+                    owned_navigations.push_back(OwnedNavigation {
+                        request_id: command.request.request_id.clone(),
+                        expected: expected_tab
+                            .clone()
+                            .ok_or(BridgeError::InvalidObservation)?,
+                        url: url.clone(),
+                        started: Instant::now(),
+                        document_id: None,
+                    });
+                } else if matches!(&command.request.request, BrowserRequest::SearchTabs { .. }) {
+                    discovered.clear();
+                }
                 let mut message = serde_json::to_value(&command.request)
                     .map_err(|_| BridgeError::InvalidFrame)?;
                 let object = message.as_object_mut().ok_or(BridgeError::InvalidFrame)?;
@@ -507,13 +589,13 @@ pub fn run_live_session<R: Read + Send + 'static, W: Write>(
                 object.insert("protocol_version".into(), PROTOCOL_VERSION.into());
                 object.insert("session_id".into(), session_id.clone().into());
                 write_json_frame(&mut output, &message)?;
-                pending = Some((command, Instant::now()));
+                pending = Some((command, Instant::now(), expected_tab));
             }
             Ok(LiveInput::Native(Err(error))) => return Err(error),
             Ok(LiveInput::Native(Ok(None))) => return Ok(report),
             Ok(LiveInput::Native(Ok(Some(mut message)))) => {
                 if message.get("type").and_then(|v| v.as_str()) == Some("browser.result") {
-                    let Some((command, _)) = pending.as_ref() else {
+                    let Some((command, _, expected_tab)) = pending.as_ref() else {
                         continue;
                     };
                     if message.get("session_id").and_then(|v| v.as_str()) != Some(&session_id)
@@ -537,6 +619,7 @@ pub fn run_live_session<R: Read + Send + 'static, W: Write>(
                             | "unavailable"
                             | "cancelled"
                             | "timeout"
+                            | "outcome_unknown"
                     ) {
                         return Err(BridgeError::InvalidObservation);
                     }
@@ -554,9 +637,58 @@ pub fn run_live_session<R: Read + Send + 'static, W: Write>(
                                     {
                                         return Err(BridgeError::InvalidObservation);
                                     }
-                                    discovered
-                                        .insert(tab.resource_id.clone(), tab.document_id.clone());
+                                    discovered.insert(tab.resource_id.clone(), tab.clone());
                                 }
+                            }
+                            BrowserRequest::NavigateTab { url, .. } => {
+                                let expected = expected_tab
+                                    .as_ref()
+                                    .ok_or(BridgeError::InvalidObservation)?;
+                                if response.page.is_some()
+                                    || response.tabs.len() != 1
+                                    || !crate::browser_tools::valid_navigation_result(
+                                        expected,
+                                        &response.tabs[0],
+                                        url,
+                                    )
+                                {
+                                    return Err(BridgeError::InvalidObservation);
+                                }
+                                let tab = &response.tabs[0];
+                                if let Some(owned) = owned_navigations
+                                    .iter_mut()
+                                    .find(|entry| entry.request_id == command.request.request_id)
+                                {
+                                    if owned
+                                        .document_id
+                                        .as_ref()
+                                        .is_some_and(|document| document != &tab.document_id)
+                                    {
+                                        return Err(BridgeError::InvalidObservation);
+                                    }
+                                    owned.document_id = Some(tab.document_id.clone());
+                                }
+                                discovered.insert(tab.resource_id.clone(), tab.clone());
+                                let now = trusted_time()?.max(last_clock);
+                                last_clock = now;
+                                let event = BrowserEvent {
+                                    kind: EventKind::Updated,
+                                    tab_id: tab.tab_id,
+                                    window_id: tab.window_id,
+                                    url: tab.url.clone(),
+                                    title: tab.title.clone(),
+                                    observed_at_ms: now,
+                                    actor: "runner".into(),
+                                    owner: "runner".into(),
+                                    command_id: Some(command.request.request_id.clone()),
+                                    document_id: Some(tab.document_id.clone()),
+                                    navigation_id: None,
+                                    source: Some("browser_metadata".into()),
+                                    trust: None,
+                                    content: None,
+                                };
+                                event.validate_owned(true)?;
+                                report.resources_changed += apply_event(store, &event, now)?;
                             }
                             BrowserRequest::ReadTab {
                                 resource_id,
@@ -570,6 +702,11 @@ pub fn run_live_session<R: Read + Send + 'static, W: Write>(
                                     || !crate::browser_tools::valid_tab(&page.tab)
                                     || page.tab.resource_id != *resource_id
                                     || page.tab.document_id != *expected_document_id
+                                    || expected_tab.as_ref().is_none_or(|expected| {
+                                        page.tab.tab_id != expected.tab_id
+                                            || page.tab.window_id != expected.window_id
+                                            || page.tab.url != expected.url
+                                    })
                                     || page.content.len() > MAX_CONTENT_BYTES
                                     || page.content.contains('\0')
                                     || page.trust != "untrusted_page"
@@ -588,6 +725,7 @@ pub fn run_live_session<R: Read + Send + 'static, W: Write>(
                                     observed_at_ms: now,
                                     actor: "unknown".into(),
                                     owner: "unknown".into(),
+                                    command_id: None,
                                     document_id: Some(page.tab.document_id.clone()),
                                     navigation_id: None,
                                     source: Some("browser_content_script".into()),
@@ -599,7 +737,7 @@ pub fn run_live_session<R: Read + Send + 'static, W: Write>(
                             }
                         }
                     }
-                    if let Some((command, _)) = pending.take() {
+                    if let Some((command, _, _)) = pending.take() {
                         let _ = command.response.try_send(response);
                     }
                     continue;
@@ -621,7 +759,31 @@ pub fn run_live_session<R: Read + Send + 'static, W: Write>(
                 if sequence <= last_sequence || sequence > MAX_JS_INTEGER {
                     return Err(BridgeError::InvalidSequence);
                 }
-                event.validate()?;
+                let owned = if event.actor == "runner" {
+                    let entry = owned_navigations.iter_mut().find(|entry| {
+                        event.command_id.as_deref() == Some(entry.request_id.as_str())
+                            && event.tab_id == entry.expected.tab_id
+                            && event.window_id == entry.expected.window_id
+                            && event.url == entry.url
+                            && event
+                                .document_id
+                                .as_ref()
+                                .is_some_and(|document| document != &entry.expected.document_id)
+                            && entry
+                                .document_id
+                                .as_ref()
+                                .is_none_or(|document| event.document_id.as_ref() == Some(document))
+                    });
+                    if let Some(entry) = entry {
+                        entry.document_id = event.document_id.clone();
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                event.validate_owned(owned)?;
                 let now = trusted_time()?.max(last_clock);
                 report.resources_changed += apply_event(store, &event, now)?;
                 report.observations_accepted += 1;
