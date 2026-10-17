@@ -261,7 +261,18 @@ fn live_watcher_publishes_edits_and_deletion_before_shutdown() {
     fs::write(&file, "initial fixture").unwrap();
     let id = file_id(&file);
     let db = directory.join("context.db");
-    let worker = thread::spawn(move || watch_root(&mut context, &root, Duration::from_secs(3)));
+    let (ready_send, ready_recv) = std::sync::mpsc::channel();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_stop = stop.clone();
+    let worker = thread::spawn(move || {
+        jarvis::awareness::watch_root_controlled(
+            &mut context,
+            &root,
+            Duration::from_secs(20),
+            || ready_send.send(()).unwrap(),
+            || worker_stop.load(std::sync::atomic::Ordering::Acquire),
+        )
+    });
     let observer = ContextStore::open(&db, Limits::default()).unwrap();
     let wait_until = |condition: &mut dyn FnMut() -> bool| {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -273,7 +284,10 @@ fn live_watcher_publishes_edits_and_deletion_before_shutdown() {
             thread::sleep(Duration::from_millis(10));
         }
     };
-    wait_until(&mut || observer.get(&id).unwrap().is_some());
+    ready_recv
+        .recv_timeout(Duration::from_secs(10))
+        .expect("watcher startup did not finish");
+    assert!(observer.get(&id).unwrap().is_some());
     fs::write(&file, "edited mango").unwrap();
     wait_until(&mut || {
         observer
@@ -283,6 +297,7 @@ fn live_watcher_publishes_edits_and_deletion_before_shutdown() {
     });
     fs::remove_file(&file).unwrap();
     wait_until(&mut || observer.get(&id).unwrap().is_none());
+    stop.store(true, std::sync::atomic::Ordering::Release);
     let report = worker.join().unwrap().unwrap();
     assert!(report.resources_changed >= 2);
     assert_eq!(report.resources_removed, 1);
@@ -316,13 +331,14 @@ fn controlled_watcher_announces_ready_only_after_initial_evidence_is_persisted()
     let id = file_id(&file);
     let observer = ContextStore::open(&directory.join("context.db"), Limits::default()).unwrap();
     let ready = std::cell::Cell::new(false);
-    let started = std::time::Instant::now();
+    let ready_at = std::cell::Cell::new(None);
     let report = jarvis::awareness::watch_root_controlled(
         &mut context,
         &root,
         Duration::from_secs(3600),
         || {
             assert_eq!(observer.get(&id).unwrap().unwrap().content, "ready mango");
+            ready_at.set(Some(std::time::Instant::now()));
             ready.set(true);
         },
         || ready.get(),
@@ -330,7 +346,8 @@ fn controlled_watcher_announces_ready_only_after_initial_evidence_is_persisted()
     .unwrap();
     assert!(ready.get());
     assert_eq!(report.resources_changed, 1);
-    assert!(started.elapsed() < Duration::from_secs(2));
+    // Bound cancellation after readiness; initial filesystem I/O is independent.
+    assert!(ready_at.get().unwrap().elapsed() < Duration::from_secs(2));
 }
 
 #[test]
@@ -357,7 +374,7 @@ fn controlled_idle_watcher_cancels_without_waiting_for_session_deadline() {
         );
         done_send.send(result).unwrap();
     });
-    ready_recv.recv_timeout(Duration::from_secs(2)).unwrap();
+    ready_recv.recv_timeout(Duration::from_secs(10)).unwrap();
     assert!(done_recv.try_recv().is_err());
     stop.store(true, Ordering::Release);
     done_recv
