@@ -59,11 +59,13 @@ impl Peer {
                                 k.eq_ignore_ascii_case("content-length")
                                     .then(|| v.trim().parse::<usize>().unwrap())
                             })
-                            .unwrap();
+                            .unwrap_or(0);
                         if bytes.len() >= end + 4 + size {
-                            captured.lock().unwrap().push(
-                                serde_json::from_slice(&bytes[end + 4..end + 4 + size]).unwrap(),
-                            );
+                            captured.lock().unwrap().push(if size == 0 {
+                                Value::Null
+                            } else {
+                                serde_json::from_slice(&bytes[end + 4..end + 4 + size]).unwrap()
+                            });
                             break;
                         }
                     }
@@ -240,6 +242,67 @@ async fn direct_approved_app_works_without_model_keys_but_quoted_or_negated_text
         fs::read_to_string(dir.join("effects")).unwrap(),
         "com.apple.Notes\ncom.apple.calculator\n"
     );
+    chat.control.stop();
+    wait(|| chat.is_finished()).await;
+    chat.join().unwrap();
+}
+
+#[tokio::test]
+async fn named_artist_uses_model_catalog_and_verified_playback_instead_of_legacy_clarification() {
+    use jarvis::{
+        music_catalog::{CatalogConfig, MusicCatalog},
+        spotify_playback::SpotifyPlayback,
+    };
+    let dir = TempDir::new();
+    seed(&dir);
+    let name = "Aurora Fixture Quartet";
+    let artist_id = "0123456789ABCDEFGHIJKL";
+    let track_id = "abcdefghijklmnopqrstuv";
+    let model=Peer::new(vec![json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":[{"id":"artist1","type":"function","function":{"name":"spotify_play_artist","arguments":json!({"artist":name}).to_string()}}]}}]})]).await;
+    let discovery=Peer::new(vec![json!({"results":{"web":[{"url":format!("https://open.spotify.com/artist/{artist_id}")}]}}),json!({"provider_name":"Spotify","provider_url":"https://spotify.com","type":"rich","title":name})]).await;
+    let catalog = MusicCatalog::new(
+        "fixture-search-key",
+        CatalogConfig::loopback_for_tests(
+            &format!("{}/search", discovery.url),
+            &format!("{}/oembed", discovery.url),
+            Duration::from_secs(2),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let observed = json!({"status":"observed","state":"playing","artist":name,"track_id":format!("spotify:track:{track_id}"),"track_url":format!("https://open.spotify.com/track/{track_id}")});
+    fs::write(dir.join("artist-observation"), observed.to_string()).unwrap();
+    let playback=SpotifyPlayback::with_executable(script(&dir,"artist-playback","printf '%s\\n' \"$@\" > \"${0%/*}/artist-args\"\n/bin/cat \"${0%/*}/artist-observation\""),Duration::from_secs(1)).unwrap();
+    let runtime =
+        Arc::new(ToolRuntime::read_only(dir.join("context.db")).with_music(catalog, playback));
+    let legacy = ActionExecutor::with_executable(
+        script(
+            &dir,
+            "legacy-playback",
+            "printf 'wrong fallback' > \"${0%/*}/legacy-called\"\nprintf 'verified:playing\\n'",
+        ),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let conversation = Conversation::new(dir.join("context.db"), None, model.client());
+    let mut chat =
+        ConversationWorker::with_factory_and_tools(move || Ok(conversation), legacy, runtime)
+            .unwrap();
+    wait(|| chat.control.available()).await;
+    chat.control
+        .submit(format!("Play {name} on Spotify"))
+        .unwrap();
+    wait(|| !chat.control.busy()).await;
+    assert_eq!(chat.control.snapshot().text, format!("Playing {name}."));
+    assert!(!dir.join("legacy-called").exists());
+    assert_eq!(
+        model.packets().len(),
+        1,
+        "verified action must not cause another model call"
+    );
+    assert_eq!(discovery.packets().len(), 2);
+    let args = fs::read_to_string(dir.join("artist-args")).unwrap();
+    assert!(args.ends_with(&format!("spotify:artist:{artist_id}\n{name}\n")));
     chat.control.stop();
     wait(|| chat.is_finished()).await;
     chat.join().unwrap();

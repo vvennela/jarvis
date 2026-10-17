@@ -1,6 +1,10 @@
 //! Bounded tools shared by model planning and trusted native dispatch.
 //! Tool arguments are proposals; only the original user request grants intent.
-use std::{path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -11,7 +15,9 @@ use crate::{
     app_tools::{AppExecutor, authorize_open},
     context::{ContextStore, Resource},
     gate,
+    music_catalog::MusicCatalog,
     providers::{ToolCall, ToolSpec},
+    spotify_playback::{SpotifyPlayback, authorize_artist_request},
 };
 
 pub trait DraftSubmitter: Send + Sync {
@@ -24,6 +30,7 @@ pub struct ToolRuntime {
     apps: Option<AppExecutor>,
     actions: Option<ActionExecutor>,
     drafts: Option<Arc<dyn DraftSubmitter>>,
+    music: Option<(MusicCatalog, SpotifyPlayback)>,
 }
 
 pub struct ToolResult {
@@ -39,6 +46,7 @@ impl ToolRuntime {
             apps: None,
             actions: None,
             drafts: None,
+            music: None,
         }
     }
     pub fn with_apps(mut self, apps: AppExecutor) -> Self {
@@ -51,6 +59,10 @@ impl ToolRuntime {
     }
     pub fn with_draft_submitter(mut self, drafts: Arc<dyn DraftSubmitter>) -> Self {
         self.drafts = Some(drafts);
+        self
+    }
+    pub fn with_music(mut self, catalog: MusicCatalog, playback: SpotifyPlayback) -> Self {
+        self.music = Some((catalog, playback));
         self
     }
 
@@ -76,7 +88,10 @@ impl ToolRuntime {
             }
         }
         if self.actions.is_some() {
-            tools.push(spec("spotify_control", "Play or pause Spotify's existing selection when explicitly requested. Named tracks need clarification.", json!({"action":{"type":"string","enum":["play","pause"]}}), &["action"]));
+            tools.push(spec("spotify_control", "Resume or pause Spotify's existing selection when explicitly requested. For a named artist use spotify_play_artist instead.", json!({"action":{"type":"string","enum":["play","pause"]}}), &["action"]));
+        }
+        if self.music.is_some() {
+            tools.push(spec("spotify_play_artist", "Find a named artist on Spotify and play their music. Extract the artist's name from the user's explicit playback request, preserving its spelling. The runner verifies Spotify identity and actual playback before confirming. This tool selects an artist, not a particular song or album.", json!({"artist":{"type":"string","minLength":1,"maxLength":128}}), &["artist"]));
         }
         if self.drafts.is_some() {
             tools.push(spec("delegate_draft", "Delegate an explicitly requested written document, report, plan, or message draft to the background worker. The worker receives the original user request, creates a separate file, verifies it, and leaves it ready for review. This returns immediately; it does not send messages or change existing files.", json!({}), &[]));
@@ -165,6 +180,37 @@ impl ToolRuntime {
                 match actions.execute(user_request, action).await {
                     Ok(result) => acknowledgment(&result.text),
                     Err(err) => acknowledgment(&crate::actions::friendly_error(user_request, &err)),
+                }
+            }
+            "spotify_play_artist" => {
+                let Ok(args) = serde_json::from_value::<ArtistArgs>(call.arguments.clone()) else {
+                    return acknowledgment("Which artist should I put on?");
+                };
+                // Model arguments are proposals, never authority. Check intent
+                // before search so rejected targets leave no network trace.
+                if let Err(error) = authorize_artist_request(user_request, &args.artist) {
+                    return acknowledgment(&error.to_string());
+                }
+                let Some((catalog, playback)) = &self.music else {
+                    return acknowledgment("Artist lookup isn't connected yet.");
+                };
+                let result = tokio::time::timeout(Duration::from_secs(35), async {
+                    let artist = catalog
+                        .resolve_artist(&args.artist)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    playback
+                        .play_artist(user_request, &artist)
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+                match result {
+                    Ok(Ok(played)) => acknowledgment(&played.text),
+                    Ok(Err(message)) => acknowledgment(&message),
+                    Err(_) => {
+                        acknowledgment("That took too long. I couldn't confirm your music started.")
+                    }
                 }
             }
             "delegate_draft" => {
@@ -310,4 +356,9 @@ struct AppArgs {
 #[serde(deny_unknown_fields)]
 struct SpotifyArgs {
     action: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtistArgs {
+    artist: String,
 }

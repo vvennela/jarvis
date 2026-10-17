@@ -4,7 +4,7 @@ Build a companion that stays present while you work: maintained context, local �
 
 ## Implemented milestones
 
-Checkpoint `a240ff6`: 312 workspace tests passed, 14 ignored; formatting, clippy and native panel smoke passed. Live full-protocol Crusoe verification is blocked by HTTP 429 (`max_requests_limit (orchestrator)`); a minimal 16-token text probe returned HTTP 200. Native app actions still require a real user rehearsal. The working deadline is approximately 22:41 UTC / 3:41 PM Pacific on October 17.
+Artist-selection increment: **334 workspace tests passed, 15 ignored**; formatting and all-target clippy passed. The live native Spotify adapter selected Metallica and confirmed its playing artist using actual Spotify metadata. Generic You search → model tool → native playback remains to be exercised live after `YOU_API_KEY` is configured and Crusoe stops returning HTTP 429. A fresh hosted protocol probe still returned `RateLimited`. The working deadline is approximately 22:41 UTC / 3:41 PM Pacific on October 17.
 
 | Component | Implemented and checked | Remaining live acceptance |
 |---|---|---|
@@ -13,8 +13,8 @@ Checkpoint `a240ff6`: 312 workspace tests passed, 14 ignored; formatting, clippy
 | OS awareness | Independent native foreground-app collector, permitted focused-window metadata, explicit permission/status reporting | Live Accessibility-title coverage; wake-time focus freezing remains future work |
 | Browser awareness | Read-only Chrome extension, approved-origin collection and authenticated Native Messaging host | Install and verify a real approved page before including it in the demo |
 | Conversation | Jev advisory routing overlaps retrieval; bounded history and clarification follow-ups; configured Nemotron through Crusoe; precise errors and bounded inference retries | Human conversation quality and latency under actual venue/network conditions |
-| Approved app actions | Exact approved-app requests bypass inference; Jev can propose typed Spotify actions; literal adapters verify outcomes and recheck caller intent | Actual app opening/playback and follow-up by voice |
-| Model tool runner | Real OpenAI-compatible function-call protocol; indexed search/read, approved apps, Spotify and draft delegation; bounded loops and untrusted results; adversarial fixtures pass | Complete tool-call/result/answer round trip against live Crusoe after rate limiting clears |
+| Approved app actions | Exact approved-app requests bypass inference; typed artist lookup verifies Spotify identity and actual playing artist; native Metallica selection exercised successfully | Generic artist lookup and spoken selection with You configured; app opening/follow-up by voice |
+| Model tool runner | Real OpenAI-compatible function-call protocol; indexed search/read, approved apps, Spotify controls and artist selection, and draft delegation; bounded loops and untrusted results; adversarial fixtures pass | Complete tool-call/result/answer round trip against live Crusoe after rate limiting clears |
 | Native panel | Idle menu-bar presence, wake-triggered 360×140 glass card, expandable details, actual animated busy spinner, cancellation, explicit draft review | Rehearse status transitions alongside a real spoken request |
 | Local voice | Streaming acoustic keyword detector, local speech-activity detection, resident Whisper command transcription, bounded microphone handoff and input-route change handling | First-attempt human wake accuracy, noisy-room endpointing and AirPods capture |
 | Speech output | Native macOS speech or optional ElevenLabs Flash; cancellable owned playback and temporary audio cleanup | Natural live response quality; current MP3 output is buffered, not streamed to playback |
@@ -39,7 +39,7 @@ Draft readiness does not open a viewer. **Open draft**, or an explicit review re
 
 | Order | Work | Acceptance gate |
 |---|---|---|
-| 1 | Rehearse the installed voice and native-action path | An approved app opens or Spotify changes state, the real outcome matches the acknowledgment, and the current quiet-audio/preroll build accepts ordinary speech |
+| 1 | Configure You and rehearse named artist selection plus native actions by voice | An approved app opens or Spotify changes state, the real outcome matches the acknowledgment, and the current quiet-audio/preroll build accepts ordinary speech |
 | 2 | Verify hosted tool calling after cooldown | A live synthetic function proposal receives a synthetic result and returns a final answer; no private context or native action is needed for this protocol check |
 | 3 | Rehearse context continuity | A truthful saved priority change produces a changed answer; the indexed resource/version explains the result |
 | 4 | Rehearse concurrent delegation | Spoken draft request reaches the real provider; another short conversation works while it runs; result reflects the updated note |

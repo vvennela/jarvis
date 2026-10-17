@@ -4,7 +4,7 @@ The CLI and native panel support local file awareness, model conversation, local
 
 ## API keys and model
 
-Only two keys are required for the implemented live-provider path:
+The conversational provider configuration uses:
 
 1. **`TYPESAFE_API_KEY`** from the [TypeSafe console](https://console.typesafe.ai/). Jev requests use bearer authentication at `https://api.typesafe.ai/v1/systemone`, model `jev-latest`. Jev returns structured routing choices; it is not a chat-completions substitute. [Official quickstart](https://docs.typesafe.ai/introduction/quickstart).
 2. **`CRUSOE_API_KEY`** with serverless inference access. The client calls `https://api.inference.crusoecloud.com/v1/chat/completions`. The selected model is **Nemotron 3.5 Lightning**, `nvidia/Nemotron-3.5-Lightning-30B-A3B`. This exact case-sensitive ID was verified through the authenticated model catalog and a live response.
@@ -15,11 +15,14 @@ Optional configuration:
 JARVIS_CONVERSATION_MODEL=nvidia/Nemotron-3.5-Lightning-30B-A3B
 JARVIS_WORKER_MODEL=nvidia/Nemotron-3.5-Lightning-30B-A3B
 JARVIS_WHISPER_MODEL_PATH=/absolute/path/to/ggml-base.en.bin
+YOU_API_KEY=
 ELEVENLABS_API_KEY=
 ELEVENLABS_VOICE_ID=
 ```
 
 The conversation override is used by `ask` and the panel. The worker override is used by the local draft task. One Crusoe key serves both roles. Jev routing has a bounded deadline; conversation can continue through Crusoe if routing is unavailable.
+
+**You.com powers named-artist lookup:** set `YOU_API_KEY` to enable `spotify_play_artist` in the native panel. Nemotron extracts the artist as a typed argument; the runner checks the original request, searches You, verifies candidate identities through Spotify oEmbed in parallel, then plays the resolved artist URI and reads back the playing artist and track identity. It confirms only a match. The search key is sent only to You. Spotify developer credentials are not needed for this desktop path.
 
 **ElevenLabs is optional:** supply `ELEVENLABS_API_KEY` for natural speech output and optionally select `ELEVENLABS_VOICE_ID`. Without that key, the panel uses native macOS speech. Local Whisper needs the model file and macOS microphone permission, not a Wispr or transcription API key. No additional wake-word key is needed.
 
@@ -100,12 +103,12 @@ The panel's optional `--voice-diagnostics` argument emits numeric capture/recogn
 
 Conversation failures show a specific, redacted reason in the card. Requests originating from voice also receive one spoken failure acknowledgment. Rate-limited conversations retain the question and retry at most twice, honoring the provider's `Retry-After` header or using increasing delays. Other transient inference errors receive at most one retry. All attempts share a 60-second deadline, and cancellation stops waiting and pending retries. A provider delay beyond the remaining deadline returns the rate-limit error without retrying early. Authentication, invalid requests, and malformed responses are not retried. Provider retries can repeat context reads. App and draft actions return an immediate observed result, with no later model call or automatic action retry.
 
-The native panel supports “open Spotify,” “play music on Spotify,” and “pause Spotify.” These requests use fixed local app controls and verify the resulting running or playback state before replying. Exact commands do not require inference or a Spotify API key. Rephrased Spotify requests can use a typed Jev proposal with a 1.5 second deadline and 0.9 confidence threshold; every proposal still passes the allowlist and intent checks before execution. macOS may ask to let Jarvis control Spotify under Privacy & Security → Automation. Playback resumes Spotify's current selection. Named tracks and playlists require a separate selection flow; the current adapter asks for clarification. Tool failures are not automatically retried, and verified results are retained for conversational follow-ups. Nemotron can propose typed calls from the installed registry. Model-generated prose never executes as a command.
+The native panel supports opening Spotify and verified current-selection play/pause through fixed local controls. Exact requests run without inference. When `YOU_API_KEY` is configured, requests such as “play Metallica on Spotify” go through the conversational tool registry: named-artist lookup, verified Spotify identity, native playback and matching artist/track readback. Other artist names follow the same path; no names or artist IDs are built into the production adapter. Named requests never fall back to resuming the old selection. The result is a short acknowledgment such as “Playing Metallica.” Specific songs and albums need a separate selection capability. macOS may ask to let Jarvis control Spotify under Privacy & Security → Automation. Tools are not automatically replayed after failure. Model-generated prose never executes as a command.
 
 Automated native smoke tests leave the microphone and native OS collection off. Actual Whisper inference has been verified with generated WAV audio; synthetic wake tests verify command isolation and cancellation. The panel independently collects foreground app identity and permitted focused-window metadata. Missing Accessibility permission leaves app identity available and is shown in the panel. Known browser/password-manager titles are excluded from OS capture; approved browser pages use the extension. Browser action execution, persistent autonomous jobs, and personal speaker recognition remain separate milestones.
 
 Git authentication remains the user's git transport. Do not invoke GitHub CLI or provision API credentials for repository work.
 
-The native panel shares a typed tool registry across conversation and background work: `search_context`, `read_context`, `open_application`, `spotify_control`, and `delegate_draft`. Independent indexed reads run in parallel. Each turn allows at most four model steps and eight proposed calls; a side effect must be the only call in its batch. Read results retain source IDs, versions, and truncation labels under a 48 KiB message budget. All provider requests remain capped at 64 KiB. Unknown tools, arbitrary file paths, extra arguments, and duplicate call IDs are rejected.
+The native panel shares a typed tool registry across conversation and background work: `search_context`, `read_context`, `open_application`, `spotify_control`, optional `spotify_play_artist`, and `delegate_draft`. Independent indexed reads run in parallel. Each turn allows at most four model steps and eight proposed calls; a side effect must be the only call in its batch. Read results retain source IDs, versions, and truncation labels under a 48 KiB message budget. All provider requests remain capped at 64 KiB. Unknown tools, arbitrary file paths, extra arguments, and duplicate call IDs are rejected.
 
 Approved applications live in `~/Library/Application Support/Jarvis/app-preferences.json`. Defaults are Spotify, Notes, Safari, Calendar, and Calculator. Clear launch commands run directly without inference; execution reloads the allowlist and verifies the target is running. App controls may require macOS Automation permission. A writing proposal queues the original user request, creates a separate verified artifact, and leaves it ready for review while conversation remains available. Existing files are not edited by this worker. Browser actions and a general coding worker remain pending.

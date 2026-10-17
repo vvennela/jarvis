@@ -3,7 +3,9 @@ use jarvis::{
     actions::ActionExecutor,
     app_tools::AppExecutor,
     conversation::{Conversation, ConversationError, Reply},
+    music_catalog::MusicCatalog,
     providers::ProviderError,
+    spotify_playback::SpotifyPlayback,
     tool_runtime::ToolRuntime,
 };
 use std::{
@@ -144,6 +146,15 @@ impl ConversationWorker {
         if let Some(tasks) = tasks {
             tools = tools.with_draft_submitter(tasks);
         }
+        if let Ok(settings) = jarvis::conversation::load_provider_settings()
+            && let Some(key) = settings
+                .get("YOU_API_KEY")
+                .filter(|key| !key.trim().is_empty())
+            && let Ok(catalog) = MusicCatalog::production(key.clone())
+            && let Ok(playback) = SpotifyPlayback::native()
+        {
+            tools = tools.with_music(catalog, playback);
+        }
         Self::with_factory_and_tools(
             move || Conversation::from_env(database),
             // Retain direct commands even if conversational credentials fail.
@@ -243,6 +254,7 @@ impl ConversationWorker {
                                     return Ok(Reply { text, routing_degraded:false });
                                 }
                                 if let Some(actions) = &actions
+                                    && (tools.is_none() || jarvis::actions::recognize(&request.question).is_some())
                                     && let Some(result) = actions.handle(&request.question).await {
                                     if let Ok(result) = &result
                                         && let Some(conversation) = conversation.as_mut() {

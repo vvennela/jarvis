@@ -13,7 +13,9 @@ pub mod conversation;
 pub mod draft;
 pub mod elevenlabs;
 pub mod install;
+pub mod music_catalog;
 pub mod providers;
+pub mod spotify_playback;
 pub mod tool_runtime;
 
 pub const MAX_REVIEW_BYTES: usize = 64 * 1024;
