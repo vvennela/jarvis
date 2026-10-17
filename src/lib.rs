@@ -10,6 +10,7 @@ pub mod bridge;
 pub mod broker;
 #[cfg(unix)]
 pub mod browser_tools;
+pub mod coding;
 pub mod context;
 pub mod conversation;
 pub mod draft;
@@ -40,6 +41,7 @@ pub enum Operation {
     CloseTab,
     DraftMessage,
     PrepareFileEdit,
+    DelegateCoding,
     PreparePurchase,
     PrepareDeletion,
     SendMessage,
@@ -55,6 +57,7 @@ impl Operation {
             self,
             Self::DraftMessage
                 | Self::PrepareFileEdit
+                | Self::DelegateCoding
                 | Self::PreparePurchase
                 | Self::PrepareDeletion
         )

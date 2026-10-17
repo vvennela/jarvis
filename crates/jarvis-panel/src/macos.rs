@@ -3,10 +3,11 @@
 use super::Options;
 use jarvis_panel::{
     chat::{self, ConversationWorker},
+    codingworker::{self, CodingWorker},
     osworker::{self, OsWorker},
     speech::{self, SpeechWorker},
     tasks::{self, TaskWorker},
-    voicehandoff::{VoiceHandoff, dispatch_question},
+    voicehandoff::{VoiceHandoff, dispatch_question_with_coding},
     wakeworker::{self, WakeWorker},
     worker::{Control, State, Worker},
 };
@@ -38,6 +39,7 @@ struct ActionIvars {
     os: Arc<osworker::Control>,
     chat: Arc<chat::Control>,
     tasks: Arc<tasks::Control>,
+    coding: Option<Arc<codingworker::Control>>,
     action_error: Cell<Option<&'static str>>,
     speech: Arc<speech::Control>,
     voice: Arc<wakeworker::Control>,
@@ -86,12 +88,13 @@ define_class!(
             self.ivars().speech.shutdown();
             self.ivars().chat.stop();
             self.ivars().tasks.shutdown();
+            if let Some(coding)=&self.ivars().coding {coding.shutdown();}
             self.ivars().control.stop();
         }
         #[unsafe(method(sendQuestion:))]
         fn send_question(&self, _sender: Option<&AnyObject>) {
             let question = self.ivars().input.stringValue().to_string();
-            match dispatch_question(question, &self.ivars().chat, &self.ivars().tasks) {
+            match dispatch_question_with_coding(question, &self.ivars().chat, &self.ivars().tasks, self.ivars().coding.as_deref()) {
                 Ok(_) => {
                     self.ivars().action_error.set(None);
                     self.ivars().input.setStringValue(&NSString::from_str(""));
@@ -105,12 +108,17 @@ define_class!(
             self.ivars().speech.stop_speaking();
             self.ivars().chat.cancel();
             self.ivars().tasks.cancel();
+            if let Some(coding)=&self.ivars().coding {coding.cancel();}
         }
         #[unsafe(method(openDraft:))]
         fn open_draft(&self, _sender: Option<&AnyObject>) {
             self.ivars().action_error.set(
                 self.ivars().tasks.request_review().err().map(|_| "The result is not ready to open yet.")
             );
+        }
+        #[unsafe(method(openCodeReview:))]
+        fn open_code_review(&self, _sender: Option<&AnyObject>) {
+            self.ivars().action_error.set(self.ivars().coding.as_ref().and_then(|coding|coding.request_review().err()).map(|_|"The coding result is not ready to open yet."));
         }
         #[unsafe(method(readAloud:))]
         fn read_aloud(&self, _sender: Option<&AnyObject>) {
@@ -139,7 +147,11 @@ impl PanelActions {
         mtm: MainThreadMarker,
         control: Arc<Control>,
         os: Arc<osworker::Control>,
-        conversation: (Arc<chat::Control>, Arc<tasks::Control>),
+        conversation: (
+            Arc<chat::Control>,
+            Arc<tasks::Control>,
+            Option<Arc<codingworker::Control>>,
+        ),
         speech: Arc<speech::Control>,
         voice: Arc<wakeworker::Control>,
         input: Retained<NSTextField>,
@@ -149,6 +161,7 @@ impl PanelActions {
             os,
             chat: conversation.0,
             tasks: conversation.1,
+            coding: conversation.2,
             action_error: Cell::new(None),
             speech,
             voice,
@@ -193,8 +206,19 @@ pub fn run(options: Options) -> Result<(), &'static str> {
         .ok_or("Context database has no parent directory")?
         .join("reviews");
     let mut tasks = TaskWorker::start(database, review_directory)?;
-    let mut conversation =
-        ConversationWorker::start_with_tasks(options.database, Arc::clone(&tasks.control))?;
+    let (mut coding, coding_error) = if options.smoke_test {
+        (None, None)
+    } else {
+        match CodingWorker::from_env() {
+            Ok(worker) => (worker, None),
+            Err(error) => (None, Some(error)),
+        }
+    };
+    let mut conversation = ConversationWorker::start_with_workers(
+        options.database,
+        Arc::clone(&tasks.control),
+        coding.as_ref().map(|worker| Arc::clone(&worker.control)),
+    )?;
     let mut speech = SpeechWorker::start()?;
     let mut voice = WakeWorker::from_env()?;
     // Smoke mode never enables microphone hardware.
@@ -323,11 +347,13 @@ pub fn run(options: Options) -> Result<(), &'static str> {
         (
             Arc::clone(&conversation.control),
             Arc::clone(&tasks.control),
+            coding.as_ref().map(|worker| Arc::clone(&worker.control)),
         ),
         Arc::clone(&speech.control),
         Arc::clone(&voice.control),
         input.clone(),
     );
+    actions.ivars().action_error.set(coding_error);
     // SAFETY: This retained target implements sendQuestion: with the standard
     // single-object action signature and outlives the entry field.
     unsafe {
@@ -431,6 +457,20 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     review_button.setEnabled(false);
     review_button.setHidden(true);
     let review_initially_disabled = !review_button.isEnabled();
+    // SAFETY: Retained main-thread target implements this single-object selector.
+    let code_review_button = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            &NSString::from_str("Open code"),
+            Some(&actions),
+            Some(sel!(openCodeReview:)),
+            mtm,
+        )
+    };
+    code_review_button.setFrame(rect(200.0, 9.0, 76.0, 23.0));
+    code_review_button.setBordered(false);
+    code_review_button.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+    code_review_button.setEnabled(false);
+    code_review_button.setHidden(true);
     let preview =
         NSTextField::wrappingLabelWithString(&NSString::from_str("Here when you need me."), mtm);
     preview.setFrame(rect(18.0, 44.0, 324.0, 36.0));
@@ -476,6 +516,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     header.addSubview(&record_button);
     header.addSubview(&expand_button);
     header.addSubview(&review_button);
+    header.addSubview(&code_review_button);
     details.addSubview(&status);
     details.addSubview(&pause_button);
     details.addSubview(&quit_button);
@@ -540,6 +581,8 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     let mut chat_revision = None;
     let mut task_revision = None;
     let mut task_notice = false;
+    let mut coding_revision = None;
+    let mut coding_notice = false;
     let mut voice_handoff = VoiceHandoff::new();
     loop {
         if expanded != actions.ivars().expanded.get() {
@@ -638,6 +681,27 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             task_snapshot.state == tasks::State::ReadyForReview && !tasks.control.busy();
         review_button.setEnabled(draft_ready);
         review_button.setHidden(task_snapshot.state != tasks::State::ReadyForReview);
+        let coding_snapshot = coding.as_ref().map(|worker| worker.control.snapshot());
+        if let Some(snapshot) = &coding_snapshot {
+            if coding_revision != Some(snapshot.revision) {
+                coding_notice = snapshot.state != tasks::State::Idle;
+                if snapshot.state == tasks::State::ReadyForReview && !actions.ivars().visible.get()
+                {
+                    actions.reveal_for_wake();
+                }
+                coding_revision = Some(snapshot.revision);
+            }
+            if coding_notice {
+                task_status.setStringValue(&NSString::from_str(&snapshot.text));
+                task_status.setToolTip(Some(&NSString::from_str(&snapshot.text)));
+            }
+        }
+        let code_ready = coding_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.state == tasks::State::ReadyForReview)
+            && coding.as_ref().is_some_and(|worker| !worker.control.busy());
+        code_review_button.setEnabled(code_ready);
+        code_review_button.setHidden(!code_ready);
         let chat_snapshot = conversation.control.snapshot();
         if chat_revision != Some(chat_snapshot.revision) {
             if matches!(
@@ -645,6 +709,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
                 chat::State::Reply | chat::State::Failed
             ) {
                 task_notice = false;
+                coding_notice = false;
             }
             response.setString(&NSString::from_str(&chat_snapshot.text));
             let message = match chat_snapshot.state {
@@ -664,11 +729,12 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             chat_status.setStringValue(&NSString::from_str(message));
             chat_revision = Some(chat_snapshot.revision);
         }
-        if let Some(command) = voice_handoff.tick_with_tasks(
+        if let Some(command) = voice_handoff.tick_with_workers(
             &voice.control,
             &conversation.control,
             &speech.control,
             &tasks.control,
+            coding.as_ref().map(|worker| worker.control.as_ref()),
         ) {
             input.setStringValue(&NSString::from_str(&command));
             if !interaction_revealed {
@@ -679,6 +745,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
         let voice_snapshot = voice.control.snapshot();
         let working = conversation.control.busy()
             || tasks.control.busy()
+            || coding.as_ref().is_some_and(|worker| worker.control.busy())
             || speech.control.busy()
             || speech.control.snapshot().state == speech::State::Starting
             || matches!(
@@ -790,6 +857,20 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             )
         {
             "Request failed · ready to retry"
+        } else if coding_notice
+            && coding_snapshot.is_some()
+            && !matches!(
+                voice_snapshot.state,
+                wakeworker::State::CommandListening | wakeworker::State::Decoding
+            )
+        {
+            match coding_snapshot.as_ref().map(|snapshot| snapshot.state) {
+                Some(tasks::State::Running) => "Codex is working in the background…",
+                Some(tasks::State::ReadyForReview) => "Coding changes ready for review",
+                Some(tasks::State::Blocked | tasks::State::Failed) => "Coding needs attention",
+                Some(tasks::State::Cancelled) => "Coding cancelled",
+                _ => "Ready when you are",
+            }
         } else if task_notice
             && !matches!(
                 voice_snapshot.state,
@@ -836,6 +917,11 @@ pub fn run(options: Options) -> Result<(), &'static str> {
         activity.setTextColor(Some(&activity_color));
         let preview_text = if let Some(error) = actions.ivars().action_error.get() {
             error.to_owned()
+        } else if coding_notice && !conversation.control.busy() {
+            coding_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.text.chars().take(180).collect::<String>())
+                .unwrap_or_default()
         } else if task_notice && !conversation.control.busy() {
             task_snapshot.text.chars().take(180).collect::<String>()
         } else if blocked {
@@ -921,6 +1007,9 @@ pub fn run(options: Options) -> Result<(), &'static str> {
                 speech.control.shutdown();
                 conversation.control.stop();
                 tasks.control.shutdown();
+                if let Some(coding) = &coding {
+                    coding.control.shutdown();
+                }
                 worker.control.stop();
             }
         }
@@ -931,6 +1020,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             && speech.is_finished()
             && voice.is_finished()
             && tasks.is_finished()
+            && coding.as_ref().is_none_or(|worker| worker.is_finished())
         {
             break;
         }
@@ -965,6 +1055,9 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     speech.join()?;
     voice.join()?;
     tasks.join()?;
+    if let Some(coding) = &mut coding {
+        coding.join()?;
+    }
     let task_worker_stopped = tasks.is_finished();
     if options.smoke_test {
         println!(

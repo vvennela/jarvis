@@ -1,11 +1,12 @@
 //! Shared voice-to-conversation-to-speech handoff used by the native panel.
-use crate::{chat, speech, tasks, wakeworker};
+use crate::{chat, codingworker, speech, tasks, wakeworker};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dispatch {
     Conversation,
     Draft,
     Review,
+    CodingReview,
 }
 
 /// Only the caller's request reaches this dispatcher. Model replies are never
@@ -49,6 +50,30 @@ pub fn dispatch_question(
     }
 }
 
+/// Exact review commands refer to a verified retained result, never a model path.
+pub fn dispatch_question_with_coding(
+    question: String,
+    conversation: &chat::Control,
+    task: &tasks::Control,
+    coding: Option<&codingworker::Control>,
+) -> Result<Dispatch, &'static str> {
+    let normalized = question
+        .trim()
+        .trim_end_matches(['.', '!', '?'])
+        .to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "open code review" | "open the code review" | "review the code" | "show the code review"
+    ) {
+        coding
+            .ok_or("Choose a coding project first.")?
+            .request_review()
+            .map_err(|_| "The coding result is not ready for review yet.")?;
+        return Ok(Dispatch::CodingReview);
+    }
+    dispatch_question(question, conversation, task)
+}
+
 struct SpokenQuestion {
     speech_revision: u64,
     speech_epoch: u64,
@@ -63,6 +88,8 @@ pub struct VoiceHandoff {
     spoken_question: Option<SpokenQuestion>,
     active_followup: Option<(u64, u64)>,
     task_revision: Option<u64>,
+    coding_revision: Option<u64>,
+    pending_coding_notice: bool,
 }
 
 impl VoiceHandoff {
@@ -77,7 +104,7 @@ impl VoiceHandoff {
         conversation: &chat::Control,
         playback: &speech::Control,
     ) -> Option<String> {
-        self.tick_inner(wake, conversation, playback, None)
+        self.tick_inner(wake, conversation, playback, None, None)
     }
 
     pub fn tick_with_tasks(
@@ -87,15 +114,26 @@ impl VoiceHandoff {
         playback: &speech::Control,
         tasks: &tasks::Control,
     ) -> Option<String> {
-        self.tick_inner(wake, conversation, playback, Some(tasks))
+        self.tick_inner(wake, conversation, playback, Some(tasks), None)
     }
 
+    pub fn tick_with_workers(
+        &mut self,
+        wake: &wakeworker::Control,
+        conversation: &chat::Control,
+        playback: &speech::Control,
+        tasks: &tasks::Control,
+        coding: Option<&codingworker::Control>,
+    ) -> Option<String> {
+        self.tick_inner(wake, conversation, playback, Some(tasks), coding)
+    }
     fn tick_inner(
         &mut self,
         wake: &wakeworker::Control,
         conversation: &chat::Control,
         playback: &speech::Control,
         tasks: Option<&tasks::Control>,
+        coding: Option<&codingworker::Control>,
     ) -> Option<String> {
         let reply = conversation.snapshot();
         if self
@@ -136,6 +174,25 @@ impl VoiceHandoff {
             }
             // Initial recovered results are visible in Details, not newly completed work.
             self.task_revision = Some(snapshot.revision);
+        }
+        if let Some(coding) = coding {
+            let snapshot = coding.snapshot();
+            if self
+                .coding_revision
+                .is_some_and(|revision| revision != snapshot.revision)
+            {
+                match snapshot.state {
+                    tasks::State::Running
+                    | tasks::State::ReadyForReview
+                    | tasks::State::Blocked
+                    | tasks::State::Failed => self.pending_coding_notice = true,
+                    tasks::State::Cancelled | tasks::State::Stopped => {
+                        self.pending_coding_notice = false
+                    }
+                    _ => {}
+                }
+            }
+            self.coding_revision = Some(snapshot.revision);
         }
         if let Some(question) = &self.spoken_question {
             let valid = question.speech_epoch == playback.cancellation_epoch()
@@ -219,6 +276,32 @@ impl VoiceHandoff {
             }
         }
 
+        if self.pending_coding_notice
+            && self.active_followup.is_none()
+            && !matches!(
+                wake.snapshot().state,
+                wakeworker::State::CommandReady
+                    | wakeworker::State::CommandListening
+                    | wakeworker::State::Decoding
+            )
+            && !conversation.busy()
+            && !playback.busy()
+            && let Some(coding) = coding
+            && !coding.busy()
+        {
+            let snapshot = coding.snapshot();
+            match snapshot.state {
+                tasks::State::ReadyForReview | tasks::State::Blocked | tasks::State::Failed => {
+                    if playback.speak(snapshot.text).is_ok() {
+                        self.pending_coding_notice = false;
+                    }
+                }
+                tasks::State::Cancelled | tasks::State::Stopped => {
+                    self.pending_coding_notice = false
+                }
+                _ => {}
+            }
+        }
         let command = if !conversation.busy() && !playback.busy() {
             wake.take_command()
         } else {
@@ -227,7 +310,7 @@ impl VoiceHandoff {
         if let Some(command) = &command {
             self.active_followup = None;
             if let Some(tasks) = tasks {
-                match dispatch_question(command.clone(), conversation, tasks) {
+                match dispatch_question_with_coding(command.clone(), conversation, tasks, coding) {
                     Ok(Dispatch::Conversation) => {
                         self.pending_reply_after =
                             Some((reply.revision, conversation.cancellation_epoch()))
@@ -237,6 +320,7 @@ impl VoiceHandoff {
                         let _ = playback.speak("I'll prepare that draft in the background. You can keep talking to me.".into());
                     }
                     Ok(Dispatch::Review) => self.pending_task_notice = true,
+                    Ok(Dispatch::CodingReview) => self.pending_coding_notice = true,
                     Err(message) => {
                         let _ = playback.speak(message.into());
                     }

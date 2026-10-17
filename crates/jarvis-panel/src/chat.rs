@@ -131,17 +131,25 @@ pub struct ConversationWorker {
 }
 impl ConversationWorker {
     pub fn start(database: PathBuf) -> Result<Self, &'static str> {
-        Self::start_configured(database, None)
+        Self::start_configured(database, None, None)
     }
     pub fn start_with_tasks(
         database: PathBuf,
         tasks: Arc<crate::tasks::Control>,
     ) -> Result<Self, &'static str> {
-        Self::start_configured(database, Some(tasks))
+        Self::start_configured(database, Some(tasks), None)
+    }
+    pub fn start_with_workers(
+        database: PathBuf,
+        tasks: Arc<crate::tasks::Control>,
+        coding: Option<Arc<crate::codingworker::Control>>,
+    ) -> Result<Self, &'static str> {
+        Self::start_configured(database, Some(tasks), coding)
     }
     fn start_configured(
         database: PathBuf,
         tasks: Option<Arc<crate::tasks::Control>>,
+        coding: Option<Arc<crate::codingworker::Control>>,
     ) -> Result<Self, &'static str> {
         let mut tools =
             ToolRuntime::read_only(database.clone()).with_actions(ActionExecutor::native());
@@ -156,6 +164,9 @@ impl ConversationWorker {
             tools = tools
                 .with_file_edits(tasks.clone())
                 .with_draft_submitter(tasks);
+        }
+        if let Some(coding) = coding {
+            tools = tools.with_coding_submitter(coding);
         }
         if let Ok(settings) = jarvis::conversation::load_provider_settings()
             && let Some(key) = settings

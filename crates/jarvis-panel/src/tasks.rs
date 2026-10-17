@@ -62,6 +62,9 @@ pub struct Control {
     snapshot: Mutex<Snapshot>,
 }
 impl jarvis::tool_runtime::DraftSubmitter for Control {
+    fn status(&self) -> Option<jarvis::tool_runtime::BackgroundJobState> {
+        Some(task_phase(self.snapshot().state, self.busy()))
+    }
     fn submit(&self, original_user_request: &str) -> Result<(), String> {
         Control::submit(self, original_user_request.to_owned()).map_err(|error| {
             match error {
@@ -77,6 +80,9 @@ impl jarvis::tool_runtime::DraftSubmitter for Control {
     }
 }
 impl jarvis::tool_runtime::FileEditSubmitter for Control {
+    fn status(&self) -> Option<jarvis::tool_runtime::BackgroundJobState> {
+        Some(task_phase(self.snapshot().state, self.busy()))
+    }
     fn submit_edit(&self, original_user_request: &str, resource_id: &str) -> Result<(), String> {
         self.submit_file_edit(original_user_request.to_owned(), resource_id.to_owned())
             .map_err(|error| {
@@ -712,4 +718,21 @@ async fn generate_edit_with_retry(
             task.generate(instruction,resource_id,output,control.cancel.clone()).await
         } else {result}
     }).await.unwrap_or(Err(DraftError::Provider(jarvis::providers::ProviderError::Timeout)))
+}
+
+/// Shared fixed metadata, never generated status prose.
+pub(crate) fn task_phase(state: State, busy: bool) -> jarvis::tool_runtime::BackgroundJobState {
+    use jarvis::tool_runtime::BackgroundJobState as Phase;
+    if busy && !matches!(state, State::Running | State::Stopped) {
+        return Phase::Queued;
+    }
+    match state {
+        State::Idle => Phase::Idle,
+        State::Running => Phase::Running,
+        State::ReadyForReview => Phase::ReadyForReview,
+        State::Blocked => Phase::Blocked,
+        State::Cancelled => Phase::Cancelled,
+        State::Failed => Phase::Failed,
+        State::Stopped => Phase::Stopped,
+    }
 }

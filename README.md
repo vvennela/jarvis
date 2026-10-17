@@ -8,6 +8,7 @@ Your work, in context. A native Rust companion for Mac that keeps a searchable m
 - **Native presence:** a menu-bar companion with a compact glass panel when you call Jarvis.
 - **Conversation:** Jev routing and NVIDIA Nemotron through Crusoe.
 - **Tools:** open approved apps, select Spotify artists, research with You, read shared context, and delegate writing through verified tools.
+- **Coding:** delegate a task to Codex in an isolated Git worktree, follow its progress, and open the verified code review.
 - **Ready for review:** prepares drafts and revised file copies, verifies their sources, and restores review state after restart.
 
 ## Run
@@ -43,4 +44,4 @@ cargo clippy --workspace --all-targets -- -D warnings
 node --test extension/tests/*.test.js
 ```
 
-[Architecture](docs/architecture.md) · [Build plan](docs/build-plan.md) · [Setup](docs/setup.md) · [Memory discipline](docs/memory.md)
+[Coding](docs/coding.md) · [Architecture](docs/architecture.md) · [Build plan](docs/build-plan.md) · [Setup](docs/setup.md) · [Memory discipline](docs/memory.md)

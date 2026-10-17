@@ -30,6 +30,9 @@ Rust gives explicit ownership and bounded lifetimes, but it does not automatical
 | Voice handoff | One pending command | Backpressure; mute and suppression invalidate pending/late results |
 | Music discovery | 5 search candidates; 512 KiB search, 64 KiB metadata, 256 KiB canonical embed per response; 2 concurrent lookups | Exact verified identities; parallel candidate checks share a 10-second deadline |
 | Artist playback | 35-second whole tool deadline; 20-second native process deadline; 4 KiB stdout/stderr | Only matching playing artist and consistent track identity produce success |
+| Clarification | One 8-second follow-up window after successful owned speech | Mute, cancellation, route changes and expiry discard late answers |
+| Coding process | One job, 10-minute deadline, 1 MiB stdout/stderr each, 64 KiB agent report | Kill owned process group; preserve isolated worktree for inspection |
+| Review journal | One 32 KiB metadata record, atomic owner-only write | Revalidate source and artifact identity on restart |
 | Speech request | 8 KiB text; ElevenLabs audio at most 8 MiB | Bounded response validation before playback |
 
 SQLite uses WAL mode, a requested 2 MiB page cache, a 32,768-page main-database cap, automatic checkpoint threshold of 128 pages, and a 4 MiB retained-journal target. With 4 KiB database pages the main-file cap is approximately 128 MiB. Page size, indexes, other connections, transient WAL growth, TLS buffers and allocator overhead affect actual memory/storage use; the journal target is not a hard instantaneous WAL cap.
@@ -59,3 +62,7 @@ The wake worker inspects ambient decoded text transiently and publishes only com
 ## What to measure next
 
 For the demo, measure idle and active RSS, store/FTS/WAL size, reads per unchanged scan, queue-overflow count, and end-of-request to verified response. Record the actual hardware and sample count. Do not claim a specific memory footprint or latency improvement until measured. Prioritize a working awareness-to-answer session over expanding scope to OCR, embeddings, continuous model summaries or arbitrary desktop control.
+
+## Local observation — October 17
+
+One sample of the installed app after 21 seconds of wake listening reported **148,096 KiB RSS (about 145 MiB)** and **11.7% CPU**. The index was 577,536 bytes, WAL 655,112 bytes, and shared-memory file 32,768 bytes. This is a single warm-up observation, not a steady-state bound. Codex/compiler child-process memory and retained worktrees are additional resources.

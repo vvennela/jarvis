@@ -15,6 +15,8 @@ fn command(directory: &TempDir, arguments: &[&str]) -> Command {
     for name in [
         "TYPESAFE_API_KEY",
         "CRUSOE_API_KEY",
+        "YOU_API_KEY",
+        "ELEVENLABS_API_KEY",
         "JARVIS_CONVERSATION_MODEL",
         "JARVIS_WORKER_MODEL",
     ] {
@@ -214,4 +216,28 @@ fn native_host_rejects_wrong_origin_before_reading_stdin_or_creating_database() 
     assert!(output.stdout.is_empty());
     assert!(!directory.join("native.db").exists());
     assert!(String::from_utf8_lossy(&output.stderr).contains("origin rejected"));
+}
+
+#[test]
+fn doctor_reports_actual_selected_model_and_only_optional_key_presence() {
+    let directory = TempDir::new();
+    fs::write(directory.join(".env"), format!("TYPESAFE_API_KEY={SECRET}\nCRUSOE_API_KEY={SECRET}\nYOU_API_KEY={SECRET}\nELEVENLABS_API_KEY={SECRET}\nJARVIS_CONVERSATION_MODEL={}\n",jarvis::providers::NEMOTRON_NANO_MODEL)).unwrap();
+    let configured = run(&directory, &["doctor"]);
+    assert!(configured.status.success());
+    assert_redacted(&configured);
+    let text = String::from_utf8(configured.stdout).unwrap();
+    assert!(text.contains(&format!(
+        "model: {}",
+        jarvis::providers::NEMOTRON_NANO_MODEL
+    )));
+    assert!(!text.contains(&format!("model: {}", jarvis::providers::NEMOTRON_MODEL)));
+    for key in ["YOU_API_KEY", "ELEVENLABS_API_KEY"] {
+        assert!(text.contains(&format!("{key}: configured (not yet verified)")));
+    }
+    let invalid = command(&directory, &["doctor"])
+        .env("JARVIS_CONVERSATION_MODEL", format!("bad\n{SECRET}"))
+        .output()
+        .unwrap();
+    assert_redacted(&invalid);
+    assert!(!String::from_utf8_lossy(&invalid.stdout).contains("model: bad"));
 }

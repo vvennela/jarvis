@@ -4,7 +4,7 @@ Build a companion that stays present while you work: maintained context, local â
 
 ## Implemented milestones
 
-Current combined checkpoint: **379 workspace tests passed, 21 ignored**, plus 16 extension tests, formatting and all-target clippy. The configured Nano model completes real native tool-call continuation; You web search and native Spotify artist playback are verified live. Full conversational artist execution subsequently passed in 4.531 seconds with verified native playback. A live fictional file request passed model planning, background editing, verified publication and restart recovery in **2.098 seconds**. The current checkpoint is **22:23 UTC / 3:23 PM Pacific on October 17**, followed by two hours of product fixes.
+Current combined checkpoint: **409 workspace tests passed, 26 ignored**, plus 16 extension tests, formatting and all-target clippy. The configured Nano model completes real native tool-call continuation; You web search and native Spotify artist playback are verified live. Full conversational artist execution subsequently passed in 4.531 seconds with verified native playback. A live fictional file request passed model planning, background editing, verified publication and restart recovery in **2.098 seconds**. The current checkpoint is **22:23 UTC / 3:23 PM Pacific on October 17**, followed by two hours of product fixes.
 
 | Component | Implemented and checked | Remaining live acceptance |
 |---|---|---|
@@ -19,6 +19,7 @@ Current combined checkpoint: **379 workspace tests passed, 21 ignored**, plus 16
 | Local voice | Streaming acoustic keyword detector, local speech-activity detection, resident Whisper command transcription, bounded microphone handoff and input-route change handling | First-attempt human wake accuracy, noisy-room endpointing and AirPods capture |
 | Speech output | Native macOS speech or optional ElevenLabs Flash; cancellable owned playback and temporary audio cleanup | Natural live response quality; current MP3 output is buffered, not streamed to playback |
 | Background drafts | One independent bounded TaskWorker, explicit typed/voice dispatch, shared evidence, source-version checks, cancellation, one transient retry and verified artifact publication | Rehearse spoken delegation while another conversation stays usable |
+| Coding delegation | Configured clean Git project, isolated Codex worktree, bounded process, cancellation, real diff and verified review; full live model-to-code acceptance passed in 22.351 seconds | Human voice rehearsal and approval to apply reviewed changes |
 | Human review | Ready-state card and Open result button; explicit review revalidates sources and file identity/content before opening | Live presenter review of a newly generated draft; no sending capability |
 
 The production TaskWorker was checked against the configured Crusoe model and real project index: **ReadyForReview in 8.064 seconds, 4,521 bytes**, with the current project priority present. Deliberate artifact modification caused explicit review to block without opening a viewer. The newer Nano native tool protocol check passed in 1.778 seconds. Lightning previously returned model-specific HTTP 429; precise errors and bounded cooldown-aware inference retries remain implemented. This is an engine check, not proof of voice capture or end-to-end spoken latency.
@@ -46,7 +47,7 @@ Draft readiness does not open a viewer. **Open result**, or an explicit review r
 | 5 | Rehearse explicit review | Open result revalidates and opens the new local artifact; the presenter confirms content and unsent status |
 | 6 | Run the timed presentation and capture submission video | Three-minute live path and separate one-minute video show actual event-built functionality, with fixture data or recovery clearly labeled |
 
-Use independent adversarial integration/e2e testers after meaningful changes, with distinct file ownership. Commit and push tested increments using git. Keep the remaining work on this complete path; general coding agents and browser bookings are separate milestones.
+Use independent adversarial integration/e2e testers after meaningful changes, with distinct file ownership. Commit and push tested increments using git. Keep the remaining work on this complete path; existing-chat resumption and browser bookings are separate milestones.
 
 ## Review and failure contracts
 

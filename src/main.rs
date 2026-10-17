@@ -163,7 +163,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let ready = ["TYPESAFE_API_KEY", "CRUSOE_API_KEY"]
                 .into_iter()
                 .all(|key| config.contains_key(key));
-            for key in ["TYPESAFE_API_KEY", "CRUSOE_API_KEY"] {
+            for key in [
+                "TYPESAFE_API_KEY",
+                "CRUSOE_API_KEY",
+                "YOU_API_KEY",
+                "ELEVENLABS_API_KEY",
+            ] {
                 println!(
                     "{key}: {}",
                     if config.contains_key(key) {
@@ -173,7 +178,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 );
             }
-            println!("model: {}", jarvis::providers::NEMOTRON_MODEL);
+            let model = config
+                .get("JARVIS_CONVERSATION_MODEL")
+                .map(String::as_str)
+                .unwrap_or(jarvis::providers::NEMOTRON_MODEL);
+            if model.len() <= 128
+                && model
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b))
+            {
+                println!("model: {model}");
+            } else {
+                println!("model: invalid configuration");
+            }
             if ready {
                 Ok(())
             } else {
