@@ -121,7 +121,8 @@ async fn verified_generic_articles_open_only_canonical_wikipedia_url_as_one_lite
         assert_eq!(result.url, expected);
         assert_eq!(
             fs::read_to_string(dir.join("argv")).unwrap(),
-            format!("{expected}\n")
+            format!("{expected}\n"),
+            "reading requests must use normal URL opening, without a background -g flag"
         );
         assert_eq!(peer.calls(), 1);
         let request = peer.requests.lock().unwrap()[0].clone();

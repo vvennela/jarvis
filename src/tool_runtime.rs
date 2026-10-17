@@ -169,7 +169,7 @@ impl ToolRuntime {
         if let Some(apps) = &self.apps {
             let available = apps.available_apps();
             if !available.is_empty() {
-                tools.push(spec("open_application", "Open an approved application only when the user explicitly asks to open that app. A verified result confirms completion.", json!({"app":{"type":"string","enum":available}}), &["app"]));
+                tools.push(spec("open_application", "Open an approved application only when the user explicitly asks to open or show that app. Spotify launches in the background unless the user explicitly says show or bring up. A verified result confirms it is running.", json!({"app":{"type":"string","enum":available}}), &["app"]));
             }
         }
         if self.actions.is_some() {

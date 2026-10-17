@@ -314,7 +314,12 @@ impl AppExecutor {
             .iter()
             .find(|allowed| allowed.name.eq_ignore_ascii_case(app.trim()))
             .ok_or(AppError::NotAllowed)?;
-        authorize_open(user_request, &approved.name)?;
+        let show = authorized_open_intent(user_request, &approved.name)?;
+        let script = if approved.bundle_id == "com.spotify.client" && !show {
+            OPEN_BACKGROUND_APP_SCRIPT
+        } else {
+            OPEN_APP_SCRIPT
+        };
         if crate::gate(
             crate::Operation::OpenApplication,
             crate::EvidenceStatus::Ready,
@@ -325,7 +330,7 @@ impl AppExecutor {
             return Err(AppError::Timeout);
         }
         let mut child = tokio::process::Command::new(&self.executable)
-            .args(["-e", OPEN_APP_SCRIPT, &approved.bundle_id])
+            .args(["-e", script, &approved.bundle_id])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -381,6 +386,11 @@ impl AppExecutor {
     }
 }
 pub fn authorize_open(request: &str, approved_name: &str) -> Result<(), AppError> {
+    authorized_open_intent(request, approved_name).map(|_| ())
+}
+
+/// Only an explicit show/bring-up request overrides Spotify's background default.
+fn authorized_open_intent(request: &str, approved_name: &str) -> Result<bool, AppError> {
     if request.is_empty()
         || request.len() > 8192
         || request
@@ -403,12 +413,21 @@ pub fn authorize_open(request: &str, approved_name: &str) -> Result<(), AppError
     let request = request.strip_prefix("please ").unwrap_or(request);
     let request = request.strip_suffix(" please").unwrap_or(request);
     let request = request.strip_suffix(" for me").unwrap_or(request);
-    let target = request
-        .strip_prefix("open ")
-        .or_else(|| request.strip_prefix("launch "))
-        .or_else(|| request.strip_prefix("start "))
+    let (target, show) = if let Some(target) = request
+        .strip_prefix("show ")
         .or_else(|| request.strip_prefix("bring up "))
-        .ok_or(AppError::Clarification)?;
+    {
+        (target, true)
+    } else {
+        (
+            request
+                .strip_prefix("open ")
+                .or_else(|| request.strip_prefix("launch "))
+                .or_else(|| request.strip_prefix("start "))
+                .ok_or(AppError::Clarification)?,
+            false,
+        )
+    };
     let target = target.strip_prefix("the ").unwrap_or(target);
     let target = target
         .strip_suffix(" application")
@@ -417,8 +436,22 @@ pub fn authorize_open(request: &str, approved_name: &str) -> Result<(), AppError
     if !target.eq_ignore_ascii_case(approved_name) {
         return Err(AppError::Clarification);
     }
-    Ok(())
+    Ok(show)
 }
+const OPEN_BACKGROUND_APP_SCRIPT: &str = r#"on run argv
+set approvedBundle to item 1 of argv
+try
+tell application id approvedBundle to launch
+repeat 30 times
+if application id approvedBundle is running then return "verified:running"
+delay 0.1
+end repeat
+return "unavailable"
+on error messageText number errorNumber
+if errorNumber is -1743 then return "permission_denied"
+return "unavailable"
+end try
+end run"#;
 const OPEN_APP_SCRIPT: &str = r#"on run argv
 set approvedBundle to item 1 of argv
 try

@@ -438,7 +438,7 @@ impl ActionExecutor {
 }
 
 const OPEN_SCRIPT: &str = r#"try
-tell application id "com.spotify.client" to activate
+tell application id "com.spotify.client" to launch
 repeat 30 times
 if application id "com.spotify.client" is running then return "verified:running"
 delay 0.1

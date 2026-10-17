@@ -8,6 +8,8 @@ Finish the installed-app rehearsal: reliable voice request, fresh shared context
 
 ## Current priorities
 
+Presentation preference: requested reading pages (such as Napoleon on Wikipedia) open visibly. Spotify playback and app startup stay in the background; “show Spotify” explicitly presents it. Codex jobs run in the background and open their review only when asked. Navigation of an existing named tab preserves focus.
+
 1. Rehearse the installed voice-to-action path. The full live model → artist tool → You lookup → verified Spotify playback passed in 4.531 seconds, with the natural acknowledgment “Playing Metallica.”
 2. Rehearse the installed browser context through voice. Arc is connected with localhost explicitly approved; the real page changed from Atlas to Beacon, the shared index advanced from version 1 to 2, and Nano answered Beacon after actual fresh search/read tool calls.
 3. Rehearse human voice on the current AirPods route. Generated audio passes real local wake detection, VAD, Whisper, handoff and speech synthesis; the model response in that test is a fixture. Test natural pauses and first-attempt wake separately.

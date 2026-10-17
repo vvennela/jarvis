@@ -419,6 +419,12 @@ async fn arbitrary_verified_artists_are_uri_arguments_and_acknowledged_only_afte
         let args = fs::read_to_string(dir.join("args")).unwrap();
         let lines = args.lines().collect::<Vec<_>>();
         assert_eq!(lines[0], "-e");
+        let script = lines[1..lines.len() - 3].join("\n").to_lowercase();
+        assert!(
+            !script.split_whitespace().any(|token| token == "activate"),
+            "artist playback requested foreground activation"
+        );
+        assert!(!script.contains("frontmost"));
         assert_eq!(lines[lines.len() - 3], format!("spotify:artist:{id}"));
         assert_eq!(lines[lines.len() - 1], format!("spotify:artist:{id}"));
         assert_eq!(lines[lines.len() - 2], name);
