@@ -55,6 +55,21 @@ pub struct Control {
     submission: Mutex<()>,
     snapshot: Mutex<Snapshot>,
 }
+impl jarvis::tool_runtime::DraftSubmitter for Control {
+    fn submit(&self, original_user_request: &str) -> Result<(), String> {
+        Control::submit(self, original_user_request.to_owned()).map_err(|error| {
+            match error {
+                SubmitError::Busy => {
+                    "A draft is already running. Let it finish or cancel it first."
+                }
+                SubmitError::Unavailable => "The draft worker is unavailable.",
+                SubmitError::InvalidRequest => "The draft request is empty, invalid, or too long.",
+                SubmitError::NotReady => "The draft is not ready for review.",
+            }
+            .to_owned()
+        })
+    }
+}
 impl Control {
     pub fn snapshot(&self) -> Snapshot {
         self.snapshot

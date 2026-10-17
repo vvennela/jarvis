@@ -1,8 +1,10 @@
 //! One cancellable conversation worker, independent of file awareness.
 use jarvis::{
     actions::ActionExecutor,
+    app_tools::AppExecutor,
     conversation::{Conversation, ConversationError, Reply},
     providers::ProviderError,
+    tool_runtime::ToolRuntime,
 };
 use std::{
     path::PathBuf,
@@ -122,16 +124,38 @@ pub struct ConversationWorker {
 }
 impl ConversationWorker {
     pub fn start(database: PathBuf) -> Result<Self, &'static str> {
-        Self::with_factory_and_actions(
+        Self::start_configured(database, None)
+    }
+    pub fn start_with_tasks(
+        database: PathBuf,
+        tasks: Arc<crate::tasks::Control>,
+    ) -> Result<Self, &'static str> {
+        Self::start_configured(database, Some(tasks))
+    }
+    fn start_configured(
+        database: PathBuf,
+        tasks: Option<Arc<crate::tasks::Control>>,
+    ) -> Result<Self, &'static str> {
+        let mut tools =
+            ToolRuntime::read_only(database.clone()).with_actions(ActionExecutor::native());
+        if let Ok(apps) = AppExecutor::native() {
+            tools = tools.with_apps(apps);
+        }
+        if let Some(tasks) = tasks {
+            tools = tools.with_draft_submitter(tasks);
+        }
+        Self::with_factory_and_tools(
             move || Conversation::from_env(database),
+            // Retain direct commands even if conversational credentials fail.
             ActionExecutor::native(),
+            Arc::new(tools),
         )
     }
     /// Test injection accepts real Conversation clients pointing at loopback fixtures.
     pub fn with_factory(
         factory: impl FnOnce() -> Result<Conversation, ConversationError> + Send + 'static,
     ) -> Result<Self, &'static str> {
-        Self::build(factory, None)
+        Self::build(factory, None, None)
     }
     /// The action adapter is independent of provider configuration. Tests inject
     /// a literal process fixture; production uses the fixed Spotify adapter.
@@ -139,11 +163,20 @@ impl ConversationWorker {
         factory: impl FnOnce() -> Result<Conversation, ConversationError> + Send + 'static,
         actions: ActionExecutor,
     ) -> Result<Self, &'static str> {
-        Self::build(factory, Some(actions))
+        Self::build(factory, Some(actions), None)
+    }
+    /// Direct approved tools stay usable when conversational inference is unavailable.
+    pub fn with_factory_and_tools(
+        factory: impl FnOnce() -> Result<Conversation, ConversationError> + Send + 'static,
+        actions: ActionExecutor,
+        tools: Arc<ToolRuntime>,
+    ) -> Result<Self, &'static str> {
+        Self::build(factory, Some(actions), Some(tools))
     }
     fn build(
         factory: impl FnOnce() -> Result<Conversation, ConversationError> + Send + 'static,
         actions: Option<ActionExecutor>,
+        tools: Option<Arc<ToolRuntime>>,
     ) -> Result<Self, &'static str> {
         let (sender, mut receiver) = mpsc::channel::<Request>(1);
         let (cancellation, mut cancelled) = watch::channel(0_u64);
@@ -170,6 +203,9 @@ impl ConversationWorker {
                 let (mut conversation, initialization_error) = match factory() {
                     Ok(mut conversation) => {
                         conversation.set_app_actions_available(actions.is_some());
+                        if let Some(tools) = &tools {
+                            conversation.set_tool_runtime(Arc::clone(tools));
+                        }
                         (Some(conversation), None)
                     }
                     Err(error) if actions.is_none() => {
@@ -198,6 +234,14 @@ impl ConversationWorker {
                         let ask = tokio::time::timeout(
                             REQUEST_TIMEOUT,
                             async {
+                                if let Some(tools) = &tools
+                                    && let Some(result) = tools.handle_direct(&request.question).await {
+                                    let text = result.acknowledgment.unwrap_or_else(|| "The requested app action did not return a confirmation.".into());
+                                    if let Some(conversation) = conversation.as_mut() {
+                                        conversation.record_tool_result(&request.question, &text);
+                                    }
+                                    return Ok(Reply { text, routing_degraded:false });
+                                }
                                 if let Some(actions) = &actions
                                     && let Some(result) = actions.handle(&request.question).await {
                                     if let Ok(result) = &result
@@ -262,8 +306,9 @@ impl ConversationWorker {
     }
 }
 
-/// These requests only generate text. A failed attempt has not committed a
-/// conversation turn; retrying cannot repeat a tool write or send a message.
+/// Provider failures are retryable only before a side effect is committed.
+/// Conversation returns authoritative side-effect acknowledgments immediately,
+/// without a subsequent model call that could fail and trigger a repeated write.
 /// The caller's timeout and cancellation select wrap all attempts and delays.
 async fn ask_with_retry(
     conversation: &mut Conversation,

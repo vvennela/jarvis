@@ -193,7 +193,8 @@ pub fn run(options: Options) -> Result<(), &'static str> {
         .ok_or("Context database has no parent directory")?
         .join("reviews");
     let mut tasks = TaskWorker::start(database, review_directory)?;
-    let mut conversation = ConversationWorker::start(options.database)?;
+    let mut conversation =
+        ConversationWorker::start_with_tasks(options.database, Arc::clone(&tasks.control))?;
     let mut speech = SpeechWorker::start()?;
     let mut voice = WakeWorker::from_env()?;
     // Smoke mode never enables microphone hardware.

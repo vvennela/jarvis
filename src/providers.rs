@@ -12,6 +12,12 @@ use std::{
 use reqwest::{Client, Url, header};
 use serde::{Deserialize, Serialize};
 
+mod tool_protocol;
+pub use tool_protocol::{
+    MAX_TOOL_ARGUMENT_BYTES, MAX_TOOL_CALLS, MAX_TOOL_SPECS, ToolCall, ToolMessage, ToolSpec,
+    ToolStep,
+};
+
 pub const JEV_ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
 pub const CRUSOE_ENDPOINT: &str = "https://api.inference.crusoecloud.com/v1/chat/completions";
 pub const NEMOTRON_MODEL: &str = "nvidia/Nemotron-3.5-Lightning-30B-A3B";

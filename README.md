@@ -7,7 +7,7 @@ Your work, in context. A native Rust companion for Mac that keeps a searchable m
 - **Fast context:** source-balanced SQLite retrieval, incremental hashes, and parallel context gathering and routing.
 - **Native presence:** a menu-bar companion with a compact glass panel when you call Jarvis.
 - **Conversation:** Jev routing and Nemotron 3.5 Lightning through Crusoe.
-- **Spotify:** open the app, resume music, and pause playback by voice, with verified spoken results.
+- **Tools:** open approved apps, control Spotify, search and read indexed context, and delegate writing through verified tools.
 - **Ready for review:** prepares and verifies draft artifacts for your review.
 
 ## Run

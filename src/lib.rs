@@ -1,9 +1,10 @@
 //! Deterministic Jarvis policy and job lifecycle foundation.
 //! Adapters must derive evidence and operation classifications from trusted code,
-//! never from model-supplied safety labels. Desktop adapters are not built yet.
+//! never from model-supplied safety labels.
 #![forbid(unsafe_code)]
 
 pub mod actions;
+pub mod app_tools;
 pub mod awareness;
 pub mod bridge;
 pub mod broker;
@@ -13,6 +14,7 @@ pub mod draft;
 pub mod elevenlabs;
 pub mod install;
 pub mod providers;
+pub mod tool_runtime;
 
 pub const MAX_REVIEW_BYTES: usize = 64 * 1024;
 pub const MAX_ANSWER_BYTES: usize = 8192;
