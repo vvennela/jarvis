@@ -8,6 +8,7 @@ struct Options {
     root: PathBuf,
     database: PathBuf,
     smoke_test: bool,
+    project_dir: Option<PathBuf>,
 }
 
 fn options() -> Result<Options, &'static str> {
@@ -15,6 +16,7 @@ fn options() -> Result<Options, &'static str> {
     let mut root = None;
     let mut database = None;
     let mut smoke_test = false;
+    let mut project_dir = None;
     while let Some(argument) = args.next() {
         match argument.to_str() {
             Some("--root") if root.is_none() => {
@@ -27,10 +29,15 @@ fn options() -> Result<Options, &'static str> {
                     args.next().ok_or("--db requires a database path")?,
                 ))
             }
+            Some("--project-dir") if project_dir.is_none() => {
+                project_dir = Some(PathBuf::from(
+                    args.next().ok_or("--project-dir requires a directory")?,
+                ));
+            }
             Some("--smoke-test") if !smoke_test => smoke_test = true,
             _ => {
                 return Err(
-                    "usage: jarvis-panel --root <directory> --db <database> [--smoke-test]",
+                    "usage: jarvis-panel --root <directory> --db <database> [--project-dir <directory>] [--smoke-test]",
                 );
             }
         }
@@ -39,6 +46,7 @@ fn options() -> Result<Options, &'static str> {
         root: root.ok_or("--root is required; no folders are collected by default")?,
         database: database.ok_or("--db is required")?,
         smoke_test,
+        project_dir,
     })
 }
 
@@ -46,13 +54,21 @@ fn options() -> Result<Options, &'static str> {
 mod macos;
 
 fn main() {
-    let parsed = match options() {
+    let mut parsed = match options() {
         Ok(options) => options,
         Err(message) => {
             eprintln!("{message}");
             std::process::exit(2);
         }
     };
+    // LaunchServices chooses its own working directory. Resolve the explicitly
+    // supplied project before any worker threads or database side effects start.
+    if let Some(project_dir) = parsed.project_dir.take()
+        && std::env::set_current_dir(project_dir).is_err()
+    {
+        eprintln!("--project-dir must be an accessible directory");
+        std::process::exit(2);
+    }
     #[cfg(target_os = "macos")]
     if let Err(message) = macos::run(parsed) {
         eprintln!("{message}");

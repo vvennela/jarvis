@@ -16,6 +16,7 @@ jarvis = { path = "../.." }
 tokio = { version = "1.53.3", features = ["rt", "sync", "time", "macros", "net", "process", "io-util"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "CALayer", "objc2-core-foundation"] }
 objc2 = "0.6.3"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "NSRunningApplication", "NSApplication", "NSButton", "NSCell", "NSColor", "NSControl", "NSEvent", "NSFont", "NSGraphics", "NSPanel", "NSResponder", "NSScreen", "NSScrollView", "NSClipView", "NSTextView", "NSTextContainer", "NSText", "NSTextField", "NSView", "NSWindow"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "NSRunningApplication", "NSApplication", "NSButton", "NSCell", "NSColor", "NSControl", "NSEvent", "NSFont", "NSGraphics", "NSPanel", "NSResponder", "NSScreen", "NSScrollView", "NSClipView", "NSTextView", "NSTextContainer", "NSText", "NSTextField", "NSView", "NSWindow", "NSVisualEffectView", "NSGlassEffectView", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSImage", "objc2-quartz-core"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSDate", "NSGeometry", "NSObject", "NSString", "NSRunLoop"] }

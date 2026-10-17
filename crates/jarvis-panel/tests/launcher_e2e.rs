@@ -1,5 +1,7 @@
 //! Launcher CLI validation is portable. Signed native bundle smoke is opt-in.
 use std::{path::PathBuf, process::Command};
+#[path = "../../../tests/support/mod.rs"]
+mod support;
 fn launcher() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/launch-jarvis.command")
 }
@@ -87,7 +89,9 @@ fn opt_in_signed_bundle_contains_native_executable_and_runs_hardware_free_smoke(
         .arg("--db")
         .arg(temp.join("state.db"))
         .arg("--smoke-test")
-        .current_dir(&temp)
+        .arg("--project-dir")
+        .arg(&temp)
+        .current_dir("/")
         .env_remove("CRUSOE_API_KEY")
         .env_remove("TYPESAFE_API_KEY")
         .env_remove("ELEVENLABS_API_KEY")
@@ -117,4 +121,130 @@ fn opt_in_signed_bundle_contains_native_executable_and_runs_hardware_free_smoke(
     assert_eq!(flags["active_observed"], true);
     assert_eq!(flags["paused_observed"], true);
     assert_eq!(flags["resumed_observed"], true);
+    for field in [
+        "initial_hidden",
+        "menu_bar_present",
+        "wake_revealed",
+        "dismissed_hidden",
+        "workers_alive_after_dismiss",
+        "voice_unchanged_after_dismiss",
+        "menu_toggle_revealed",
+    ] {
+        assert_eq!(
+            flags[field], true,
+            "bundle failed visibility lifecycle: {field}"
+        );
+    }
+}
+
+#[test]
+fn invalid_project_directory_is_rejected_before_database_or_worker_start() {
+    let dir = support::TempDir::new();
+    let root = dir.join("approved");
+    std::fs::create_dir(&root).unwrap();
+    let invalid_file = dir.join("not-a-directory");
+    std::fs::write(&invalid_file, "fixture").unwrap();
+    for project in [dir.join("missing-project"), invalid_file] {
+        let output = Command::new(env!("CARGO_BIN_EXE_jarvis-panel"))
+            .arg("--root")
+            .arg(&root)
+            .arg("--db")
+            .arg(dir.join("never.db"))
+            .arg("--project-dir")
+            .arg(project)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("--project-dir must be an accessible directory")
+        );
+        assert!(output.stdout.is_empty());
+        assert!(!dir.join("never.db").exists());
+    }
+    for project_args in [
+        vec!["--project-dir"],
+        vec!["--project-dir", ".", "--project-dir", "."],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_jarvis-panel"))
+            .arg("--root")
+            .arg(&root)
+            .arg("--db")
+            .arg(dir.join("never.db"))
+            .args(project_args)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(!dir.join("never.db").exists());
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires explicit signed bundle; observes normal hardware-off app for 30 seconds"]
+fn opt_in_normal_bundle_stays_alive_until_explicit_termination() {
+    use std::{
+        fs,
+        process::{Child, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+    struct OwnedChild(Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
+    let bundle = PathBuf::from(
+        std::env::var_os("JARVIS_TEST_APP_BUNDLE").expect("set JARVIS_TEST_APP_BUNDLE"),
+    );
+    let dir = support::TempDir::new();
+    let root = dir.join("approved");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("fixture.md"), "lifetime fixture").unwrap();
+    let mut command = Command::new(bundle.join("Contents/MacOS/jarvis-panel"));
+    command
+        .arg("--root")
+        .arg(root)
+        .arg("--db")
+        .arg(dir.join("state.db"))
+        .arg("--project-dir")
+        .arg(dir.path())
+        .current_dir(dir.path())
+        .env_remove("CRUSOE_API_KEY")
+        .env_remove("TYPESAFE_API_KEY")
+        .env_remove("ELEVENLABS_API_KEY")
+        .env_remove("JARVIS_WHISPER_MODEL_PATH")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = OwnedChild(command.spawn().unwrap());
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(30) {
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "normal app exited before explicit termination after {:?}",
+            started.elapsed()
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-TERM", &child.0.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while child.0.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "explicit termination did not stop app"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 }

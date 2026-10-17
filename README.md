@@ -5,7 +5,7 @@ Your work, in context. A native Rust companion for Mac that keeps a searchable m
 - **Voice:** say “Jarvis” or “Hey Jarvis” to ask a question and hear the reply, with local wake recognition and a microphone mute control.
 - **Continuous awareness:** watches selected folders, approved Chrome sites, and foreground app/window metadata.
 - **Fast context:** SQLite search, incremental hashes, and parallel retrieval and routing.
-- **Native presence:** a floating panel with live awareness status and pause/resume.
+- **Native presence:** a menu-bar companion with a compact glass panel when you call Jarvis.
 - **Conversation:** Jev routing and Nemotron 3.5 Lightning through Crusoe.
 - **Ready for review:** prepares and verifies draft artifacts for your review.
 

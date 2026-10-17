@@ -83,10 +83,12 @@ The current host writes directly to SQLite; the planned separate service/socket 
 ## Native voice panel
 
 ```sh
-cargo run -p jarvis-panel -- --root "$PWD/examples/demo-workspace" --db "$PWD/runtime/context.db"
+./scripts/launch-jarvis.command --root "$PWD/examples/demo-workspace" --db "$PWD/runtime/context.db"
 ```
 
-The top-right panel runs file awareness and conversation on separate workers. Configure the absolute Whisper model path before launching. The voice interaction uses “Jarvis” as its wake word and automatically speaks the response; the panel provides microphone mute and speech-stop controls. macOS may request microphone permission on first use. Local phrase detection uses bounded speech-active Whisper windows, so false wakes and power usage still need measurement on real microphone input. Wake capture pauses during Jarvis's own response; voice barge-in remains a follow-up.
+Jarvis waits in the menu bar; a wake request or a click on its menu-bar item reveals the compact top-right glass panel. Dismissing the panel keeps wake listening and awareness running. Expand the panel for typed conversation, awareness status, pause, speech controls, and Quit. File awareness and conversation run on separate workers. The launcher builds a signed development app under Application Support and supplies the project directory so its `.env` loads through LaunchServices.
+
+Configure the absolute Whisper model path before launching. The voice interaction uses “Jarvis” or “Hey Jarvis” and automatically speaks the response. macOS may request microphone permission on first use. Capture uses the default macOS input device: select AirPods under Sound → Input, then mute and resume Jarvis to reopen capture after changing devices. AirPods capture still needs a live hardware rehearsal. Local phrase detection uses bounded speech-active Whisper windows, so false wakes and power usage still need measurement on real microphone input. Wake capture pauses during Jarvis's own response; voice barge-in remains a follow-up.
 
 Automated native smoke tests leave the microphone and native OS collection off. Actual Whisper inference has been verified with generated WAV audio; synthetic wake tests verify command isolation and cancellation. The panel independently collects foreground app identity and permitted focused-window metadata. Missing Accessibility permission leaves app identity available and is shown in the panel. Known browser/password-manager titles are excluded from OS capture; approved browser pages use the extension. Browser action execution, persistent autonomous jobs, and personal speaker recognition remain separate milestones.
 

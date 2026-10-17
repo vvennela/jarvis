@@ -92,8 +92,11 @@ ln -s "$bundle_path" "$runtime_link"
 printf 'Jarvis app ready: %s\n' "$bundle_path"
 if "$build_only"; then exit 0; fi
 
-launch_args=(--root "$root_dir" --db "$database_path")
-if "$smoke_test"; then launch_args+=(--smoke-test); fi
-# This preserves the project working directory for .env loading and launches the
-# signed native executable inside its bundle, giving macOS its Jarvis identity.
-"$bundle_path/Contents/MacOS/jarvis-panel" "${launch_args[@]}"
+launch_args=(--root "$root_dir" --db "$database_path" --project-dir "$repo_dir")
+if "$smoke_test"; then
+  # Tests need bounded foreground execution and structured stdout; no mic/OS reads.
+  "$bundle_path/Contents/MacOS/jarvis-panel" "${launch_args[@]}" --smoke-test
+else
+  # LaunchServices owns the native app lifetime, independent of the launcher shell.
+  /usr/bin/open -n "$bundle_path" --args "${launch_args[@]}"
+fi

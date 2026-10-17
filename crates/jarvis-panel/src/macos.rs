@@ -12,19 +12,22 @@ use jarvis_panel::{
 use objc2::{
     DefinedClass, MainThreadOnly, define_class, msg_send,
     rc::{Retained, autoreleasepool},
-    runtime::AnyObject,
+    runtime::{AnyClass, AnyObject},
     sel,
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSColor,
-    NSEventMask, NSFloatingWindowLevel, NSFont, NSPanel, NSScreen, NSScrollView, NSTextField,
-    NSTextView, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSEventMask, NSFloatingWindowLevel, NSFont, NSGlassEffectView, NSGlassEffectViewStyle, NSImage,
+    NSPanel, NSScreen, NSScrollView, NSStatusBar, NSTextField, NSTextView, NSView,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSDate, NSDefaultRunLoopMode, NSObject, NSObjectProtocol, NSPoint, NSRect,
     NSSize, NSString,
 };
 use std::{
+    cell::Cell,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -36,6 +39,9 @@ struct ActionIvars {
     speech: Arc<speech::Control>,
     voice: Arc<wakeworker::Control>,
     input: Retained<NSTextField>,
+    expanded: Cell<bool>,
+    visible: Cell<bool>,
+    wake_opened: Cell<bool>,
 }
 define_class!(
     // SAFETY: NSObject has no additional subclass invariants; this class has no
@@ -47,6 +53,23 @@ define_class!(
     // SAFETY: NSObjectProtocol adds no requirements beyond the NSObject subclass.
     unsafe impl NSObjectProtocol for PanelActions {}
     impl PanelActions {
+        #[unsafe(method(togglePanel:))]
+        fn toggle_panel(&self, _sender: Option<&AnyObject>) {
+            let visible = !self.ivars().visible.get();
+            self.ivars().visible.set(visible);
+            self.ivars().wake_opened.set(false);
+            if visible { self.ivars().expanded.set(false); }
+        }
+        #[unsafe(method(dismissPanel:))]
+        fn dismiss_panel(&self, _sender: Option<&AnyObject>) {
+            self.ivars().visible.set(false);
+            self.ivars().wake_opened.set(false);
+        }
+        #[unsafe(method(toggleDetails:))]
+        fn toggle_details(&self, _sender: Option<&AnyObject>) {
+            self.ivars().expanded.set(!self.ivars().expanded.get());
+            self.ivars().wake_opened.set(false);
+        }
         #[unsafe(method(togglePause:))]
         fn toggle_pause(&self, _sender: Option<&AnyObject>) {
             if self.ivars().control.pause_requested() { self.ivars().control.resume(); self.ivars().os.resume(); }
@@ -54,6 +77,7 @@ define_class!(
         }
         #[unsafe(method(quitPanel:))]
         fn quit_panel(&self, _sender: Option<&AnyObject>) {
+            eprintln!("Jarvis: quit control invoked");
             self.ivars().os.stop();
             self.ivars().voice.shutdown();
             self.ivars().speech.shutdown();
@@ -91,6 +115,11 @@ define_class!(
     }
 );
 impl PanelActions {
+    fn reveal_for_wake(&self) {
+        self.ivars().expanded.set(false);
+        self.ivars().visible.set(true);
+        self.ivars().wake_opened.set(true);
+    }
     fn new(
         mtm: MainThreadMarker,
         control: Arc<Control>,
@@ -107,6 +136,9 @@ impl PanelActions {
             speech,
             voice,
             input,
+            expanded: Cell::new(false),
+            visible: Cell::new(false),
+            wake_opened: Cell::new(false),
         });
         // SAFETY: Correct NSObject init signature, initialized ivars remain owned.
         unsafe { msg_send![super(this), init] }
@@ -142,8 +174,9 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     application.finishLaunching();
     let screen = NSScreen::mainScreen(mtm).ok_or("No display is available for the panel")?;
     let frame = screen.visibleFrame();
-    let width = 480.0;
-    let height = 480.0;
+    let width = 360.0;
+    let height = 140.0;
+    let expanded_height = 440.0;
     // Retain the panel throughout the event loop; disable release-on-close below.
     let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
         NSPanel::alloc(mtm),
@@ -171,47 +204,84 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             | NSWindowCollectionBehavior::FullScreenAuxiliary,
     );
     panel.setHasShadow(true);
-    panel.setOpaque(true);
-    panel.setBackgroundColor(Some(&NSColor::windowBackgroundColor()));
-    let view = panel
-        .contentView()
-        .ok_or("Panel content view unavailable")?;
-    let title = label(mtm, "JARVIS", rect(18.0, 445.0, 444.0, 22.0), 13.0);
-    title.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
-    let status = label(mtm, "Starting…", rect(18.0, 414.0, 444.0, 26.0), 19.0);
+    panel.setOpaque(false);
+    panel.setBackgroundColor(Some(&NSColor::clearColor()));
+    let view = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, width, height));
+    // Runtime availability preserves the frosted-glass fallback on older macOS.
+    let native_glass = AnyClass::get(c"NSGlassEffectView").is_some();
+    let (glass, frosted) = if native_glass {
+        let glass = NSGlassEffectView::initWithFrame(
+            NSGlassEffectView::alloc(mtm),
+            rect(0.0, 0.0, width, height),
+        );
+        glass.setStyle(NSGlassEffectViewStyle::Regular);
+        glass.setCornerRadius(18.0);
+        glass.setContentView(Some(&view));
+        panel.setContentView(Some(&glass));
+        (Some(glass), None)
+    } else {
+        let frosted = NSVisualEffectView::initWithFrame(
+            NSVisualEffectView::alloc(mtm),
+            rect(0.0, 0.0, width, height),
+        );
+        frosted.setMaterial(NSVisualEffectMaterial::Popover);
+        frosted.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+        frosted.setState(NSVisualEffectState::Active);
+        frosted.setWantsLayer(true);
+        if let Some(layer) = frosted.layer() {
+            layer.setCornerRadius(18.0);
+            layer.setMasksToBounds(true);
+        }
+        frosted.addSubview(&view);
+        panel.setContentView(Some(&frosted));
+        (None, Some(frosted))
+    };
+    let header = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, width, height));
+    let details = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        rect(0.0, 0.0, width, expanded_height - height),
+    );
+    details.setHidden(true);
+    view.addSubview(&header);
+    view.addSubview(&details);
+    let title = label(mtm, "Jarvis", rect(18.0, 110.0, 200.0, 18.0), 11.0);
+    title.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    let status = label(mtm, "Starting…", rect(18.0, 274.0, 324.0, 18.0), 11.0);
     let detail = label(
         mtm,
         "Microphone off · models idle",
-        rect(18.0, 390.0, 444.0, 20.0),
-        12.0,
+        rect(34.0, 82.0, 308.0, 24.0),
+        15.0,
     );
     detail.setTextColor(Some(&NSColor::secondaryLabelColor()));
     let os_status = label(
         mtm,
         "Starting app awareness…",
-        rect(18.0, 368.0, 444.0, 20.0),
+        rect(18.0, 254.0, 324.0, 18.0),
         12.0,
     );
     let chat_status = label(
         mtm,
         "Preparing conversation…",
-        rect(18.0, 344.0, 444.0, 20.0),
+        rect(18.0, 234.0, 324.0, 18.0),
         12.0,
     );
     let scroll =
-        NSScrollView::initWithFrame(NSScrollView::alloc(mtm), rect(18.0, 124.0, 444.0, 212.0));
+        NSScrollView::initWithFrame(NSScrollView::alloc(mtm), rect(18.0, 108.0, 324.0, 120.0));
     scroll.setHasVerticalScroller(true);
-    let response = NSTextView::initWithFrame(NSTextView::alloc(mtm), rect(0.0, 0.0, 424.0, 212.0));
+    scroll.setDrawsBackground(false);
+    let response = NSTextView::initWithFrame(NSTextView::alloc(mtm), rect(0.0, 0.0, 304.0, 120.0));
     response.setEditable(false);
+    response.setDrawsBackground(false);
     response.setSelectable(true);
     response.setRichText(false);
     response.setFont(Some(&NSFont::systemFontOfSize(14.0)));
     response.setVerticallyResizable(true);
     response.setHorizontallyResizable(false);
-    response.setMinSize(NSSize::new(424.0, 212.0));
-    response.setMaxSize(NSSize::new(424.0, 1_000_000.0));
+    response.setMinSize(NSSize::new(304.0, 120.0));
+    response.setMaxSize(NSSize::new(304.0, 1_000_000.0));
     scroll.setDocumentView(Some(&response));
-    let input = NSTextField::initWithFrame(NSTextField::alloc(mtm), rect(18.0, 82.0, 350.0, 30.0));
+    let input = NSTextField::initWithFrame(NSTextField::alloc(mtm), rect(18.0, 70.0, 250.0, 30.0));
     input.setPlaceholderString(Some(&NSString::from_str("Ask Jarvis about your work…")));
     input.setFont(Some(&NSFont::systemFontOfSize(14.0)));
     let actions = PanelActions::new(
@@ -247,8 +317,8 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             ),
         )
     };
-    pause_button.setFrame(rect(16.0, 16.0, 94.0, 30.0));
-    quit_button.setFrame(rect(380.0, 16.0, 82.0, 30.0));
+    pause_button.setFrame(rect(16.0, 8.0, 74.0, 28.0));
+    quit_button.setFrame(rect(274.0, 8.0, 68.0, 28.0));
     // SAFETY: The retained target declares these exact single-object selectors.
     let (send_button, cancel_button) = unsafe {
         (
@@ -266,8 +336,8 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             ),
         )
     };
-    send_button.setFrame(rect(378.0, 82.0, 84.0, 30.0));
-    cancel_button.setFrame(rect(118.0, 16.0, 130.0, 30.0));
+    send_button.setFrame(rect(274.0, 70.0, 68.0, 30.0));
+    cancel_button.setFrame(rect(94.0, 8.0, 78.0, 28.0));
     // SAFETY: Both selectors are declared on the retained main-thread target.
     let (read_button, stop_speech_button) = unsafe {
         (
@@ -285,8 +355,8 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             ),
         )
     };
-    read_button.setFrame(rect(16.0, 48.0, 110.0, 28.0));
-    stop_speech_button.setFrame(rect(132.0, 48.0, 140.0, 28.0));
+    read_button.setFrame(rect(16.0, 38.0, 110.0, 28.0));
+    stop_speech_button.setFrame(rect(132.0, 38.0, 140.0, 28.0));
     // SAFETY: The retained target implements this single-object selector.
     let record_button = unsafe {
         NSButton::buttonWithTitle_target_action(
@@ -296,24 +366,103 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             mtm,
         )
     };
-    record_button.setFrame(rect(282.0, 48.0, 180.0, 28.0));
-    // Subviews remain owned by both retained handles and AppKit's hierarchy.
-    view.addSubview(&title);
-    view.addSubview(&status);
-    view.addSubview(&detail);
-    view.addSubview(&pause_button);
-    view.addSubview(&quit_button);
-    view.addSubview(&os_status);
-    view.addSubview(&chat_status);
-    view.addSubview(&scroll);
-    view.addSubview(&input);
-    view.addSubview(&send_button);
-    view.addSubview(&cancel_button);
-    view.addSubview(&read_button);
-    view.addSubview(&stop_speech_button);
-    view.addSubview(&record_button);
-    // Deliberately neither activate the application nor make this panel key.
-    panel.orderFrontRegardless();
+    record_button.setFrame(rect(14.0, 9.0, 60.0, 23.0));
+    record_button.setBordered(false);
+    record_button.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+    // SAFETY: The retained target declares this standard single-object action.
+    let expand_button = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            &NSString::from_str("Expand"),
+            Some(&actions),
+            Some(sel!(toggleDetails:)),
+            mtm,
+        )
+    };
+    expand_button.setFrame(rect(278.0, 9.0, 68.0, 23.0));
+    expand_button.setBordered(false);
+    expand_button.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+    let preview =
+        NSTextField::wrappingLabelWithString(&NSString::from_str("Here when you need me."), mtm);
+    preview.setFrame(rect(18.0, 44.0, 324.0, 36.0));
+    preview.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+    preview.setMaximumNumberOfLines(2);
+    preview.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    let activity = label(mtm, "●", rect(18.0, 84.0, 12.0, 18.0), 9.0);
+    activity.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    // SAFETY: Target owns this exact single-object selector for the entire UI loop.
+    let dismiss_button = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            &NSString::from_str("×"),
+            Some(&actions),
+            Some(sel!(dismissPanel:)),
+            mtm,
+        )
+    };
+    dismiss_button.setFrame(rect(320.0, 108.0, 24.0, 22.0));
+    dismiss_button.setBordered(false);
+    dismiss_button.setFont(Some(&NSFont::systemFontOfSize(14.0)));
+    dismiss_button.setToolTip(Some(&NSString::from_str(
+        "Dismiss · Jarvis keeps listening",
+    )));
+    header.addSubview(&dismiss_button);
+    header.addSubview(&activity);
+    header.addSubview(&title);
+    header.addSubview(&detail);
+    header.addSubview(&preview);
+    header.addSubview(&record_button);
+    header.addSubview(&expand_button);
+    details.addSubview(&status);
+    details.addSubview(&pause_button);
+    details.addSubview(&quit_button);
+    details.addSubview(&os_status);
+    details.addSubview(&chat_status);
+    details.addSubview(&scroll);
+    details.addSubview(&input);
+    details.addSubview(&send_button);
+    details.addSubview(&cancel_button);
+    details.addSubview(&read_button);
+    details.addSubview(&stop_speech_button);
+    let compact_width = panel.frame().size.width;
+    let compact_height = panel.frame().size.height;
+    let translucent = !panel.isOpaque();
+    let nonactivating = panel
+        .styleMask()
+        .contains(NSWindowStyleMask::NonactivatingPanel);
+    let mut expanded = false;
+    let mut expanded_observed = false;
+    let mut collapsed_observed = false;
+    // The status item owns the idle presence; the panel starts completely hidden.
+    let status_bar = NSStatusBar::systemStatusBar();
+    let status_item = status_bar.statusItemWithLength(28.0);
+    let menu_button = status_item
+        .button(mtm)
+        .ok_or("Menu bar control unavailable")?;
+    if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+        &NSString::from_str("waveform"),
+        Some(&NSString::from_str("Jarvis")),
+    ) {
+        image.setTemplate(true);
+        menu_button.setImage(Some(&image));
+    } else {
+        menu_button.setTitle(&NSString::from_str("J"));
+    }
+    // SAFETY: The retained target implements the action and outlives the item.
+    unsafe {
+        menu_button.setTarget(Some(&actions));
+        menu_button.setAction(Some(sel!(togglePanel:)));
+    }
+    menu_button.setToolTip(Some(&NSString::from_str("Jarvis · click to open")));
+    let initial_hidden = !panel.isVisible();
+    let menu_bar_present = status_item.isVisible();
+    let mut visible = false;
+    let mut wake_revealed = false;
+    let mut dismissed_hidden = false;
+    let mut workers_alive_after_dismiss = false;
+    let initial_voice_enabled = voice.control.enabled();
+    let mut voice_unchanged_after_dismiss = false;
+    let mut menu_toggle_revealed = false;
+    let mut interaction_revealed = false;
+    let mut wake_idle_since: Option<Instant> = None;
     let started = Instant::now();
     let mut active_observed = false;
     let mut paused_observed = false;
@@ -324,12 +473,55 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     let mut chat_revision = None;
     let mut voice_handoff = VoiceHandoff::new();
     loop {
+        if expanded != actions.ivars().expanded.get() {
+            expanded = actions.ivars().expanded.get();
+            let target_height = if expanded { expanded_height } else { height };
+            let current = panel.frame();
+            panel.setFrame_display(
+                rect(
+                    current.origin.x,
+                    current.origin.y + current.size.height - target_height,
+                    width,
+                    target_height,
+                ),
+                true,
+            );
+            if let Some(glass) = &glass {
+                glass.setFrame(rect(0.0, 0.0, width, target_height));
+            }
+            if let Some(frosted) = &frosted {
+                frosted.setFrame(rect(0.0, 0.0, width, target_height));
+            }
+            view.setFrame(rect(0.0, 0.0, width, target_height));
+            header.setFrame(rect(0.0, target_height - height, width, height));
+            details.setHidden(!expanded);
+            expand_button.setTitle(&NSString::from_str(if expanded {
+                "Less"
+            } else {
+                "Details"
+            }));
+            if expanded {
+                expanded_observed =
+                    panel.frame().size.height == expanded_height && !details.isHidden();
+            } else {
+                collapsed_observed = panel.frame().size.height == height && details.isHidden();
+            }
+        }
+        if visible != actions.ivars().visible.get() {
+            visible = actions.ivars().visible.get();
+            // Neither path activates the application or makes the panel key.
+            if visible {
+                panel.orderFrontRegardless();
+            } else {
+                panel.orderOut(None);
+            }
+        }
         let snapshot = worker.control.snapshot();
         let os_snapshot = os.control.snapshot();
         os_status.setStringValue(&NSString::from_str(os_snapshot.message));
         if snapshot.state == State::Active {
             active_observed = true;
-            if smoke_phase >= 2 {
+            if paused_observed {
                 resumed_observed = true;
             }
         }
@@ -386,12 +578,24 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             voice_handoff.tick(&voice.control, &conversation.control, &speech.control)
         {
             input.setStringValue(&NSString::from_str(&command));
+            if !interaction_revealed {
+                actions.reveal_for_wake();
+            }
+            interaction_revealed = true;
         }
         let voice_snapshot = voice.control.snapshot();
+        if voice_snapshot.state == wakeworker::State::WakeListening {
+            interaction_revealed = false;
+        }
+        if voice_snapshot.state == wakeworker::State::CommandListening && !interaction_revealed {
+            actions.reveal_for_wake();
+            interaction_revealed = true;
+        }
+        menu_button.setToolTip(Some(&NSString::from_str(voice_snapshot.message)));
         record_button.setTitle(&NSString::from_str(if voice.control.enabled() {
-            "Mute microphone"
+            "Mute"
         } else {
-            "Enable wake listening"
+            "Listen"
         }));
         record_button.setToolTip(Some(&NSString::from_str(voice_snapshot.message)));
         record_button.setEnabled(voice_snapshot.state != wakeworker::State::Stopped);
@@ -410,37 +614,107 @@ pub fn run(options: Options) -> Result<(), &'static str> {
                 && !speech.control.busy(),
         );
         stop_speech_button.setEnabled(speech.control.busy());
-        if snapshot.state != State::Blocked {
-            let message = if speech.control.busy() {
-                "Speaking…"
-            } else if speech.control.snapshot().state == speech::State::Failed {
-                "Speech unavailable · your reply is shown above"
-            } else if conversation.control.busy() {
-                "Thinking…"
-            } else {
-                voice_snapshot.message
-            };
-            detail.setStringValue(&NSString::from_str(message));
-            let color = if matches!(
+        let blocked =
+            snapshot.state == State::Blocked || os_snapshot.state == osworker::State::Blocked;
+        let message = if blocked {
+            "Awareness needs attention"
+        } else if speech.control.busy() {
+            "Speaking…"
+        } else if speech.control.snapshot().state == speech::State::Failed {
+            "Couldn't play audio"
+        } else if conversation.control.busy() {
+            "Thinking…"
+        } else {
+            match voice_snapshot.state {
+                wakeworker::State::WakeListening => "Listening for Jarvis",
+                wakeworker::State::CommandListening => "I'm listening…",
+                wakeworker::State::Decoding => "One moment…",
+                wakeworker::State::Loading | wakeworker::State::Starting => "Starting…",
+                wakeworker::State::Muted => "Microphone muted",
+                wakeworker::State::Failed => "Microphone needs attention",
+                wakeworker::State::Stopped => "Microphone off",
+                wakeworker::State::CommandReady => "Request heard",
+                wakeworker::State::Suppressed => "One moment…",
+            }
+        };
+        detail.setStringValue(&NSString::from_str(message));
+        detail.setTextColor(Some(&NSColor::labelColor()));
+        let activity_color = if blocked || voice_snapshot.state == wakeworker::State::Failed {
+            NSColor::systemOrangeColor()
+        } else if voice.control.enabled() {
+            NSColor::systemGreenColor()
+        } else {
+            NSColor::tertiaryLabelColor()
+        };
+        activity.setTextColor(Some(&activity_color));
+        let preview_text = if blocked {
+            "Open Details to check access.".to_owned()
+        } else if chat_snapshot.state == chat::State::Unavailable {
+            "Open Details to finish setup.".to_owned()
+        } else if chat_snapshot.state == chat::State::Failed {
+            "That didn't finish. Open Details to retry.".to_owned()
+        } else if chat_snapshot.state == chat::State::Reply && !chat_snapshot.text.is_empty() {
+            chat_snapshot
+                .text
+                .chars()
+                .take(180)
+                .collect::<String>()
+                .replace('\n', " ")
+        } else {
+            "Here when you need me.".to_owned()
+        };
+        preview.setStringValue(&NSString::from_str(&preview_text));
+        // Only cards opened by wake recognition auto-dismiss. Explicit menu or
+        // Details interaction keeps the card open until the user dismisses it.
+        if visible
+            && actions.ivars().wake_opened.get()
+            && !expanded
+            && !interaction_revealed
+            && !conversation.control.busy()
+            && !speech.control.busy()
+            && matches!(
                 voice_snapshot.state,
-                wakeworker::State::WakeListening | wakeworker::State::CommandListening
-            ) {
-                NSColor::systemGreenColor()
-            } else {
-                NSColor::secondaryLabelColor()
-            };
-            detail.setTextColor(Some(&color));
+                wakeworker::State::WakeListening | wakeworker::State::Decoding
+            )
+        {
+            let idle_since = wake_idle_since.get_or_insert_with(Instant::now);
+            if idle_since.elapsed() >= Duration::from_secs(8) {
+                actions.dismiss_panel(sel!(dismissPanel:), None);
+            }
+        } else {
+            wake_idle_since = None;
         }
         if options.smoke_test {
             if smoke_phase == 0 && active_observed {
-                actions.toggle_pause(sel!(togglePause:), None);
+                actions.reveal_for_wake();
                 smoke_phase = 1;
-            } else if smoke_phase == 1 && paused_observed {
-                actions.toggle_pause(sel!(togglePause:), None);
+            } else if smoke_phase == 1 && panel.isVisible() {
+                wake_revealed = true;
+                actions.toggle_details(sel!(toggleDetails:), None);
                 smoke_phase = 2;
-            } else if smoke_phase == 2 && resumed_observed {
-                actions.quit_panel(sel!(quitPanel:), None);
+            } else if smoke_phase == 2 && expanded_observed {
+                actions.toggle_details(sel!(toggleDetails:), None);
                 smoke_phase = 3;
+            } else if smoke_phase == 3 && collapsed_observed {
+                actions.dismiss_panel(sel!(dismissPanel:), None);
+                smoke_phase = 4;
+            } else if smoke_phase == 4 && !panel.isVisible() {
+                dismissed_hidden = true;
+                workers_alive_after_dismiss =
+                    !worker.control.stop_requested() && !worker.is_finished();
+                voice_unchanged_after_dismiss = voice.control.enabled() == initial_voice_enabled;
+                actions.toggle_panel(sel!(togglePanel:), None);
+                smoke_phase = 5;
+            } else if smoke_phase == 5 && panel.isVisible() {
+                menu_toggle_revealed = true;
+                actions.toggle_pause(sel!(togglePause:), None);
+                smoke_phase = 6;
+            } else if smoke_phase == 6 && paused_observed {
+                actions.toggle_pause(sel!(togglePause:), None);
+                smoke_phase = 7;
+            } else if smoke_phase == 7 && resumed_observed {
+                actions.quit_panel(sel!(quitPanel:), None);
+                smoke_phase = 8;
             }
             if started.elapsed() > Duration::from_secs(8) || had_error {
                 os.control.stop();
@@ -479,6 +753,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
         });
     }
     panel.orderOut(None);
+    status_bar.removeStatusItem(&status_item);
     worker.join()?;
     os.join()?;
     conversation.join()?;
@@ -486,9 +761,22 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     voice.join()?;
     if options.smoke_test {
         println!(
-            "{{\"panel_created\":true,\"active_observed\":{active_observed},\"paused_observed\":{paused_observed},\"resumed_observed\":{resumed_observed},\"microphone_active\":false}}"
+            "{{\"panel_created\":true,\"active_observed\":{active_observed},\"paused_observed\":{paused_observed},\"resumed_observed\":{resumed_observed},\"microphone_active\":false,\"compact_width\":{compact_width},\"compact_height\":{compact_height},\"expanded_observed\":{expanded_observed},\"collapsed_observed\":{collapsed_observed},\"translucent\":{translucent},\"native_glass\":{native_glass},\"nonactivating\":{nonactivating},\"initial_hidden\":{initial_hidden},\"menu_bar_present\":{menu_bar_present},\"wake_revealed\":{wake_revealed},\"dismissed_hidden\":{dismissed_hidden},\"workers_alive_after_dismiss\":{workers_alive_after_dismiss},\"voice_unchanged_after_dismiss\":{voice_unchanged_after_dismiss},\"menu_toggle_revealed\":{menu_toggle_revealed}}}"
         );
-        if had_error || !active_observed || !paused_observed || !resumed_observed {
+        if had_error
+            || !active_observed
+            || !paused_observed
+            || !resumed_observed
+            || !expanded_observed
+            || !collapsed_observed
+            || !initial_hidden
+            || !menu_bar_present
+            || !wake_revealed
+            || !dismissed_hidden
+            || !workers_alive_after_dismiss
+            || !voice_unchanged_after_dismiss
+            || !menu_toggle_revealed
+        {
             return Err("Panel smoke test did not complete its observer lifecycle");
         }
     }

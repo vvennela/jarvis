@@ -10,7 +10,7 @@ Build a companion that stays present while you work: continuous file and browser
 | Browser awareness | Read-only Chrome extension and authenticated Native Messaging session, approved-origin page/tab evidence | Install and verify a real approved page |
 | OS awareness | Native foreground app and permitted focused-window metadata; independent panel collector; shared SQLite evidence | Live Accessibility-title rehearsal and utterance-frozen anchors; app identity captured on this Mac |
 | Conversation | Jev routing and context retrieval overlap; bounded conversational history; Nemotron replies and clarification follow-ups | Rehearse a real multi-turn session using the configured provider |
-| Native panel | Top-right panel, awareness pause/resume, typed conversation, cancellation and speech controls | Rehearse the complete microphone-to-reply path on the user's Mac |
+| Native panel | Menu-bar idle presence, 360×140 wake card, native Liquid Glass with older-macOS blur fallback, expandable conversation and speech controls | Rehearse the complete microphone-to-reply path on the user's Mac |
 | Local voice | Resident Whisper model, bounded microphone capture and transcription; continuous wake worker and automatic spoken-reply integration are the current increment | Validate wake recognition, endpointing, mute/resume and echo suppression together |
 | Speech output | Native speech; optional ElevenLabs Flash synthesis with cancellable owned playback and private temporary audio | Native playback is the default without an ElevenLabs key; live ElevenLabs quality requires a configured key |
 | Review preparation | Context-backed model-generated local message draft, source-version checks, artifact verification, cancellation and readiness invalidation | Add durable jobs and a review surface in the panel |
@@ -21,7 +21,7 @@ The local draft command is a real generation path. A live Nemotron request again
 
 Continuously while enabled: filesystem collection and reconciliation; permitted browser observations; local microphone capture with bounded audio windows and speech-energy checks. The wake worker uses the resident local Whisper model when speech needs recognition. It makes no hosted LM call for idle awareness or wake detection. This is local speech recognition over windows, not a specialized hardware wake-word detector.
 
-On a recognized “Jarvis” request: finish local transcription, overlap Jev with indexed-context retrieval, then call the conversational model. Keep the UI responsive on its own thread. A spoken request receives a spoken answer automatically. Typed input remains available for debugging and recovery, not as the primary voice interaction.
+On a recognized “Jarvis” request: reveal the compact card, finish local transcription, overlap Jev with indexed-context retrieval, then call the conversational model. Keep the UI responsive on its own thread. A spoken request receives a spoken answer automatically. Wake-opened cards hide after eight idle seconds; menu-opened or expanded cards stay open until dismissed. Hiding preserves listening and awareness. Typed input remains available for debugging and recovery, not as the primary voice interaction.
 
 For an explicitly requested local draft: pin selected indexed resources, generate with the model, recheck source versions, save the caller-selected artifact, and verify it. A changed or missing source blocks readiness. Sending, purchasing and deleting remain final human actions; preparing a draft does not grant a commit capability.
 
