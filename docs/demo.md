@@ -1,69 +1,63 @@
-# Demonstrating Jarvis
+# Jarvis: three-minute live demo
 
-Use the generated notes in `examples/demo-workspace` for a repeatable demonstration. The primary experience is always-on “Jarvis,” a visible top-right panel, and spoken replies. The current wake increment needs a real microphone rehearsal; deterministic audio and worker tests do not substitute for that check.
+**Story:** one maintained, versioned work context powers both a conversation and an independent drafting worker. Change a priority once, ask about it, then delegate a handoff without assembling the context again. The result ends with a verified local artifact for human review.
 
-## Start the companion
+This fits the participant guide's **Shared Brain** theme. Show continuous collection, shared evidence, concurrent work and review checks—not just question answering over a document. The implemented system does not yet have a team that autonomously writes back and improves its own shared playbook.
 
-Run from the repository root with `CRUSOE_API_KEY` configured in `.env` or the environment. Jev uses `TYPESAFE_API_KEY` when available. Set the absolute path to the local Whisper weights:
+## Before judges arrive
 
-```sh
-export JARVIS_WHISPER_MODEL_PATH="$PWD/models/ggml-base.en.bin"
-mkdir -p runtime
-cargo run -p jarvis-panel -- --root "$PWD/examples/demo-workspace" --db "$PWD/runtime/demo.sqlite"
-```
+Checkpoint `a240ff6` has 312 passing workspace tests and 14 ignored tests, plus formatting, clippy and native smoke checks. Current blockers are live acceptance of native app/voice actions and Crusoe full tool-call verification: recent protocol probes returned HTTP 429 (`max_requests_limit (orchestrator)`), while a minimal text request returned HTTP 200. Neither result establishes a working full tool round trip.
 
-Use a real downloaded Whisper model at that path. Normal panel startup enables wake listening; grant macOS microphone access when requested. The panel shows loading, wake listening, command listening, decoding, thinking and speaking states. **Mute microphone** stops listening; **Enable wake listening** resumes it. `--smoke-test` exercises the panel without enabling microphone capture.
+Use the actual Jarvis project notes in `docs/` and the existing `runtime/live.sqlite` database. `docs/CURRENT_WORK.md` is a maintained development note, not a complete activity log. Read it and check that its priorities and deadline are still true before presenting. Keep the note's current priority near the beginning so it fits the bounded excerpt.
 
-Native speech is used without an ElevenLabs key. For optional ElevenLabs speech, configure `ELEVENLABS_API_KEY` and optionally `ELEVENLABS_VOICE_ID`; synthesis uses `eleven_flash_v2_5`. The current adapter downloads a bounded MP3 before playing it. Audio playback can be interrupted with **Stop speaking**.
+1. Confirm `.env` using `cargo run -- doctor`. It reports configuration presence, not successful provider access. Do not display `.env` or keys. The configured Crusoe model is `nvidia/Nemotron-3.5-Lightning-30B-A3B`; Jev is optional for routing.
+2. Confirm the local Whisper, keyword and speech-activity model paths are configured. See [setup](setup.md). Select the intended microphone under macOS Sound → Input; connecting AirPods as output alone does not select their microphone. Check the input name and signal counters in the Jarvis menu-bar tooltip.
+3. With the existing app, verify that the watched root is `docs/` and the database is `runtime/live.sqlite`. If starting a fresh session, run this from the repository root:
 
-## Show awareness and conversation
+   ```sh
+   ./scripts/launch-jarvis.command --root "$PWD/docs" --db "$PWD/runtime/live.sqlite"
+   ```
 
-1. Leave the generated project note in the watched folder before asking anything.
-2. Say “Jarvis, where was I?” The answer should identify Project Beacon and the unfinished handoff from the indexed note.
-3. After the answer, say “Jarvis, what should I do next?” to exercise conversational history. If Jarvis asks a clarification, use the wake phrase again before your answer.
-4. Edit the note's preferred review time, wait for awareness to ingest the change, then ask what the current review time is.
-5. Pause awareness, edit the note, and resume. Ask again to demonstrate reconciliation.
-6. Mute and resume the microphone to show that the visible state corresponds to actual capture control.
+   Do not launch a second copy beside an already-running demo instance. Allow model loading and any microphone permission prompt to finish before timing the presentation.
+4. First rehearse an approved exact app command such as **“Jarvis, open Calculator”** and verify the actual app opens. This path bypasses hosted inference. Then rehearse one real spoken question, one short reply and a draft. Use the configured voice if it works; native macOS speech is the fallback when ElevenLabs is not configured. Speak again after Jarvis finishes—voice barge-in is not implemented.
+5. Keep the note editor and an empty area for the review artifact visible. Have the menu-bar icon available for typed recovery. Do not pre-open a generated result and present it as new output.
 
-Wake recognition accepts standalone “Jarvis” (or “Hey Jarvis”), either with the request in one utterance or followed by the request. After the wake word alone, there is a ten-second silent wait for the command; commands are capped at 15 seconds. Listening preferences do not persist across launches. It uses bounded local Whisper windows and speech-energy endpointing. Capture pauses while conversation or playback is busy to avoid self-triggering; spoken interruption during the answer is not part of this increment. Use the explicit speech-stop control. Speaker identity is not enforced yet.
+## The live three minutes
 
-The panel also accepts typed questions and offers **Read aloud**. The same context is available through the CLI:
+| Time | Action and narration | Evidence the judge sees |
+|---|---|---|
+| 0:00–0:20 | “Jarvis keeps a small, versioned picture of my work. The conversation and its background worker use the same context.” Show the actual current-work note and idle menu-bar presence. | An explicit watched project, an actual note and an unobtrusive companion. |
+| 0:20–0:45 | Say: **“Jarvis, what should I work on next?”** | The card appears, native spinner shows processing, and the answer identifies a documented unfinished priority. |
+| 0:45–1:15 | Make a truthful edit near the top of the note: **“For this judging rehearsal, my next step is to prepare Brian's handoff before reviewing the demo.”** Save. Say: **“Jarvis, what's my next step for this rehearsal now?”** | A fresh answer reflects the saved change without pasting the note into chat. If needed, `cargo run -- search --db runtime/live.sqlite rehearsal` confirms the indexed resource/version. |
+| 1:15–1:55 | Say: **“Jarvis, draft a short handoff for Brian about the current priorities and unfinished work.”** While the draft runs, ask a short conversational follow-up such as **“Jarvis, remind me of the deadline.”** | Background progress appears while conversation remains independently available. The draft is generated by the configured model from shared evidence. The worker does not open a viewer on completion. |
+| 1:55–2:30 | When the card says the draft is ready, click **Open draft**. | The worker rechecks indexed source versions and artifact integrity, then opens the exact local file. Its header says **LOCAL DRAFT FOR REVIEW — NOT SENT**. Briefly inspect whether the handoff reflects the changed priority. |
+| 2:30–3:00 | “Done here means a verified draft ready for me to review. It has not sent anything. A changed source or artifact revokes that readiness.” Explain that the same index served both requests. | A concrete result and a clearly defined stopping point. Explain deterministic invalidation tests; do not claim a live failure test you did not perform. |
 
-```sh
-cargo run -- index --db runtime/demo.sqlite --root examples/demo-workspace
-cargo run -- search --db runtime/demo.sqlite Beacon
-cargo run -- ask --db runtime/demo.sqlite --question "Where was I?"
-```
+Keep utterances short. The native panel dispatches explicit caller requests such as “draft…” and “write a handoff…” to the worker. The model can also propose a typed, policy-checked draft delegation; ordinary model prose cannot execute tools. Present that model-proposed route as fixture-tested until the live hosted protocol succeeds. “Brian” is a draft recipient label, not a resolved email address. **Open draft** verifies and opens a file; it is not a Send button.
 
-## Prepare a real local draft
+## Recovery without hiding failures
 
-This step currently uses the CLI, separately from the panel conversation:
+| Symptom | Recovery |
+|---|---|
+| Wake is missed | After one repeat or about ten seconds, click the menu-bar icon, expand Details and type the same request. Say that voice capture is still being tuned; continue showing live shared context and generation. Do not call the typed path successful wake recognition. |
+| Answer still uses the old priority | Check the saved note and its indexed version. Wait for ingestion or use `cargo run -- index --db runtime/live.sqlite --root "$PWD/docs"`, then ask again. Describe manual reconciliation if you used it. |
+| Provider rate limit or timeout | Show the specific error and respect its cooldown. Do not keep submitting duplicates or ask for new API keys solely because of a rate limit. Exact approved app commands remain available without inference. Use those for a clearly labeled live action, then explain the tested shared-state/review contracts; do not present an old draft as new. |
+| Draft becomes blocked | Show the reason. If a source changed, regenerate using current context. If the artifact changed, leave it blocked. Do not relabel an older artifact as newly verified. |
+| Speech is delayed or fails | Read the live response in Details. Optional ElevenLabs audio is buffered before playback; do not claim streaming audio or interruptible voice conversation. |
 
-```sh
-cargo run -- draft --db runtime/demo.sqlite \
-  --request "Draft a short update to Brian about Project Beacon using these notes." \
-  --output "$PWD/runtime/brian-review.txt" \
-  --source "file:$PWD/examples/demo-workspace/project.md"
-```
+## What is live, measured, and fixture-based
 
-Use a fresh output filename on each run. Resource IDs use canonical paths; copy the exact ID printed by `search` if `$PWD` capitalization differs from the physical path on macOS.
+- **Previously exercised live:** project-context replies, Jev classification, production background draft generation and artifact-tamper rejection. The full edited-note → voice → draft → explicit viewer walkthrough still needs rehearsal on the current build.
+- **Measured engine check:** a production `TaskWorker::start` run using the live project index reached ready for review in **8.064 seconds**, producing a **4,521-byte** unsent artifact containing the current priority. An intentional artifact change then blocked explicit review before any viewer opened. This is one engine measurement, not a voice latency percentile or a live judging rehearsal.
+- **Deterministic tests:** real loopback function-call/result continuation, approved app process adapters, original-request authorization, model delegation to TaskWorker, source changes during inference, cancellation, retry limits, artifact tampering, and conversation continuing beside a draft. Tests support the contracts; label them as tests when describing them.
+- **Optional fictional data:** `examples/demo-workspace` contains explicitly generated Project Beacon notes. It can replace the real-project root for a repeatable rehearsal, but announce that the data is fictional and that inference/indexing/review are executing live. `jarvis demo` is a scripted policy fixture, not the live draft path.
+- **Acceptance still pending:** actual native app actions, full live Crusoe tool calls, current quiet-audio/preroll human wake reliability, the current input route and installed browser-page ingestion. AirPods input/output were previously verified at 24 kHz mono; that is historical hardware evidence, not a current-session device assertion. An earlier first-try wake does not validate every later build.
+- **Future scope:** browser actions, a general coding worker, durable job restart recovery and full-duplex voice interruption. Sending email or final booking/payment is outside the automatic capabilities; those stop for human review.
 
-A live Nemotron run using the generated Beacon notes produced the verified artifact `runtime/brian-live-review-1834.txt`. This is a local demonstration artifact, not a message sent to a real recipient.
+## Submission and contribution summary
 
-Jarvis generates a local draft using the selected context, pins its versions, rechecks them after generation, and verifies the saved file before announcing `READY_FOR_REVIEW`. Open that exact path to inspect the result. It has not sent a message or resolved Brian's email address. Ctrl-C cancels a running generation.
+The supplied participant guide specifies a **one-minute submission video** and approximately **three minutes for live judging**. For the video, keep the same four beats: current priority, visible edit and changed answer, delegated draft, explicit review. Label cuts and generated fixture data; retain actual results rather than substituting scripted output.
 
-For a failure demonstration, change the indexed source while generation runs. If the watcher ingests the change before the final source check, the task should block instead of producing an apparently current artifact. Integration tests exercise this timing deterministically. Later source changes and artifact tampering revoke readiness when the task's review method is called; current CLI job state does not survive process exit.
+The guide requires a public repository and clear identification of work created during the event. Use the repository history to show the Rust context broker, collectors, native voice panel, independent draft worker and review checks that were implemented. Credit reused components—Whisper, sherpa-onnx/Silero, Jev, Nemotron/Crusoe and optional ElevenLabs. Commit times are useful supporting evidence, not proof of when every contribution began. Verify repository visibility and the demo video's accessibility before submitting.
 
-## What the current demo proves
-
-The honest story is awareness → spoken question → contextual reply → clarification → verified local draft. It demonstrates maintained context and a responsive native companion. “Implement that,” autonomous coding/test repair, Gmail draft placement, browser bookings, durable background jobs and voice-triggered tool execution are subsequent milestones. Do not stage those as live behavior with scripted fixture output.
-
-The read-only browser bridge can add approved page context after extension installation and host registration. Verify ingestion into the same database before including browser evidence in a demo. The native panel also collects foreground app identity and permitted focused-window metadata into that database. Its status distinguishes missing Accessibility permission from collection errors. It currently stores the current foreground observation; full window inventory and utterance-frozen anchors remain separate work.
-
-## Deterministic local speech check
-
-```sh
-cargo run -p jarvis-voice -- --model models/ggml-base.en.bin --wav /path/to/16khz-mono.wav
-```
-
-The WAV path accepts bounded 16 kHz mono, 16-bit PCM audio. The reusable transcriber retains its model across calls; the CLI is a one-shot check. Run integration tests and a real microphone rehearsal before recording latency claims. Avoid claiming speaker recognition, production wake reliability or full-duplex barge-in from a successful fixture transcription.
+Round-one judging weights technicality at 40%, live demo at 20%, originality at 25% and future potential at 15%. Spend the time showing the version change and verified artifact; use questions afterward to explain bounds, provenance and cancellation. The provided guide lists an RTX 5090 for **Best Use of Nemotron**; using the model does not guarantee that award.
