@@ -90,6 +90,43 @@ pub struct ContextStore {
     connection: Connection,
     limits: Limits,
 }
+/// Reserve the SQLite writer before reading a snapshot. Nested write APIs share
+/// the outer reservation; their savepoints still provide per-operation rollback.
+/// Dropping this scope on any error (including commit failure) rolls back the
+/// entire outer write, so effects are never replayed by a retry loop.
+struct WriteScope<'a> {
+    store: &'a mut ContextStore,
+    owns_transaction: bool,
+    committed: bool,
+}
+impl<'a> WriteScope<'a> {
+    fn begin(store: &'a mut ContextStore) -> Result<Self, ContextError> {
+        let owns_transaction = store.connection.is_autocommit();
+        if owns_transaction {
+            store.connection.execute_batch("BEGIN IMMEDIATE")?;
+        }
+        Ok(Self {
+            store,
+            owns_transaction,
+            committed: false,
+        })
+    }
+    fn commit(mut self) -> Result<(), ContextError> {
+        if self.owns_transaction {
+            self.store.connection.execute_batch("COMMIT")?;
+        }
+        self.committed = true;
+        Ok(())
+    }
+}
+impl Drop for WriteScope<'_> {
+    fn drop(&mut self) {
+        if self.owns_transaction && !self.committed {
+            let _ = self.store.connection.execute_batch("ROLLBACK");
+        }
+    }
+}
+
 impl ContextStore {
     pub fn open(path: &Path, limits: Limits) -> Result<Self, ContextError> {
         if limits.max_resources == 0
@@ -111,6 +148,16 @@ impl ContextStore {
             CREATE TABLE IF NOT EXISTS expected_actions(action_id TEXT PRIMARY KEY,job_id TEXT NOT NULL,resource_id TEXT NOT NULL,digest BLOB NOT NULL,start_ms INTEGER NOT NULL,deadline_ms INTEGER NOT NULL);")?;
         Ok(Self { connection, limits })
     }
+    fn with_write<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> Result<T, ContextError>,
+    ) -> Result<T, ContextError> {
+        let scope = WriteScope::begin(self)?;
+        let result = operation(scope.store)?;
+        scope.commit()?;
+        Ok(result)
+    }
+
     fn check_text(id: &str, content: &str, observed_at_ms: i64) -> Result<(), ContextError> {
         if id.is_empty()
             || id.len() > 2048
@@ -124,6 +171,27 @@ impl ContextStore {
     /// Only trusted runner code registers exact expected effects. A web page must
     /// never call this API. Matching is deliberately conservative and one-use.
     pub fn expect_action(
+        &mut self,
+        action_id: &str,
+        job_id: &str,
+        resource_id: &str,
+        content: &str,
+        start_ms: i64,
+        deadline_ms: i64,
+    ) -> Result<(), ContextError> {
+        Self::check_text(resource_id, content, start_ms)?;
+        self.with_write(|store| {
+            store.expect_action_inner(
+                action_id,
+                job_id,
+                resource_id,
+                content,
+                start_ms,
+                deadline_ms,
+            )
+        })
+    }
+    fn expect_action_inner(
         &mut self,
         action_id: &str,
         job_id: &str,
@@ -167,6 +235,16 @@ impl ContextStore {
     /// observed_at_ms is assigned by the trusted collector, not by a page/model.
     /// Content from both sources stays untrusted evidence, never authorization.
     pub fn observe(
+        &mut self,
+        id: &str,
+        content: &str,
+        source: Source,
+        observed_at_ms: i64,
+    ) -> Result<ObservationResult, ContextError> {
+        Self::check_text(id, content, observed_at_ms)?;
+        self.with_write(|store| store.observe_inner(id, content, source, observed_at_ms))
+    }
+    fn observe_inner(
         &mut self,
         id: &str,
         content: &str,
@@ -236,6 +314,15 @@ impl ContextStore {
         if observations.is_empty() || observations.len() > 8 {
             return Err(ContextError::InvalidInput);
         }
+        self.with_write(|store| store.observe_many_inner(observations))
+    }
+    fn observe_many_inner(
+        &mut self,
+        observations: &[(&str, &str, Source, i64)],
+    ) -> Result<Vec<ObservationResult>, ContextError> {
+        if observations.is_empty() || observations.len() > 8 {
+            return Err(ContextError::InvalidInput);
+        }
         self.connection
             .execute_batch("SAVEPOINT observation_batch")?;
         let result: Result<Vec<_>, _> = observations
@@ -253,6 +340,14 @@ impl ContextStore {
 
     /// Tombstones retain the version sequence without retaining deleted content.
     pub fn forget(
+        &mut self,
+        id: &str,
+        observed_at_ms: i64,
+    ) -> Result<Option<ObservationResult>, ContextError> {
+        Self::check_text(id, "", observed_at_ms)?;
+        self.with_write(|store| store.forget_inner(id, observed_at_ms))
+    }
+    fn forget_inner(
         &mut self,
         id: &str,
         observed_at_ms: i64,

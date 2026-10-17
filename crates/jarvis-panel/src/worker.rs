@@ -1,6 +1,6 @@
 use jarvis::{
-    awareness::watch_root_controlled,
-    context::{ContextStore, Limits},
+    awareness::{AwarenessError, watch_root_controlled},
+    context::{ContextError, ContextStore, Limits},
 };
 use std::{
     path::PathBuf,
@@ -92,6 +92,44 @@ impl Control {
     }
 }
 
+/// Static diagnostics: never include database messages, paths, SQL, or content.
+pub fn awareness_error_message(error: &AwarenessError) -> &'static str {
+    match error {
+        AwarenessError::InvalidRoot => "File root unavailable; check folder access",
+        AwarenessError::InvalidDuration => "File observer duration is invalid",
+        AwarenessError::RootChanged => "File root identity changed; restart awareness",
+        AwarenessError::WatchUnavailable => "File events unavailable; check folder access",
+        AwarenessError::Context(error) => context_error_message(error),
+    }
+}
+fn context_error_message(error: &ContextError) -> &'static str {
+    match error {
+        ContextError::InvalidInput => "File context rejected an invalid observation",
+        ContextError::Capacity => "File context reached its resource limit",
+        ContextError::Database(error) => {
+            // Error-code names contain only SQLite's fixed enum, never SQL or data.
+            match error
+                .sqlite_error_code()
+                .map(|code| format!("{code:?}"))
+                .as_deref()
+            {
+                Some("DatabaseBusy" | "DatabaseLocked") => {
+                    "File context database busy with another writer"
+                }
+                Some("ReadOnly" | "PermissionDenied" | "CannotOpen") => {
+                    "File context database access denied"
+                }
+                Some("DiskFull") => "File context storage is full",
+                Some("DatabaseCorrupt" | "NotADatabase") => {
+                    "File context database format is invalid"
+                }
+                Some("SystemIoFailure") => "File context database I/O failed",
+                _ => "File context database update failed",
+            }
+        }
+    }
+}
+
 pub struct Worker {
     pub control: Arc<Control>,
     handle: Option<JoinHandle<()>>,
@@ -125,8 +163,8 @@ impl Worker {
             .spawn(move || {
                 let mut store = match opened_store {
                     Ok(store) => store,
-                    Err(_) => {
-                        worker_control.state(State::Blocked, "Cannot open context database");
+                    Err(error) => {
+                        worker_control.state(State::Blocked, context_error_message(&error));
                         return;
                     }
                 };
@@ -174,11 +212,8 @@ impl Worker {
                                 .reconciliations
                                 .saturating_add(report.reconciliations);
                         }
-                        Err(_) => {
-                            worker_control.state(
-                                State::Blocked,
-                                "File observer stopped; check root and database",
-                            );
+                        Err(error) => {
+                            worker_control.state(State::Blocked, awareness_error_message(&error));
                             return;
                         }
                     }
