@@ -66,6 +66,7 @@ pub struct ToolRuntime {
     actions: Option<ActionExecutor>,
     drafts: Option<Arc<dyn DraftSubmitter>>,
     music: Option<(MusicCatalog, SpotifyPlayback)>,
+    tracks: Option<crate::spotify_tracks::SpotifyTracks>,
     file_edits: Option<Arc<dyn FileEditSubmitter>>,
     coding: Option<Arc<dyn CodingSubmitter>>,
     web_search: Option<WebSearch>,
@@ -90,6 +91,7 @@ impl ToolRuntime {
             actions: None,
             drafts: None,
             music: None,
+            tracks: None,
             file_edits: None,
             coding: None,
             web_search: None,
@@ -112,6 +114,10 @@ impl ToolRuntime {
     }
     pub fn with_music(mut self, catalog: MusicCatalog, playback: SpotifyPlayback) -> Self {
         self.music = Some((catalog, playback));
+        self
+    }
+    pub fn with_tracks(mut self, tracks: crate::spotify_tracks::SpotifyTracks) -> Self {
+        self.tracks = Some(tracks);
         self
     }
     pub fn with_file_edits(mut self, worker: Arc<dyn FileEditSubmitter>) -> Self {
@@ -166,6 +172,9 @@ impl ToolRuntime {
                 &["resource_id"],
             ),
         ];
+        if self.tracks.is_some() {
+            tools.push(spec("spotify_play_track", "Play one explicitly named song by its explicitly named artist. Preserve both names from the user's request. Spotify metadata and actual track playback are verified; never substitute another artist or recording.", json!({"title":{"type":"string","minLength":1,"maxLength":128},"artist":{"type":"string","minLength":1,"maxLength":128}}), &["title","artist"]));
+        }
         if let Some(apps) = &self.apps {
             let available = apps.available_apps();
             if !available.is_empty() {
@@ -229,6 +238,16 @@ impl ToolRuntime {
             };
             return Some(self.execute(user_request, &proposal).await);
         }
+        if self.tracks.is_some()
+            && let Some(track) = crate::spotify_tracks::track_confirmation(user_request)
+        {
+            let mut result = acknowledgment(&format!(
+                "Did you mean {} by {}?",
+                track.title, track.artist
+            ));
+            result.needs_followup = true;
+            return Some(result);
+        }
         let proposal = if self.web_opener.is_some()
             && let Some(topic) = crate::request_intent::wikipedia_page_intent(user_request)
         {
@@ -241,6 +260,12 @@ impl ToolRuntime {
                 id: "trusted-page-intent".into(),
                 name: "open_webpage".into(),
                 arguments: json!({"site":"wikipedia", "topic":topic}),
+            }
+        } else if let Some(track) = crate::spotify_tracks::requested_track(user_request) {
+            ToolCall {
+                id: "trusted-track-intent".into(),
+                name: "spotify_play_track".into(),
+                arguments: json!({"title":track.title,"artist":track.artist}),
             }
         } else if self.music.is_some()
             && let Some(artist) = crate::spotify_playback::requested_artist(user_request)
@@ -485,7 +510,30 @@ impl ToolRuntime {
                     Err(err) => acknowledgment(&crate::actions::friendly_error(user_request, &err)),
                 }
             }
+            "spotify_play_track" => {
+                let Ok(args) = serde_json::from_value::<TrackArgs>(call.arguments.clone()) else {
+                    return acknowledgment("Tell me the song title and artist you'd like to hear.");
+                };
+                let Some(tracks) = &self.tracks else {
+                    return acknowledgment("Song lookup isn't connected yet.");
+                };
+                match tracks.play(user_request, &args.title, &args.artist).await {
+                    Ok(text) => acknowledgment(&text),
+                    Err(crate::spotify_tracks::TrackError::NotFound) => acknowledgment(&format!(
+                        "I couldn't verify {} by {} on Spotify. I haven't played a different recording.",
+                        args.title, args.artist
+                    )),
+                    Err(error) => acknowledgment(&error.to_string()),
+                }
+            }
             "spotify_play_artist" => {
+                if crate::spotify_tracks::requested_track(user_request).is_some()
+                    || crate::spotify_tracks::track_confirmation(user_request).is_some()
+                {
+                    return acknowledgment(
+                        "That request names a particular song. Use its title and artist together.",
+                    );
+                }
                 let Ok(args) = serde_json::from_value::<ArtistArgs>(call.arguments.clone()) else {
                     return acknowledgment("Which artist should I put on?");
                 };
@@ -838,6 +886,12 @@ struct SpotifyArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ArtistArgs {
+    artist: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrackArgs {
+    title: String,
     artist: String,
 }
 #[cfg(unix)]

@@ -238,14 +238,49 @@ pub fn wikipedia_page_intent(request: &str) -> Option<String> {
         body = rest;
     }
     let rest = body.strip_prefix("open ")?;
-    if let Some(topic) = rest.strip_suffix(" on wikipedia") {
-        return (!topic.is_empty()).then(|| topic.to_owned());
-    }
     let rest = rest
         .strip_prefix("the ")
         .or_else(|| rest.strip_prefix("a "))
         .unwrap_or(rest);
+    // The topic may precede the provider and noun in ordinary speech:
+    // "open the Ada Lovelace Wikipedia page". Preserve the whole supplied
+    // topic; this parser does not invent a narrower article or resolve aliases.
+    for suffix in [" wikipedia page", " wikipedia article"] {
+        if let Some(topic) = rest.strip_suffix(suffix) {
+            let topic = topic
+                .strip_suffix("'s")
+                .or_else(|| topic.strip_suffix("’s"))
+                .unwrap_or(topic);
+            return (!topic.is_empty()).then(|| topic.to_owned());
+        }
+    }
+    if let Some(topic) = rest.strip_suffix(" on wikipedia") {
+        if matches!(topic, "page" | "article") {
+            return Some(String::new());
+        }
+        let topic = topic
+            .strip_suffix(" page")
+            .or_else(|| topic.strip_suffix(" article"))
+            .unwrap_or(topic);
+        return (!topic.is_empty()).then(|| topic.to_owned());
+    }
+    for prefix in ["page on wikipedia", "article on wikipedia"] {
+        if rest == prefix {
+            return Some(String::new());
+        }
+        if let Some(tail) = rest.strip_prefix(prefix) {
+            for link in [" for ", " about ", " on "] {
+                if let Some(topic) = tail.strip_prefix(link) {
+                    return (!topic.is_empty()).then(|| topic.to_owned());
+                }
+            }
+        }
+    }
     for noun in [
+        "wikipedia's page",
+        "wikipedia's article",
+        "wikipedia’s page",
+        "wikipedia’s article",
         "wikipedia page",
         "wikipedia article",
         "wikipedia",
@@ -330,6 +365,17 @@ pub fn resolve_action_followup(original: &str, answer: &str) -> Option<String> {
         .to_ascii_lowercase();
     if restrictive(&lower) {
         return None;
+    }
+    if let Some(track) = crate::spotify_tracks::track_confirmation(original) {
+        let answer = answer
+            .trim()
+            .trim_end_matches(['.', '!', '?'])
+            .to_lowercase();
+        return matches!(
+            answer.as_str(),
+            "yes" | "yes please" | "correct" | "that's right"
+        )
+        .then(|| format!("play {} by {} on Spotify", track.title, track.artist));
     }
     let body = imperative(&lower);
     let answer = plain_name(answer)?;

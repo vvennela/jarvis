@@ -21,6 +21,7 @@ pub mod music_catalog;
 pub mod providers;
 pub mod request_intent;
 pub mod spotify_playback;
+pub mod spotify_tracks;
 pub mod task_journal;
 pub mod tool_runtime;
 pub mod web_open;

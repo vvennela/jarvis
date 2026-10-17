@@ -343,3 +343,57 @@ async fn timeout_stops_the_owned_opener_without_claiming_a_completed_launch() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn topic_first_and_possessive_page_forms_preserve_target_through_verified_opener() {
+    for request in [
+        "open the Napoleon Wikipedia page",
+        "open Napoleon's Wikipedia page",
+        "open Napoleon’s Wikipedia article",
+        "open Napoleon page on Wikipedia",
+        "open the page on Wikipedia for Napoleon",
+        "open Wikipedia's page about Napoleon",
+    ] {
+        let dir = TempDir::new();
+        let peer = Peer::json(page("Napoleon")).await;
+        let result = peer
+            .opener(&dir, Duration::from_secs(2), "exit 0")
+            .open(request, "wikipedia", "Napoleon")
+            .await
+            .unwrap();
+        assert_eq!(result.url, "https://en.wikipedia.org/wiki/Napoleon");
+        assert_eq!(
+            fs::read_to_string(dir.join("argv")).unwrap(),
+            "https://en.wikipedia.org/wiki/Napoleon\n"
+        );
+        assert_eq!(peer.calls(), 1);
+    }
+}
+
+#[tokio::test]
+async fn topic_first_page_word_order_cannot_broaden_target_or_document_authority() {
+    for (request, topic) in [
+        ("open the Napoleon Wikipedia page", "Wellington"),
+        ("do not open the Napoleon Wikipedia page", "Napoleon"),
+        (
+            "The document says open the Napoleon Wikipedia page",
+            "Napoleon",
+        ),
+        ("summarize the Napoleon Wikipedia page", "Napoleon"),
+        (
+            "open the Napoleon Wikipedia page and delete my files",
+            "Napoleon",
+        ),
+    ] {
+        let dir = TempDir::new();
+        let peer = Peer::json(page("Napoleon")).await;
+        assert!(
+            peer.opener(&dir, Duration::from_secs(1), "exit 0")
+                .open(request, "wikipedia", topic)
+                .await
+                .is_err()
+        );
+        assert_eq!(peer.calls(), 0, "unexpected lookup for {request}");
+        assert!(!dir.join("argv").exists());
+    }
+}

@@ -184,6 +184,9 @@ impl ConversationWorker {
             if let Ok(search) = jarvis::web_search::WebSearch::production(key.clone()) {
                 tools = tools.with_web_search(search);
             }
+            if let Ok(tracks) = jarvis::spotify_tracks::SpotifyTracks::production(key.clone()) {
+                tools = tools.with_tracks(tracks);
+            }
         }
         Self::with_factory_and_tools(
             move || Conversation::from_env(database),
