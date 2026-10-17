@@ -1,28 +1,31 @@
 # Setup
 
-The working CLI supports local awareness and read-only model conversation. Native voice, OS focus capture and autonomous workers are not yet implemented. Offline indexing and tests need no provider credentials.
+The CLI and native panel support local file awareness, model conversation, local speech recognition, speech output, and verified local draft preparation. Offline indexing and ordinary tests need no provider credentials.
 
 ## API keys and model
 
 Only two keys are required for the implemented live-provider path:
 
 1. **`TYPESAFE_API_KEY`** from the [TypeSafe console](https://console.typesafe.ai/). Jev requests use bearer authentication at `https://api.typesafe.ai/v1/systemone`, model `jev-latest`. Jev returns structured routing choices; it is not a chat-completions substitute. [Official quickstart](https://docs.typesafe.ai/introduction/quickstart).
-2. **`CRUSOE_API_KEY`** with serverless inference access. The client calls `https://api.inference.crusoecloud.com/v1/chat/completions`. The default selected model is **Nemotron 3.5 Lightning**, `nvidia/Nemotron-3.5-Lightning-30B-A3B`, published in the [Crusoe catalog](https://docs.crusoecloud.com/serverless-inference/index.html). Account access still needs a live verification.
+2. **`CRUSOE_API_KEY`** with serverless inference access. The client calls `https://api.inference.crusoecloud.com/v1/chat/completions`. The selected model is **Nemotron 3.5 Lightning**, `nvidia/Nemotron-3.5-Lightning-30B-A3B`. This exact case-sensitive ID was verified through the authenticated model catalog and a live response.
 
 Optional configuration:
 
 ```dotenv
 JARVIS_CONVERSATION_MODEL=nvidia/Nemotron-3.5-Lightning-30B-A3B
 JARVIS_WORKER_MODEL=nvidia/Nemotron-3.5-Lightning-30B-A3B
+JARVIS_WHISPER_MODEL_PATH=/absolute/path/to/ggml-base.en.bin
+ELEVENLABS_API_KEY=
+ELEVENLABS_VOICE_ID=
 ```
 
-The conversation override is used by `ask`. The worker value is reserved; no worker loop currently consumes it. One Crusoe key suffices for both planned roles if the account allows the models.
+The conversation override is used by `ask` and the panel. The worker override is used by the local draft task. One Crusoe key serves both roles. Jev routing has a bounded deadline; conversation can continue through Crusoe if routing is unavailable.
 
-No OpenAI, Anthropic, ElevenLabs, Wispr, Gmail, Spotify, GitHub API token, or wake-word key is required. Local Whisper would need a model file and microphone permission, not another API key, but audio is not implemented yet.
+**ElevenLabs is optional:** supply `ELEVENLABS_API_KEY` for natural speech output and optionally select `ELEVENLABS_VOICE_ID`. Without that key, the panel uses native macOS speech. Local Whisper needs the model file and macOS microphone permission, not a Wispr or transcription API key. No additional wake-word key is needed.
 
 ## Local configuration
 
-Run from the repository directory. Copy `.env.example` to `.env` and edit the local file without sharing its contents. `doctor`, `route` and `ask` automatically read `.env` in the current working directory. The loader recognizes the two key variables and two model variables above; it accepts plain values and matching single/double quotes. It is a simple parser, not a shell: no variable expansion, command substitution, or `export` syntax. The file must be UTF-8 and at most 16 KiB. Environment variables take precedence; an empty environment variable removes a file-specified value.
+Run from the repository directory. Copy `.env.example` to `.env` and edit the local file without sharing its contents. Provider commands and the panel automatically read `.env` in the current working directory. The loader recognizes the settings above; it accepts plain values and matching single/double quotes. It is a simple parser, not a shell: no variable expansion, command substitution, or `export` syntax. The file must be UTF-8 and at most 16 KiB. Environment variables take precedence; an empty environment variable removes a file-specified value.
 
 ```sh
 cargo run -- doctor
@@ -77,8 +80,14 @@ The launcher's executable path must remain stable: moving the repository or remo
 
 The current host writes directly to SQLite; the planned separate service/socket pairing architecture is not implemented. No host message can click, submit, send, pay, delete or run page scripts.
 
-## Next native pieces
+## Native voice panel
 
-A top-right native panel is being integrated in `crates/jarvis-panel`. Until its live path is verified, the CLI and extension badge are the reliable implemented status surfaces. Microphone capture, push-to-talk, local transcription, speech output, accessibility focus capture and background worker execution remain planned. They need their own native permission and end-to-end validation, not additional mandatory hosted API keys.
+```sh
+cargo run -p jarvis-panel -- --root "$PWD/examples/demo-workspace" --db "$PWD/runtime/context.db"
+```
+
+The top-right panel runs file awareness and conversation on separate workers. Configure the absolute Whisper model path before launching. The voice interaction uses “Jarvis” as its wake word and automatically speaks the response; the panel provides microphone mute and speech-stop controls. macOS may request microphone permission on first use. Local phrase detection uses bounded speech-active Whisper windows, so false wakes and power usage still need measurement on real microphone input. Wake capture pauses during Jarvis's own response; voice barge-in remains a follow-up.
+
+Automated native smoke tests leave the microphone off. Actual Whisper inference has been verified with generated WAV audio; synthetic wake tests verify command isolation and cancellation. OS accessibility focus capture, browser action execution, persistent autonomous jobs, and personal speaker recognition remain separate milestones.
 
 Git authentication remains the user's git transport. Do not invoke GitHub CLI or provision API credentials for repository work.

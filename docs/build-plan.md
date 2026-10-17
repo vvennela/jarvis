@@ -1,39 +1,56 @@
-# Today's build plan
+# Jarvis build plan
 
-The goal is one honest end-to-end demonstration: Jarvis observes a work session before being asked, reconstructs it, delegates a small task, accepts a correction, verifies the result, and leaves a sensitive follow-up ready for human review. Six hours and fifteen minutes is a constrained core-demo budget, not a promise of general desktop autonomy.
+Build a companion that stays present while you work: continuous file and browser awareness, local “Jarvis” recognition, a responsive conversation, and delegated work that ends with an exact artifact ready for review. Always-on wake listening is the primary voice interaction. Personal speaker identification comes later.
 
-## Implementation order
+## Current milestone
 
-| Time budget | Build | Acceptance / go-no-go |
+| Component | Current implementation | Next verification or extension |
 |---|---|---|
-| 0:00–0:45 | Typed request, resource, evidence, action and job records; policy gate; runner state; headless review fixture | CLI fixture produces verified review artifact, never final send/pay/delete. Adversarial tests reject forbidden proposals and stale review state. If this fails, do not wire external actions. |
-| 0:45–1:35 | SQLite resources/events/FTS5, one filesystem watcher, normalized text hashes and provenance | A real temporary-file edit changes one resource version; unchanged content does not. Replay and agent echoes do not fabricate user activity. Scope live collection to text/Markdown. |
-| 1:35–2:25 | Chrome MV3 Native Messaging bridge, focused tab anchor, permitted page text | Observe before command, survive navigation and disconnect, reject wrong extension/session. If bridge slips, use file awareness and label browser context unavailable; never fake capture. |
-| 2:25–3:10 | Jev routing + parallel broker retrieval; Crusoe conversational adapter; job-bound clarification | Real provider smoke test succeeds with available model IDs. Missing/invalid keys yield explicit setup state. Final transcript invalidates wrong speculation. Typed input remains a fallback. |
-| 3:10–4:10 | One background worker; dependency invalidation; narrow test tool; local message-draft review | Worker handles a changed requirement without overwriting user edits. Test failures trigger bounded repair. Verified draft reflects latest requirement and remains unsent. If safe shell confinement is not ready, use an explicitly bounded fixture worker and label it. |
-| 4:10–5:00 | Native top-right panel, push-to-talk, local Whisper, native speech, barge-in | Panel reports actual state without focus theft. Speech interruption stops playback. If local speech latency is poor, preserve typed commands and show real state; do not burn remaining time on wake words. |
-| 5:00–6:15 | Adversarial e2e runs, failure injection, latency traces, rehearsal and documentation | Entire story passes from fresh state; no unreviewed external action. Record known limits and real measurements. Freeze features; fix failures. |
+| File awareness | Explicit-root text/Markdown collection, bounded notifications and reconciliation, hashes, SQLite history and FTS search | Exercise changes while the panel stays open |
+| Browser awareness | Read-only Chrome extension and authenticated Native Messaging session, approved-origin page/tab evidence | Install and verify a real approved page; OS-wide application/focus capture is separate work |
+| Conversation | Jev routing and context retrieval overlap; bounded conversational history; Nemotron replies and clarification follow-ups | Rehearse a real multi-turn session using the configured provider |
+| Native panel | Top-right panel, awareness pause/resume, typed conversation, cancellation and speech controls | Rehearse the complete microphone-to-reply path on the user's Mac |
+| Local voice | Resident Whisper model, bounded microphone capture and transcription; continuous wake worker and automatic spoken-reply integration are the current increment | Validate wake recognition, endpointing, mute/resume and echo suppression together |
+| Speech output | Native speech; optional ElevenLabs Flash synthesis with cancellable owned playback and private temporary audio | Native playback is the default without an ElevenLabs key; live ElevenLabs quality requires a configured key |
+| Review preparation | Context-backed model-generated local message draft, source-version checks, artifact verification, cancellation and readiness invalidation | Add durable jobs and a review surface in the panel |
 
-Run independent tester work throughout each block. One implementer owns core; another can own the extension/UI boundary after contracts stabilize; a tester owns integration/e2e files and probes misuse. Avoid concurrent edits to the same module. Commit and push each tested meaningful increment using git. A failing meaningful increment is fixed before push, not hidden by skipping tests.
+The local draft command is a real generation path. A live Nemotron request against the generated Beacon fixture produced a verified `READY_FOR_REVIEW` artifact at `runtime/brian-live-review-1834.txt`; no message was sent. The older `demo` command is explicitly a scripted policy/review fixture. Neither is an autonomous coding worker or a Gmail integration. Conversation currently returns text; it does not execute model-generated tools. State-machine tests establish contracts, not live desktop execution.
 
-## Demo script
+## What runs continuously and on demand
 
-1. Start Jarvis visibly; the top-right indicator says awareness is on. Open a permitted browser specification and edit a small local requirements note.
-2. Switch away. Ask “Where was I?” Jarvis identifies the unfinished work with evidence references from before the question.
-3. “Implement that.” It asks one materially necessary clarification. Answer naturally; the pending question and job state update together.
-4. Worker acts in its own project workspace. Issue an independent simple command while it runs to show the conversation stays responsive.
-5. Change a watched requirement. Show the relevant resource revision and worker adaptation. If the user changes the worker's output file instead, show a conflict pause instead of an overwrite.
-6. Tool-specific tests verify the revised behavior. Ask for an update to Brian; use a local unsent draft initially, explicitly labeled as such.
-7. Jarvis says “The update is ready for review. It hasn't been sent.” The Review button opens the exact verified artifact. No final send capability exists.
+Continuously while enabled: filesystem collection and reconciliation; permitted browser observations; local microphone capture with bounded audio windows and speech-energy checks. The wake worker uses the resident local Whisper model when speech needs recognition. It makes no hosted LM call for idle awareness or wake detection. This is local speech recognition over windows, not a specialized hardware wake-word detector.
 
-Use a small genuine change and genuine tests. Fixtures support repeatability but are not presented as live Gmail or live booking integration. The broad flight-booking conversation can be a contract test; real purchase execution is deliberately absent.
+On a recognized “Jarvis” request: finish local transcription, overlap Jev with indexed-context retrieval, then call the conversational model. Keep the UI responsive on its own thread. A spoken request receives a spoken answer automatically. Typed input remains available for debugging and recovery, not as the primary voice interaction.
 
-## What we defer
+For an explicitly requested local draft: pin selected indexed resources, generate with the model, recheck source versions, save the caller-selected artifact, and verify it. A changed or missing source blocks readiness. Sending, purchasing and deleting remain final human actions; preparing a draft does not grant a commit capability.
 
-Universal accessibility coverage, arbitrary browser action generation, real checkout/booking preparation across sites, PDF OCR, embeddings, autonomous proactive interruptions, wake-word reliability, cloud sync, multi-user identity, and unrestricted shell access. A stored index plus temporal history is enough to prove the core awareness loop.
+## Next implementation order
+
+| Order | Work | Acceptance gate |
+|---|---|---|
+| 1 | Complete the always-on wake increment | “Jarvis, where was I?” reaches conversation and speaks back; an ordinary ambient utterance is not submitted; mute closes capture; silence does not trigger model requests |
+| 2 | Rehearse context continuity | A note indexed before the question is cited accurately; changing its review time changes the next answer; clarification history survives follow-ups |
+| 3 | Rehearse the verified local draft | Real model output reflects the selected note; source changes during generation block output; artifact tampering or later observed changes revoke readiness on review |
+| 4 | Integrate draft jobs with conversation and panel | A typed proposal goes through the gate; the runner owns job state; the UI opens the exact verified artifact; no send capability appears |
+| 5 | Add one bounded tool-backed worker | Isolated project workspace, explicit tool arguments, execution-time preconditions, a real test command and bounded repair after failures; conflicting user edits pause the job |
+| 6 | Measure and rehearse the complete delegation story | Only then demonstrate “implement that,” worker correction and test repair as live capabilities |
+
+Use independent adversarial integration/e2e testers after each meaningful change, in parallel with implementation. Give each agent distinct files. Commit and push tested increments using git. Prefer one working vertical path over expanding a general framework during the demo build.
+
+## Ready-for-review contract
+
+Every sensitive task ends at preparation: “The draft is ready for your review. It hasn't been sent.” Readiness identifies the job, revision and exact verified output path. The model cannot choose an arbitrary output path or turn generated prose into tool calls. The draft object rechecks indexed-source versions and artifact identity/content before returning review readiness again.
+
+Current review state lives in the process. Changes not yet ingested by collectors are not detected by an index-version check; the future application adapter must also validate its target at execution/review time. Durable job recovery, live dependency notifications, browser draft preparation and final UI review integration are subsequent work. Do not describe a local text file as an email already drafted inside Gmail.
+
+## Voice behavior and remaining work
+
+The current wake design recognizes the standalone word “Jarvis” in local transcription (an optional preceding “Hey” is also accepted), then captures a command. It supports a wake phrase and command together or a wake phrase followed by the request. The current defaults use a four-second rolling wake window, speech-triggered decoding at 2.5-second intervals, a 700 ms silence endpoint, a 15-second command cap and a ten-second silent wait after a standalone wake word. These are prototype thresholds to measure, not latency guarantees. Listening is enabled on normal startup; the mute preference is not persisted. The panel exposes microphone mute/resume and actual listening/decoding/thinking/speaking state. To avoid hearing its own reply, this increment suppresses capture during conversation and playback; spoken barge-in is therefore not implemented. The explicit Stop speaking control remains available.
+
+Tune false activations and endpointing using real microphone trials before claiming wake reliability or a latency figure. Personal speaker identification, robust noise handling, a dedicated low-power wake engine, full-duplex barge-in, OS-wide focus anchors and speculative transcript retrieval remain future improvements. Do not defer the always-on interaction itself in favor of push-to-talk.
 
 ## Measurements
 
-Trace utterance end, evidence ready, route ready, tool start, verification complete, speech start and review ready. Measure p50/p95 when enough repeated runs exist; show sample counts. Compare sequential retrieval, concurrent on-demand retrieval and maintained context on the same fixed tasks. Report correctness and stale-target rejection alongside latency. A spoken “On it” does not count as task completion.
+Record wake recognition, command endpoint, evidence readiness, route readiness, first model response, speech start and review readiness. Include local speech-window and endpoint delays in the result. Jev has a bounded advisory deadline; falling back to conversation is preferable to waiting on routing indefinitely. ElevenLabs currently buffers bounded MP3 audio before playback, so do not call that streaming playback.
 
-The first success criterion is not a promised millisecond target. It is correct contextual handoff plus verified response to a mid-task change. Then optimize the observed critical path. Jev itself incurs inference latency; remove it from a route if measurement shows it provides no useful benefit there.
+Use a fixed set of prompts and report sample counts before p50/p95. Compare maintained context with on-demand retrieval on the same tasks. Record stale-context rejection and answer correctness alongside speed. A quick acknowledgment is not task completion, and local fixture tests do not establish real microphone or browser reliability.

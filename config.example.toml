@@ -29,7 +29,8 @@ safe_retry_limit = 2
 external_write_conflict = "pause"
 
 [audio]
-input_mode = "push_to_talk"
+input_mode = "wake_word"
+wake_word = "Jarvis"
 transcription = "local_whisper"
 model_path_env = "JARVIS_WHISPER_MODEL_PATH"
 speech_output = "macos_native"

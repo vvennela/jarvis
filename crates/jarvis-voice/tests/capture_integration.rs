@@ -93,3 +93,41 @@ fn long_recordings_stop_growing_at_the_fifteen_second_cap() {
     assert_eq!(samples.len(), MAX_RECORDING_SAMPLES);
     assert!(samples.iter().all(|sample| *sample == 0.25));
 }
+
+#[test]
+fn continuous_capture_drains_without_losing_resampler_position_and_marks_overrun() {
+    let input: Vec<f32> = (0..48000).map(|i| (i % 100) as f32 / 100.0).collect();
+    let mut baseline = CaptureBuffer::continuous(48000, 1).unwrap();
+    baseline.push_f32(&input).unwrap();
+    let (expected, overflow) = baseline.drain_samples();
+    assert!(!overflow);
+    let mut streamed = CaptureBuffer::continuous(48000, 1).unwrap();
+    let mut actual = Vec::new();
+    for chunk in input.chunks(71) {
+        streamed.push_f32(chunk).unwrap();
+        let (samples, overflow) = streamed.drain_samples();
+        assert!(!overflow);
+        actual.extend(samples);
+    }
+    assert_eq!(
+        actual, expected,
+        "draining must preserve interpolation continuity"
+    );
+    let mut buffer = CaptureBuffer::continuous(16000, 1).unwrap();
+    buffer
+        .push_f32(&vec![0.1; MAX_RECORDING_SAMPLES * 3])
+        .unwrap();
+    assert!(
+        !buffer.is_full(),
+        "continuous input must remain usable after 15 seconds"
+    );
+    assert!(buffer.output_len() <= MAX_RECORDING_SAMPLES);
+    let (samples, overflow) = buffer.drain_samples();
+    assert!(overflow);
+    assert!(!samples.is_empty());
+    assert_eq!(buffer.drain_samples(), (Vec::new(), false));
+    buffer.push_f32(&[0.25; 320]).unwrap();
+    let (samples, overflow) = buffer.drain_samples();
+    assert!(!overflow);
+    assert_eq!(samples, vec![0.25; 320]);
+}

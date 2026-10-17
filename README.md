@@ -2,6 +2,7 @@
 
 Your work, in context. A native Rust companion for Mac that keeps a searchable memory of files and browser activity, ready when you ask.
 
+- **Voice:** say “Jarvis” to ask a question and hear the reply, with local wake recognition and a microphone mute control.
 - **Continuous awareness:** watches selected folders and approved Chrome sites.
 - **Fast context:** SQLite search, incremental hashes, and parallel retrieval and routing.
 - **Native presence:** a floating panel with live awareness status and pause/resume.
@@ -27,6 +28,9 @@ Copy `.env.example` to `.env` and set:
 
 - `TYPESAFE_API_KEY` — [Jev](https://console.typesafe.ai/)
 - `CRUSOE_API_KEY` — [Crusoe inference](https://crusoe.ai/)
+- `JARVIS_WHISPER_MODEL_PATH` — absolute path to a local Whisper GGML model
+
+For ElevenLabs speech, add `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID`. Jarvis also supports your Mac’s built-in voice.
 
 Model: `nvidia/Nemotron-3.5-Lightning-30B-A3B`.
 

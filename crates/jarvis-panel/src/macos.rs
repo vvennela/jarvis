@@ -4,7 +4,7 @@ use super::Options;
 use jarvis_panel::{
     chat::{self, ConversationWorker},
     speech::{self, SpeechWorker},
-    voiceworker::{self, VoiceWorker},
+    wakeworker::{self, WakeWorker},
     worker::{Control, State, Worker},
 };
 use objc2::{
@@ -31,7 +31,7 @@ struct ActionIvars {
     control: Arc<Control>,
     chat: Arc<chat::Control>,
     speech: Arc<speech::Control>,
-    voice: Arc<voiceworker::Control>,
+    voice: Arc<wakeworker::Control>,
     input: Retained<NSTextField>,
 }
 define_class!(
@@ -65,7 +65,7 @@ define_class!(
         }
         #[unsafe(method(cancelQuestion:))]
         fn cancel_question(&self, _sender: Option<&AnyObject>) {
-            self.ivars().voice.cancel();
+            self.ivars().voice.suppress(true);
             self.ivars().speech.stop_speaking();
             self.ivars().chat.cancel();
         }
@@ -82,12 +82,7 @@ define_class!(
         fn stop_speaking(&self, _sender: Option<&AnyObject>) { self.ivars().speech.stop_speaking(); }
         #[unsafe(method(toggleRecording:))]
         fn toggle_recording(&self, _sender: Option<&AnyObject>) {
-            if matches!(self.ivars().voice.snapshot().state, voiceworker::State::Recording | voiceworker::State::StartingMicrophone) {
-                self.ivars().voice.finish_recording();
-            } else {
-                self.ivars().speech.stop_speaking();
-                let _ = self.ivars().voice.record();
-            }
+            self.ivars().voice.set_enabled(!self.ivars().voice.enabled());
         }
     }
 );
@@ -97,7 +92,7 @@ impl PanelActions {
         control: Arc<Control>,
         chat: Arc<chat::Control>,
         speech: Arc<speech::Control>,
-        voice: Arc<voiceworker::Control>,
+        voice: Arc<wakeworker::Control>,
         input: Retained<NSTextField>,
     ) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(ActionIvars {
@@ -128,7 +123,9 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     let mut worker = Worker::start(options.root, options.database.clone())?;
     let mut conversation = ConversationWorker::start(options.database)?;
     let mut speech = SpeechWorker::start()?;
-    let mut voice = VoiceWorker::from_env()?;
+    let mut voice = WakeWorker::from_env()?;
+    // Smoke mode never enables microphone hardware.
+    voice.control.set_enabled(!options.smoke_test);
     let application = NSApplication::sharedApplication(mtm);
     application.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     application.finishLaunching();
@@ -275,7 +272,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     // SAFETY: The retained target implements this single-object selector.
     let record_button = unsafe {
         NSButton::buttonWithTitle_target_action(
-            &NSString::from_str("Record"),
+            &NSString::from_str("Mute microphone"),
             Some(&actions),
             Some(sel!(toggleRecording:)),
             mtm,
@@ -306,7 +303,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     let mut last_state = None;
     let mut had_error = false;
     let mut chat_revision = None;
-    let mut voice_revision = None;
+    let mut voice_reply_revision = None;
     loop {
         let snapshot = worker.control.snapshot();
         if snapshot.state == State::Active {
@@ -367,51 +364,72 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             chat_status.setStringValue(&NSString::from_str(message));
             chat_revision = Some(chat_snapshot.revision);
         }
-        let voice_snapshot = voice.control.snapshot();
-        if voice_revision != Some(voice_snapshot.revision) {
-            if voice_snapshot.state == voiceworker::State::Transcript {
-                input.setStringValue(&NSString::from_str(&voice_snapshot.transcript));
+        if voice_reply_revision.is_some_and(|revision| revision != chat_snapshot.revision)
+            && chat_snapshot.state == chat::State::Reply
+            && !conversation.control.busy()
+        {
+            let mut end = chat_snapshot.text.len().min(speech::MAX_TEXT_BYTES);
+            while !chat_snapshot.text.is_char_boundary(end) {
+                end -= 1;
             }
-            record_button.setToolTip(Some(&NSString::from_str(voice_snapshot.message)));
-            voice_revision = Some(voice_snapshot.revision);
+            let _ = speech.control.speak(chat_snapshot.text[..end].to_owned());
+            voice_reply_revision = None;
         }
-        let recording = matches!(
-            voice_snapshot.state,
-            voiceworker::State::Recording | voiceworker::State::StartingMicrophone
-        );
-        record_button.setTitle(&NSString::from_str(if recording {
-            "Finish recording"
+        if voice_reply_revision.is_some_and(|revision| revision != chat_snapshot.revision)
+            && matches!(
+                chat_snapshot.state,
+                chat::State::Failed | chat::State::Cancelled | chat::State::Unavailable
+            )
+        {
+            voice_reply_revision = None;
+        }
+        // A voice command owns the next response. Ambient decode text never reaches chat.
+        if let Some(command) = voice.control.take_command() {
+            input.setStringValue(&NSString::from_str(&command));
+            if conversation.control.submit(command).is_ok() {
+                voice_reply_revision = Some(chat_snapshot.revision);
+            }
+        }
+        voice
+            .control
+            .suppress(speech.control.busy() || conversation.control.busy());
+        let voice_snapshot = voice.control.snapshot();
+        record_button.setTitle(&NSString::from_str(if voice.control.enabled() {
+            "Mute microphone"
         } else {
-            "Record"
+            "Enable wake listening"
         }));
-        record_button.setEnabled(voice.control.available() && (!voice.control.busy() || recording));
-        input.setEnabled(!voice.control.busy());
-        send_button.setEnabled(
-            conversation.control.available()
-                && !conversation.control.busy()
-                && !voice.control.busy(),
+        record_button.setToolTip(Some(&NSString::from_str(voice_snapshot.message)));
+        record_button.setEnabled(voice_snapshot.state != wakeworker::State::Stopped);
+        input.setEnabled(!conversation.control.busy());
+        send_button.setEnabled(conversation.control.available() && !conversation.control.busy());
+        cancel_button.setEnabled(
+            conversation.control.busy()
+                || matches!(
+                    voice_snapshot.state,
+                    wakeworker::State::CommandListening | wakeworker::State::Decoding
+                ),
         );
-        cancel_button.setEnabled(conversation.control.busy() || voice.control.busy());
         read_button.setEnabled(
             chat_snapshot.state == chat::State::Reply
                 && speech.control.available()
-                && !speech.control.busy()
-                && !voice.control.busy(),
+                && !speech.control.busy(),
         );
         stop_speech_button.setEnabled(speech.control.busy());
         if snapshot.state != State::Blocked {
-            let message = if !matches!(voice_snapshot.state, voiceworker::State::Ready) {
-                voice_snapshot.message
-            } else if speech.control.busy() {
-                "Microphone off · reading reply aloud"
+            let message = if speech.control.busy() {
+                "Speaking…"
             } else if conversation.control.busy() {
-                "Microphone off · model request active"
+                "Thinking…"
             } else {
-                "Microphone off · ready to record"
+                voice_snapshot.message
             };
             detail.setStringValue(&NSString::from_str(message));
-            let color = if voice_snapshot.state == voiceworker::State::Recording {
-                NSColor::systemRedColor()
+            let color = if matches!(
+                voice_snapshot.state,
+                wakeworker::State::WakeListening | wakeworker::State::CommandListening
+            ) {
+                NSColor::systemGreenColor()
             } else {
                 NSColor::secondaryLabelColor()
             };

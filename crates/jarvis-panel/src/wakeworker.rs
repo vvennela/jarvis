@@ -1,0 +1,322 @@
+//! Continuous local wake recognition; the native audio handle stays on one thread.
+use crate::wake::{Phase, WakeDetector};
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
+};
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum State {
+    Loading,
+    Muted,
+    Starting,
+    WakeListening,
+    CommandListening,
+    Decoding,
+    CommandReady,
+    Suppressed,
+    Failed,
+    Stopped,
+}
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    pub state: State,
+    pub message: &'static str,
+    pub revision: u64,
+}
+pub trait WakeBackend {
+    fn start(&mut self) -> Result<(), &'static str>;
+    fn poll(&mut self) -> Result<(Vec<f32>, bool), &'static str>;
+    fn stop(&mut self);
+    fn transcribe(
+        &mut self,
+        samples: &[f32],
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<String, &'static str>;
+}
+pub struct Control {
+    enabled: AtomicBool,
+    suppressed: AtomicBool,
+    stopped: AtomicBool,
+    generation: AtomicU64,
+    cancelled: Arc<AtomicBool>,
+    snapshot: Mutex<Snapshot>,
+    command: Mutex<Option<String>>,
+}
+impl Control {
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
+    }
+    pub fn set_enabled(&self, value: bool) {
+        if self.enabled.swap(value, Ordering::AcqRel) != value {
+            self.invalidate();
+        }
+    }
+    pub fn suppress(&self, value: bool) {
+        if self.suppressed.swap(value, Ordering::AcqRel) != value {
+            self.invalidate();
+        }
+    }
+    fn invalidate(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.command
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+    }
+    pub fn take_command(&self) -> Option<String> {
+        self.command
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+    }
+    pub fn snapshot(&self) -> Snapshot {
+        self.snapshot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+    pub fn shutdown(&self) {
+        self.stopped.store(true, Ordering::Release);
+        self.invalidate();
+    }
+    fn publish(&self, state: State, message: &'static str) {
+        let mut s = self.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+        if s.state != state {
+            s.state = state;
+            s.message = message;
+            s.revision = s.revision.wrapping_add(1);
+        }
+    }
+}
+pub struct WakeWorker {
+    pub control: Arc<Control>,
+    handle: Option<JoinHandle<()>>,
+}
+impl WakeWorker {
+    #[cfg(target_os = "macos")]
+    pub fn from_env() -> Result<Self, &'static str> {
+        Self::with_backend(|| {
+            let settings = jarvis::conversation::load_provider_settings()
+                .map_err(|_| "Set JARVIS_WHISPER_MODEL_PATH")?;
+            let path = std::path::PathBuf::from(
+                settings
+                    .get("JARVIS_WHISPER_MODEL_PATH")
+                    .ok_or("Set JARVIS_WHISPER_MODEL_PATH")?,
+            );
+            if !path.is_absolute() {
+                return Err("Choose an absolute Whisper model path");
+            }
+            let transcriber = jarvis_voice::Transcriber::load(&path)
+                .map_err(|_| "Check the local Whisper model")?;
+            Ok(Box::new(NativeBackend {
+                transcriber,
+                capture: None,
+            }))
+        })
+    }
+    pub fn with_backend(
+        factory: impl FnOnce() -> Result<Box<dyn WakeBackend>, &'static str> + Send + 'static,
+    ) -> Result<Self, &'static str> {
+        let control = Arc::new(Control {
+            enabled: AtomicBool::new(false),
+            suppressed: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            snapshot: Mutex::new(Snapshot {
+                state: State::Loading,
+                message: "Loading local wake recognition",
+                revision: 0,
+            }),
+            command: Mutex::new(None),
+        });
+        let c = control.clone();
+        let handle = thread::Builder::new()
+            .name("jarvis-local-wake".into())
+            .spawn(move || {
+                let mut backend = match factory() {
+                    Ok(b) => b,
+                    Err(message) => {
+                        c.publish(State::Failed, message);
+                        return;
+                    }
+                };
+                let mut detector = WakeDetector::new();
+                let mut running = false;
+                let mut seen_generation = c.generation.load(Ordering::Acquire);
+                loop {
+                    if c.stopped.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let generation = c.generation.load(Ordering::Acquire);
+                    if generation != seen_generation {
+                        backend.stop();
+                        running = false;
+                        detector.reset();
+                        seen_generation = generation;
+                    }
+                    let suppressed = c.suppressed.load(Ordering::Acquire);
+                    if !c.enabled() || suppressed {
+                        if running {
+                            backend.stop();
+                            running = false;
+                        }
+                        detector.reset();
+                        c.publish(
+                            if suppressed {
+                                State::Suppressed
+                            } else {
+                                State::Muted
+                            },
+                            if suppressed {
+                                "Voice paused during reply"
+                            } else {
+                                "Microphone muted"
+                            },
+                        );
+                        thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
+                    if !running {
+                        c.publish(State::Starting, "Starting microphone");
+                        if let Err(message) = backend.start() {
+                            c.enabled.store(false, Ordering::Release);
+                            c.publish(State::Failed, message);
+                            // Keep permission errors visible until explicit retry.
+                            while !c.enabled() && !c.stopped.load(Ordering::Acquire) {
+                                thread::sleep(Duration::from_millis(20));
+                            }
+                            continue;
+                        }
+                        running = true;
+                        c.cancelled.store(false, Ordering::Release);
+                    }
+                    if c.command
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .is_some()
+                    {
+                        thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
+                    c.publish(
+                        if detector.phase() == Phase::Wake {
+                            State::WakeListening
+                        } else {
+                            State::CommandListening
+                        },
+                        if detector.phase() == Phase::Wake {
+                            "Wake listening · say Jarvis"
+                        } else {
+                            "Listening to your request…"
+                        },
+                    );
+                    let (samples, overflow) = match backend.poll() {
+                        Ok(v) => v,
+                        Err(message) => {
+                            backend.stop();
+                            running = false;
+                            c.enabled.store(false, Ordering::Release);
+                            c.publish(State::Failed, message);
+                            continue;
+                        }
+                    };
+                    if overflow || samples.len() > jarvis_voice::capture::MAX_RECORDING_SAMPLES {
+                        detector.reset();
+                        continue;
+                    }
+                    if let Some(request) = detector.ingest(&samples) {
+                        c.publish(
+                            State::Decoding,
+                            if request.phase == Phase::Wake {
+                                "Checking wake phrase locally"
+                            } else {
+                                "Understanding your request locally"
+                            },
+                        );
+                        let result = backend.transcribe(&request.samples, c.cancelled.clone());
+                        if generation != c.generation.load(Ordering::Acquire)
+                            || c.stopped.load(Ordering::Acquire)
+                        {
+                            detector.reset();
+                            continue;
+                        }
+                        match result {
+                            Ok(text) => {
+                                if let Some(command) = detector.accept_transcript(&text) {
+                                    *c.command.lock().unwrap_or_else(|p| p.into_inner()) =
+                                        Some(command);
+                                    c.publish(State::CommandReady, "Request heard");
+                                }
+                            }
+                            Err(_) => detector.reset(),
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                backend.stop();
+                c.publish(State::Stopped, "Microphone off");
+            })
+            .map_err(|_| "Could not start wake worker")?;
+        Ok(Self {
+            control,
+            handle: Some(handle),
+        })
+    }
+    pub fn is_finished(&self) -> bool {
+        self.handle.as_ref().is_none_or(|h| h.is_finished())
+    }
+    pub fn join(&mut self) -> Result<(), &'static str> {
+        if let Some(h) = self.handle.take() {
+            h.join().map_err(|_| "Wake worker stopped unexpectedly")?;
+        }
+        Ok(())
+    }
+}
+impl Drop for WakeWorker {
+    fn drop(&mut self) {
+        self.control.shutdown();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+#[cfg(target_os = "macos")]
+struct NativeBackend {
+    transcriber: jarvis_voice::Transcriber,
+    capture: Option<jarvis_voice::capture::ContinuousCapture>,
+}
+#[cfg(target_os = "macos")]
+impl WakeBackend for NativeBackend {
+    fn start(&mut self) -> Result<(), &'static str> {
+        self.capture = Some(
+            jarvis_voice::capture::ContinuousCapture::start()
+                .map_err(|_| "Allow microphone access in macOS Privacy & Security")?,
+        );
+        Ok(())
+    }
+    fn poll(&mut self) -> Result<(Vec<f32>, bool), &'static str> {
+        self.capture
+            .as_mut()
+            .ok_or("Microphone unavailable")?
+            .poll()
+            .map_err(|_| "Check microphone settings")
+    }
+    fn stop(&mut self) {
+        self.capture.take();
+    }
+    fn transcribe(
+        &mut self,
+        samples: &[f32],
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<String, &'static str> {
+        self.transcriber
+            .transcribe_cancelled(samples, cancelled)
+            .map_err(|_| "Try saying Jarvis again")
+    }
+}

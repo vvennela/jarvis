@@ -9,3 +9,6 @@ pub mod chat;
 pub mod speech;
 
 pub mod voiceworker;
+
+pub mod wake;
+pub mod wakeworker;

@@ -1,6 +1,6 @@
 # Architecture
 
-This is the intended architecture. The initial repository increment covers the policy/runner foundation and headless fixtures; live collectors, providers, native UI, and audio remain planned. Purple nodes require inference. Speech recognition and synthesis have separate compute costs.
+This diagram describes the full intended architecture. Implemented pieces include bounded file/Chrome observation, SQLite search, parallel Jev routing and retrieval, Nemotron conversation, local draft verification, and a native panel with local voice recognition and speech output. OS focus anchors, persistent job recovery, browser action adapters, speculative retrieval integration, and general coding workers remain planned. Purple nodes require inference. Speech recognition and synthesis have separate compute costs.
 
 ```mermaid
 flowchart TD
@@ -85,7 +85,7 @@ flowchart TD
 | Native observation and panel | objc2 / AppKit bindings | NSWorkspace and accessibility observers; top-right nonactivating panel |
 | Browser adapter | Small JavaScript Manifest V3 extension + Rust Native Messaging host | Extension is the deliberate non-Rust edge; structured permitted DOM text, no screenshot capture |
 | Provider transport | reqwest | TypeSafe Jev endpoint and Crusoe OpenAI-compatible inference endpoint |
-| Audio | cpal + whisper-rs; native macOS speech output | Push-to-talk first; local model file; wake-word engine later |
+| Audio | cpal + whisper-rs; native macOS or optional ElevenLabs speech | Local “Jarvis” phrase detection and command endpointing; bounded resident-model capture; microphone mute |
 | Diagnostics | tracing with redaction | Request/job/tool spans, timings, reason codes; no content dumps by default |
 
 Do not pull every planned dependency into the foundation before using it. Native permission and voice integration are substantial work; feature-gate platform-specific adapters so headless tests run independently.
