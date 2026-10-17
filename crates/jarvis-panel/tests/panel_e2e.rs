@@ -166,6 +166,8 @@ fn real_appkit_smoke_exercises_awareness_pause_resume_and_quit() {
         "\"workers_alive_after_dismiss\":true",
         "\"voice_unchanged_after_dismiss\":true",
         "\"menu_toggle_revealed\":true",
+        "\"review_initially_disabled\":true",
+        "\"task_worker_stopped\":true",
     ] {
         assert!(
             stdout.contains(field),

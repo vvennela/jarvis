@@ -5,7 +5,8 @@ use jarvis_panel::{
     chat::{self, ConversationWorker},
     osworker::{self, OsWorker},
     speech::{self, SpeechWorker},
-    voicehandoff::VoiceHandoff,
+    tasks::{self, TaskWorker},
+    voicehandoff::{VoiceHandoff, dispatch_question},
     wakeworker::{self, WakeWorker},
     worker::{Control, State, Worker},
 };
@@ -36,6 +37,8 @@ struct ActionIvars {
     control: Arc<Control>,
     os: Arc<osworker::Control>,
     chat: Arc<chat::Control>,
+    tasks: Arc<tasks::Control>,
+    action_error: Cell<Option<&'static str>>,
     speech: Arc<speech::Control>,
     voice: Arc<wakeworker::Control>,
     input: Retained<NSTextField>,
@@ -82,13 +85,18 @@ define_class!(
             self.ivars().voice.shutdown();
             self.ivars().speech.shutdown();
             self.ivars().chat.stop();
+            self.ivars().tasks.shutdown();
             self.ivars().control.stop();
         }
         #[unsafe(method(sendQuestion:))]
         fn send_question(&self, _sender: Option<&AnyObject>) {
             let question = self.ivars().input.stringValue().to_string();
-            if self.ivars().chat.submit(question).is_ok() {
-                self.ivars().input.setStringValue(&NSString::from_str(""));
+            match dispatch_question(question, &self.ivars().chat, &self.ivars().tasks) {
+                Ok(_) => {
+                    self.ivars().action_error.set(None);
+                    self.ivars().input.setStringValue(&NSString::from_str(""));
+                }
+                Err(error) => self.ivars().action_error.set(Some(error)),
             }
         }
         #[unsafe(method(cancelQuestion:))]
@@ -96,6 +104,13 @@ define_class!(
             self.ivars().voice.suppress(true);
             self.ivars().speech.stop_speaking();
             self.ivars().chat.cancel();
+            self.ivars().tasks.cancel();
+        }
+        #[unsafe(method(openDraft:))]
+        fn open_draft(&self, _sender: Option<&AnyObject>) {
+            self.ivars().action_error.set(
+                self.ivars().tasks.request_review().err().map(|_| "The draft is not ready to open yet.")
+            );
         }
         #[unsafe(method(readAloud:))]
         fn read_aloud(&self, _sender: Option<&AnyObject>) {
@@ -124,7 +139,7 @@ impl PanelActions {
         mtm: MainThreadMarker,
         control: Arc<Control>,
         os: Arc<osworker::Control>,
-        chat: Arc<chat::Control>,
+        conversation: (Arc<chat::Control>, Arc<tasks::Control>),
         speech: Arc<speech::Control>,
         voice: Arc<wakeworker::Control>,
         input: Retained<NSTextField>,
@@ -132,7 +147,9 @@ impl PanelActions {
         let this = Self::alloc(mtm).set_ivars(ActionIvars {
             control,
             os,
-            chat,
+            chat: conversation.0,
+            tasks: conversation.1,
+            action_error: Cell::new(None),
             speech,
             voice,
             input,
@@ -164,6 +181,18 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     } else {
         OsWorker::start(options.database.clone())?
     };
+    let database = if options.database.is_absolute() {
+        options.database.clone()
+    } else {
+        std::env::current_dir()
+            .map_err(|_| "Current directory unavailable")?
+            .join(&options.database)
+    };
+    let review_directory = database
+        .parent()
+        .ok_or("Context database has no parent directory")?
+        .join("reviews");
+    let mut tasks = TaskWorker::start(database, review_directory)?;
     let mut conversation = ConversationWorker::start(options.database)?;
     let mut speech = SpeechWorker::start()?;
     let mut voice = WakeWorker::from_env()?;
@@ -266,11 +295,13 @@ pub fn run(options: Options) -> Result<(), &'static str> {
         rect(18.0, 234.0, 324.0, 18.0),
         12.0,
     );
+    let task_status = label(mtm, "Drafts · ready", rect(18.0, 214.0, 324.0, 18.0), 11.0);
+    task_status.setTextColor(Some(&NSColor::secondaryLabelColor()));
     let scroll =
-        NSScrollView::initWithFrame(NSScrollView::alloc(mtm), rect(18.0, 108.0, 324.0, 120.0));
+        NSScrollView::initWithFrame(NSScrollView::alloc(mtm), rect(18.0, 108.0, 324.0, 100.0));
     scroll.setHasVerticalScroller(true);
     scroll.setDrawsBackground(false);
-    let response = NSTextView::initWithFrame(NSTextView::alloc(mtm), rect(0.0, 0.0, 304.0, 120.0));
+    let response = NSTextView::initWithFrame(NSTextView::alloc(mtm), rect(0.0, 0.0, 304.0, 100.0));
     response.setEditable(false);
     response.setDrawsBackground(false);
     response.setSelectable(true);
@@ -278,7 +309,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     response.setFont(Some(&NSFont::systemFontOfSize(14.0)));
     response.setVerticallyResizable(true);
     response.setHorizontallyResizable(false);
-    response.setMinSize(NSSize::new(304.0, 120.0));
+    response.setMinSize(NSSize::new(304.0, 100.0));
     response.setMaxSize(NSSize::new(304.0, 1_000_000.0));
     scroll.setDocumentView(Some(&response));
     let input = NSTextField::initWithFrame(NSTextField::alloc(mtm), rect(18.0, 70.0, 250.0, 30.0));
@@ -288,7 +319,10 @@ pub fn run(options: Options) -> Result<(), &'static str> {
         mtm,
         Arc::clone(&worker.control),
         Arc::clone(&os.control),
-        Arc::clone(&conversation.control),
+        (
+            Arc::clone(&conversation.control),
+            Arc::clone(&tasks.control),
+        ),
         Arc::clone(&speech.control),
         Arc::clone(&voice.control),
         input.clone(),
@@ -381,6 +415,21 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     expand_button.setFrame(rect(278.0, 9.0, 68.0, 23.0));
     expand_button.setBordered(false);
     expand_button.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+    // SAFETY: This retained main-thread target implements openDraft:.
+    let review_button = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            &NSString::from_str("Open draft"),
+            Some(&actions),
+            Some(sel!(openDraft:)),
+            mtm,
+        )
+    };
+    review_button.setFrame(rect(96.0, 9.0, 100.0, 23.0));
+    review_button.setBordered(false);
+    review_button.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+    review_button.setEnabled(false);
+    review_button.setHidden(true);
+    let review_initially_disabled = !review_button.isEnabled();
     let preview =
         NSTextField::wrappingLabelWithString(&NSString::from_str("Here when you need me."), mtm);
     preview.setFrame(rect(18.0, 44.0, 324.0, 36.0));
@@ -411,11 +460,13 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     header.addSubview(&preview);
     header.addSubview(&record_button);
     header.addSubview(&expand_button);
+    header.addSubview(&review_button);
     details.addSubview(&status);
     details.addSubview(&pause_button);
     details.addSubview(&quit_button);
     details.addSubview(&os_status);
     details.addSubview(&chat_status);
+    details.addSubview(&task_status);
     details.addSubview(&scroll);
     details.addSubview(&input);
     details.addSubview(&send_button);
@@ -472,6 +523,8 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     let mut last_state = None;
     let mut had_error = false;
     let mut chat_revision = None;
+    let mut task_revision = None;
+    let mut task_notice = false;
     let mut voice_handoff = VoiceHandoff::new();
     loop {
         if expanded != actions.ivars().expanded.get() {
@@ -555,8 +608,29 @@ pub fn run(options: Options) -> Result<(), &'static str> {
         if snapshot.state == State::Blocked {
             detail.setStringValue(&NSString::from_str(snapshot.message));
         }
+        let task_snapshot = tasks.control.snapshot();
+        if task_revision != Some(task_snapshot.revision) {
+            task_status.setStringValue(&NSString::from_str(&task_snapshot.text));
+            task_status.setToolTip(Some(&NSString::from_str(&task_snapshot.text)));
+            task_notice = task_snapshot.state != tasks::State::Idle;
+            if task_snapshot.state == tasks::State::ReadyForReview && !actions.ivars().visible.get()
+            {
+                actions.reveal_for_wake();
+            }
+            task_revision = Some(task_snapshot.revision);
+        }
+        let draft_ready =
+            task_snapshot.state == tasks::State::ReadyForReview && !tasks.control.busy();
+        review_button.setEnabled(draft_ready);
+        review_button.setHidden(task_snapshot.state != tasks::State::ReadyForReview);
         let chat_snapshot = conversation.control.snapshot();
         if chat_revision != Some(chat_snapshot.revision) {
+            if matches!(
+                chat_snapshot.state,
+                chat::State::Reply | chat::State::Failed
+            ) {
+                task_notice = false;
+            }
             response.setString(&NSString::from_str(&chat_snapshot.text));
             let message = match chat_snapshot.state {
                 chat::State::Starting => "Preparing conversation…",
@@ -568,16 +642,19 @@ pub fn run(options: Options) -> Result<(), &'static str> {
                 }
                 chat::State::Reply => "Reply ready",
                 chat::State::Cancelled => "Cancelled · ready for another question",
-                chat::State::Unavailable => "Add your model key to enable conversation",
+                chat::State::Unavailable => "Conversation needs attention",
                 chat::State::Failed => "Ready to retry",
                 chat::State::Stopped => "Conversation stopped",
             };
             chat_status.setStringValue(&NSString::from_str(message));
             chat_revision = Some(chat_snapshot.revision);
         }
-        if let Some(command) =
-            voice_handoff.tick(&voice.control, &conversation.control, &speech.control)
-        {
+        if let Some(command) = voice_handoff.tick_with_tasks(
+            &voice.control,
+            &conversation.control,
+            &speech.control,
+            &tasks.control,
+        ) {
             input.setStringValue(&NSString::from_str(&command));
             if !interaction_revealed {
                 actions.reveal_for_wake();
@@ -625,9 +702,13 @@ pub fn run(options: Options) -> Result<(), &'static str> {
         record_button.setToolTip(Some(&NSString::from_str(&microphone_details)));
         record_button.setEnabled(voice_snapshot.state != wakeworker::State::Stopped);
         input.setEnabled(!conversation.control.busy());
-        send_button.setEnabled(conversation.control.available() && !conversation.control.busy());
+        send_button.setEnabled(
+            !conversation.control.busy()
+                && (conversation.control.available() || !tasks.control.busy()),
+        );
         cancel_button.setEnabled(
             conversation.control.busy()
+                || tasks.control.busy()
                 || matches!(
                     voice_snapshot.state,
                     wakeworker::State::CommandListening | wakeworker::State::Decoding
@@ -650,12 +731,27 @@ pub fn run(options: Options) -> Result<(), &'static str> {
         } else if conversation.control.busy() {
             "Thinking…"
         } else if chat_snapshot.state == chat::State::Failed
+            && !task_notice
             && !matches!(
                 voice_snapshot.state,
                 wakeworker::State::CommandListening | wakeworker::State::Decoding
             )
         {
             "Request failed · ready to retry"
+        } else if task_notice
+            && !matches!(
+                voice_snapshot.state,
+                wakeworker::State::CommandListening | wakeworker::State::Decoding
+            )
+        {
+            match task_snapshot.state {
+                tasks::State::Running => "Drafting in the background…",
+                tasks::State::ReadyForReview => "Draft ready for review",
+                tasks::State::Blocked => "Draft needs attention",
+                tasks::State::Failed => "Draft could not finish",
+                tasks::State::Cancelled => "Draft cancelled",
+                tasks::State::Idle | tasks::State::Stopped => "Ready when you are",
+            }
         } else {
             match voice_snapshot.state {
                 wakeworker::State::WakeListening => "Listening for Jarvis",
@@ -674,7 +770,11 @@ pub fn run(options: Options) -> Result<(), &'static str> {
         let activity_color = if blocked
             || voice_snapshot.state == wakeworker::State::Failed
             || chat_snapshot.state == chat::State::Failed
-        {
+            || (task_notice
+                && matches!(
+                    task_snapshot.state,
+                    tasks::State::Blocked | tasks::State::Failed
+                )) {
             NSColor::systemOrangeColor()
         } else if voice.control.enabled() {
             NSColor::systemGreenColor()
@@ -682,11 +782,16 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             NSColor::tertiaryLabelColor()
         };
         activity.setTextColor(Some(&activity_color));
-        let preview_text = if blocked {
+        let preview_text = if let Some(error) = actions.ivars().action_error.get() {
+            error.to_owned()
+        } else if task_notice && !conversation.control.busy() {
+            task_snapshot.text.chars().take(180).collect::<String>()
+        } else if blocked {
             "Open Details to check access.".to_owned()
-        } else if chat_snapshot.state == chat::State::Unavailable {
-            "Open Details to finish setup.".to_owned()
-        } else if chat_snapshot.state == chat::State::Failed {
+        } else if matches!(
+            chat_snapshot.state,
+            chat::State::Unavailable | chat::State::Failed
+        ) {
             chat_snapshot.text.chars().take(180).collect::<String>()
         } else if chat_snapshot.state == chat::State::Reply && !chat_snapshot.text.is_empty() {
             chat_snapshot
@@ -760,6 +865,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
                 voice.control.shutdown();
                 speech.control.shutdown();
                 conversation.control.stop();
+                tasks.control.shutdown();
                 worker.control.stop();
             }
         }
@@ -769,6 +875,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             && conversation.is_finished()
             && speech.is_finished()
             && voice.is_finished()
+            && tasks.is_finished()
         {
             break;
         }
@@ -798,9 +905,11 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     conversation.join()?;
     speech.join()?;
     voice.join()?;
+    tasks.join()?;
+    let task_worker_stopped = tasks.is_finished();
     if options.smoke_test {
         println!(
-            "{{\"panel_created\":true,\"active_observed\":{active_observed},\"paused_observed\":{paused_observed},\"resumed_observed\":{resumed_observed},\"microphone_active\":false,\"compact_width\":{compact_width},\"compact_height\":{compact_height},\"expanded_observed\":{expanded_observed},\"collapsed_observed\":{collapsed_observed},\"translucent\":{translucent},\"native_glass\":{native_glass},\"nonactivating\":{nonactivating},\"initial_hidden\":{initial_hidden},\"menu_bar_present\":{menu_bar_present},\"wake_revealed\":{wake_revealed},\"dismissed_hidden\":{dismissed_hidden},\"workers_alive_after_dismiss\":{workers_alive_after_dismiss},\"voice_unchanged_after_dismiss\":{voice_unchanged_after_dismiss},\"menu_toggle_revealed\":{menu_toggle_revealed}}}"
+            "{{\"panel_created\":true,\"active_observed\":{active_observed},\"paused_observed\":{paused_observed},\"resumed_observed\":{resumed_observed},\"microphone_active\":false,\"compact_width\":{compact_width},\"compact_height\":{compact_height},\"expanded_observed\":{expanded_observed},\"collapsed_observed\":{collapsed_observed},\"translucent\":{translucent},\"native_glass\":{native_glass},\"nonactivating\":{nonactivating},\"initial_hidden\":{initial_hidden},\"menu_bar_present\":{menu_bar_present},\"wake_revealed\":{wake_revealed},\"dismissed_hidden\":{dismissed_hidden},\"workers_alive_after_dismiss\":{workers_alive_after_dismiss},\"voice_unchanged_after_dismiss\":{voice_unchanged_after_dismiss},\"menu_toggle_revealed\":{menu_toggle_revealed},\"review_initially_disabled\":{review_initially_disabled},\"task_worker_stopped\":{task_worker_stopped}}}"
         );
         if had_error
             || !active_observed
@@ -815,6 +924,8 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             || !workers_alive_after_dismiss
             || !voice_unchanged_after_dismiss
             || !menu_toggle_revealed
+            || !review_initially_disabled
+            || !task_worker_stopped
         {
             return Err("Panel smoke test did not complete its observer lifecycle");
         }
