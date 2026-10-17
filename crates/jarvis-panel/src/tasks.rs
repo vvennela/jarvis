@@ -214,7 +214,7 @@ impl TaskWorker {
                                         match factory(database.clone(),id.clone(),id) {
                                             Err(error)=>state.update(State::Failed,error_text(error),None),
                                             Ok(mut task)=>{
-                                                match task.generate(&instruction,&ids,&output,state.cancel.clone()).await {
+                                                match generate_with_retry(&mut task,&instruction,&ids,&output,&state).await {
                                                     Ok(outcome)=>publish(&state,outcome),
                                                     Err(error)=>state.update(State::Failed,error_text(error),None),
                                                 }
@@ -379,6 +379,41 @@ fn publish(control: &Control, outcome: DraftOutcome) {
         ),
     }
 }
+async fn generate_with_retry(
+    task: &mut DraftTask,
+    instruction: &str,
+    ids: &[String],
+    output: &Path,
+    control: &Control,
+) -> Result<DraftOutcome, DraftError> {
+    // Only inference failures before artifact publication are retryable. Both
+    // attempts and backoff share one deadline; cancellation also covers delay.
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let result = task
+            .generate(instruction, ids, output, control.cancel.clone())
+            .await;
+        if matches!(&result, Err(DraftError::Provider(error)) if error.retryable()) {
+            control.update(
+                State::Running,
+                "The draft provider is temporarily busy or unreachable. Retrying once…",
+                None,
+            );
+            tokio::select! {
+                biased;
+                _ = cancelled(&control.cancel) => {},
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {},
+            }
+            task.generate(instruction, ids, output, control.cancel.clone())
+                .await
+        } else {
+            result
+        }
+    })
+    .await
+    .unwrap_or(Err(DraftError::Provider(
+        jarvis::providers::ProviderError::Timeout,
+    )))
+}
 fn error_text(error: DraftError) -> &'static str {
     match error {
         DraftError::Configuration(_) => {
@@ -390,8 +425,32 @@ fn error_text(error: DraftError) -> &'static str {
         DraftError::Provider(jarvis::providers::ProviderError::Timeout) => {
             "The draft model took too long to answer. Please try again."
         }
-        DraftError::Provider(_) => {
-            "The draft model could not complete its response. Please try again."
+        DraftError::Provider(jarvis::providers::ProviderError::Rejected) => {
+            "The draft provider rejected the request. Check the configured worker model and account access."
+        }
+        DraftError::Provider(jarvis::providers::ProviderError::RateLimited) => {
+            "The draft provider is rate limiting requests. Please try again shortly."
+        }
+        DraftError::Provider(jarvis::providers::ProviderError::ServerUnavailable) => {
+            "The draft provider is temporarily unavailable. Please try again shortly."
+        }
+        DraftError::Provider(jarvis::providers::ProviderError::Transport) => {
+            "The draft provider could not be reached. Check the connection and try again."
+        }
+        DraftError::Provider(jarvis::providers::ProviderError::InvalidResponse) => {
+            "The draft provider returned an unreadable response. Please try again."
+        }
+        DraftError::Provider(jarvis::providers::ProviderError::IncompleteOutput) => {
+            "The draft provider returned an incomplete response. Please ask for a shorter draft."
+        }
+        DraftError::Provider(jarvis::providers::ProviderError::ResponseTooLarge) => {
+            "The draft provider response exceeded its size limit. Please ask for a shorter draft."
+        }
+        DraftError::Provider(jarvis::providers::ProviderError::InvalidConfiguration) => {
+            "The draft provider configuration is invalid. Check the worker model and credential format."
+        }
+        DraftError::Provider(jarvis::providers::ProviderError::InvalidInput) => {
+            "The draft provider input exceeded its limit or contained invalid text. Shorten the request."
         }
         DraftError::Context => "The source context could not be read. No draft was prepared.",
         DraftError::Artifact => {

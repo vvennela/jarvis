@@ -524,3 +524,89 @@ fn voice_delegates_background_draft_stays_conversational_and_opens_only_after_re
     speech.join().unwrap();
     task.join().unwrap();
 }
+
+#[test]
+fn transient_draft_inference_retries_once_and_publishes_only_one_review_artifact() {
+    let temp = support::TempDir::new();
+    let _db = seed(&temp);
+    let peer = Peer::new(vec![429, 200]);
+    let mut worker = peer.worker(&temp, opener(&temp));
+    worker
+        .control
+        .submit("Draft a Beacon handoff".into())
+        .unwrap();
+    wait(|| !worker.control.busy());
+    assert_eq!(worker.control.snapshot().state, State::ReadyForReview);
+    let packets = peer.packets();
+    assert_eq!(packets.len(), 2);
+    for packet in packets {
+        assert_eq!(packet["user_instruction"], "Draft a Beacon handoff");
+        assert_eq!(packet["untrusted_evidence"][0]["version"], 1);
+    }
+    assert_eq!(fs::read_dir(temp.join("drafts")).unwrap().count(), 1);
+    assert!(!temp.join("opened-args").exists());
+    finish(&mut worker);
+}
+
+#[test]
+fn persistent_rate_limit_and_auth_failure_expose_safe_reason_without_unbounded_retry() {
+    for (statuses, count, label) in [
+        (vec![429, 429], 2, "limit"),
+        (vec![401], 1, "authentication"),
+    ] {
+        let temp = support::TempDir::new();
+        let _db = seed(&temp);
+        let peer = Peer::new(statuses);
+        let mut worker = peer.worker(&temp, opener(&temp));
+        worker
+            .control
+            .submit("Draft a Beacon handoff".into())
+            .unwrap();
+        wait(|| !worker.control.busy());
+        let result = worker.control.snapshot();
+        assert_eq!(result.state, State::Failed);
+        assert!(result.path.is_none());
+        assert_eq!(peer.packets().len(), count);
+        assert!(
+            result.text.to_ascii_lowercase().contains(label),
+            "safe failure class missing: {}",
+            result.text
+        );
+        assert!(!result.text.contains("PRIVATE_ERROR_BODY"));
+        assert!(!result.text.contains("fixture-secret-key"));
+        assert_eq!(fs::read_dir(temp.join("drafts")).unwrap().count(), 0);
+        assert!(!temp.join("opened-args").exists());
+        finish(&mut worker);
+    }
+}
+
+#[test]
+fn cancelling_draft_during_retry_backoff_prevents_second_provider_call_and_artifact() {
+    let temp = support::TempDir::new();
+    let _db = seed(&temp);
+    let peer = Peer::new(vec![429, 200]);
+    let mut worker = peer.worker(&temp, opener(&temp));
+    worker
+        .control
+        .submit("Draft a Beacon handoff".into())
+        .unwrap();
+    wait(|| {
+        worker
+            .control
+            .snapshot()
+            .text
+            .to_ascii_lowercase()
+            .contains("retry")
+    });
+    assert_eq!(peer.packets().len(), 1);
+    assert_eq!(fs::read_dir(temp.join("drafts")).unwrap().count(), 0);
+    worker.control.cancel();
+    let start = Instant::now();
+    wait(|| !worker.control.busy());
+    assert!(start.elapsed() < Duration::from_millis(400));
+    assert_eq!(worker.control.snapshot().state, State::Cancelled);
+    thread::sleep(Duration::from_millis(2200));
+    assert_eq!(peer.packets().len(), 1, "cancelled retry reached provider");
+    assert_eq!(fs::read_dir(temp.join("drafts")).unwrap().count(), 0);
+    finish(&mut worker);
+}
