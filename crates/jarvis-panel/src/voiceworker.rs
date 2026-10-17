@@ -1,4 +1,4 @@
-//! User-initiated local recording; microphone and Whisper live off the UI thread.
+//! User-initiated local recording; microphone capture and Apple transcription run off the UI thread.
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
 use std::{
@@ -40,8 +40,8 @@ pub enum VoiceFailure {
 impl VoiceFailure {
     fn message(self) -> &'static str {
         match self {
-            Self::MissingModel => "Set JARVIS_WHISPER_MODEL_PATH to a local Whisper model",
-            Self::Model => "Check the local Whisper model file",
+            Self::MissingModel => "Install the bundled Apple speech helper",
+            Self::Model => "Prepare the local Apple speech assets",
             Self::Microphone => {
                 "Check microphone access in macOS Privacy & Security and Sound settings"
             }
@@ -173,14 +173,17 @@ impl VoiceWorker {
             let settings = jarvis::conversation::load_provider_settings()
                 .map_err(|_| VoiceFailure::MissingModel)?;
             let path = settings
-                .get("JARVIS_WHISPER_MODEL_PATH")
+                .get("JARVIS_APPLE_STT_PATH")
                 .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::current_exe().ok().and_then(|path| {
+                        path.parent().map(|parent| parent.join("jarvis-apple-stt"))
+                    })
+                })
                 .ok_or(VoiceFailure::MissingModel)?;
-            if !path.is_absolute() {
-                return Err(VoiceFailure::MissingModel);
-            }
             let transcriber =
-                jarvis_voice::Transcriber::load(&path).map_err(|_| VoiceFailure::Model)?;
+                jarvis_voice::apple::AppleTranscriber::new(path, Duration::from_secs(20))
+                    .map_err(|_| VoiceFailure::Model)?;
             Ok(Box::new(NativeBackend {
                 transcriber,
                 session: None,
@@ -367,7 +370,7 @@ impl Drop for VoiceWorker {
 
 #[cfg(target_os = "macos")]
 struct NativeBackend {
-    transcriber: jarvis_voice::Transcriber,
+    transcriber: jarvis_voice::apple::AppleTranscriber,
     session: Option<jarvis_voice::capture::CaptureSession>,
 }
 #[cfg(target_os = "macos")]
@@ -404,9 +407,9 @@ impl VoiceBackend for NativeBackend {
         cancelled: Arc<AtomicBool>,
     ) -> Result<String, VoiceFailure> {
         self.transcriber
-            .transcribe_command_cancelled(samples, cancelled)
+            .transcribe(samples, cancelled)
             .map_err(|error| {
-                if error == jarvis_voice::VoiceError::Cancelled {
+                if error == jarvis_voice::apple::AppleSpeechError::Cancelled {
                     VoiceFailure::Cancelled
                 } else {
                     VoiceFailure::Transcription

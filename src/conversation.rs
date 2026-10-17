@@ -659,6 +659,8 @@ pub fn load_provider_settings() -> Result<HashMap<String, String>, ConversationE
         "JARVIS_WORKER_MODEL",
         "JARVIS_CODING_PROJECT",
         "JARVIS_WHISPER_MODEL_PATH",
+        "JARVIS_APPLE_STT_PATH",
+        "JARVIS_OPENWAKEWORD_MODEL_DIR",
         "JARVIS_KWS_MODEL_DIR",
         "JARVIS_VAD_MODEL_PATH",
         "JARVIS_MICROPHONE_NAME",

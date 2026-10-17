@@ -345,6 +345,7 @@ fn capture_overflow_discards_pending_wake_and_command_mailbox_has_backpressure()
 
 #[test]
 #[ignore = "requires explicit local model and generated wake-command WAV"]
+#[cfg(feature = "whisper")]
 fn opt_in_real_whisper_audio_reaches_wake_command_without_microphone() {
     let model = std::env::var_os("JARVIS_TEST_WHISPER_MODEL")
         .expect("set JARVIS_TEST_WHISPER_MODEL to an existing trusted local model");

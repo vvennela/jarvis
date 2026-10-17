@@ -20,9 +20,10 @@ use objc2::{
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSColor,
     NSEventMask, NSFloatingWindowLevel, NSFont, NSGlassEffectView, NSGlassEffectViewStyle, NSImage,
-    NSPanel, NSProgressIndicator, NSProgressIndicatorStyle, NSScreen, NSScrollView, NSStatusBar,
-    NSTextField, NSTextView, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
-    NSVisualEffectState, NSVisualEffectView, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSPanel, NSProgressIndicator, NSProgressIndicatorStyle, NSScreen, NSScrollView, NSSound,
+    NSStatusBar, NSTextField, NSTextView, NSView, NSVisualEffectBlendingMode,
+    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindowCollectionBehavior,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSDate, NSDefaultRunLoopMode, NSObject, NSObjectProtocol, NSPoint, NSRect,
@@ -569,6 +570,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     let mut voice_unchanged_after_dismiss = false;
     let mut menu_toggle_revealed = false;
     let mut interaction_revealed = false;
+    let mut audible_wake_count = 0;
     let mut wake_idle_since: Option<Instant> = None;
     let started = Instant::now();
     let mut next_voice_diagnostic = Duration::ZERO;
@@ -747,6 +749,14 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             wake_idle_since = None;
         }
         let voice_snapshot = voice.control.snapshot();
+        if voice_snapshot.diagnostics.wake_matches > audible_wake_count {
+            audible_wake_count = voice_snapshot.diagnostics.wake_matches;
+            if !options.smoke_test
+                && let Some(chime) = NSSound::soundNamed(&NSString::from_str("Tink"))
+            {
+                let _ = chime.play();
+            }
+        }
         let working = conversation.control.busy()
             || tasks.control.busy()
             || coding.as_ref().is_some_and(|worker| worker.control.busy())
@@ -891,7 +901,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             }
         } else {
             match voice_snapshot.state {
-                wakeworker::State::WakeListening => "Listening for Jarvis",
+                wakeworker::State::WakeListening => "Listening for Hey Jarvis",
                 wakeworker::State::CommandListening => "I'm listening…",
                 wakeworker::State::Decoding => "One moment…",
                 wakeworker::State::Loading | wakeworker::State::Starting => "Starting…",

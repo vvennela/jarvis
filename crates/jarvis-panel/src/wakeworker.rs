@@ -316,23 +316,25 @@ impl WakeWorker {
     pub fn from_env() -> Result<Self, &'static str> {
         Self::with_backend(|| {
             let settings = jarvis::conversation::load_provider_settings()
-                .map_err(|_| "Set JARVIS_WHISPER_MODEL_PATH")?;
-            let path = std::path::PathBuf::from(
-                settings
-                    .get("JARVIS_WHISPER_MODEL_PATH")
-                    .ok_or("Set JARVIS_WHISPER_MODEL_PATH")?,
-            );
-            if !path.is_absolute() {
-                return Err("Choose an absolute Whisper model path");
-            }
-            let transcriber = jarvis_voice::Transcriber::load(&path)
-                .map_err(|_| "Check the local Whisper model")?;
+                .map_err(|_| "Check the local voice configuration")?;
+            let helper = settings
+                .get("JARVIS_APPLE_STT_PATH")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::current_exe().ok().and_then(|path| {
+                        path.parent().map(|parent| parent.join("jarvis-apple-stt"))
+                    })
+                })
+                .ok_or("Install the Apple speech helper")?;
+            let transcriber =
+                jarvis_voice::apple::AppleTranscriber::new(helper, Duration::from_secs(20))
+                    .map_err(|_| "Install the Apple speech helper")?;
             let keyword_path = std::path::PathBuf::from(
                 settings
-                    .get("JARVIS_KWS_MODEL_DIR")
-                    .ok_or("Set JARVIS_KWS_MODEL_DIR to the local keyword model")?,
+                    .get("JARVIS_OPENWAKEWORD_MODEL_DIR")
+                    .ok_or("Set JARVIS_OPENWAKEWORD_MODEL_DIR to the local wake models")?,
             );
-            let keyword = jarvis_voice::kws::LocalKeywordSpotter::load(&keyword_path)?;
+            let keyword = jarvis_voice::openwakeword::LocalWakeSpotter::load(&keyword_path)?;
             let vad_path = std::path::PathBuf::from(
                 settings
                     .get("JARVIS_VAD_MODEL_PATH")
@@ -500,11 +502,35 @@ impl WakeWorker {
                         keyword_audio.clear();
                         followup_armed = true;
                     }
-                    if c.command
+                    let command_pending = c
+                        .command
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
-                        .is_some()
-                    {
+                        .is_some();
+                    if command_pending {
+                        // One command may wait for the conversation worker. Keep
+                        // hardware healthy without building an ambient audio backlog.
+                        match backend.poll() {
+                            Ok((samples, overflow)) => {
+                                c.capture_diagnostics(backend.capture_diagnostics());
+                                c.audio(&samples, overflow);
+                                if overflow {
+                                    c.invalidate();
+                                    c.input(backend.input_info(), backend.listening_message());
+                                }
+                            }
+                            Err(message) => {
+                                backend.stop();
+                                running = false;
+                                c.capture_error();
+                                c.enabled.store(false, Ordering::Release);
+                                c.invalidate();
+                                c.publish(State::Failed, message);
+                                while !c.enabled() && !c.stopped.load(Ordering::Acquire) {
+                                    thread::sleep(Duration::from_millis(20));
+                                }
+                            }
+                        }
                         thread::sleep(Duration::from_millis(20));
                         continue;
                     }
@@ -826,8 +852,8 @@ pub fn same_input_device(left: &str, right: &str) -> bool {
 
 #[cfg(target_os = "macos")]
 struct NativeBackend {
-    transcriber: jarvis_voice::Transcriber,
-    keyword: jarvis_voice::kws::LocalKeywordSpotter,
+    transcriber: jarvis_voice::apple::AppleTranscriber,
+    keyword: jarvis_voice::openwakeword::LocalWakeSpotter,
     vad: jarvis_voice::vad::LocalVoiceActivity,
     capture: Option<jarvis_voice::capture::ContinuousCapture>,
     input_follower: Option<jarvis_voice::capture::DefaultInputFollower>,
@@ -887,7 +913,7 @@ impl NativeBackend {
 #[cfg(target_os = "macos")]
 impl WakeBackend for NativeBackend {
     fn wake_fallback_enabled(&self) -> bool {
-        true
+        false
     }
     fn speech_activity(&mut self, samples: &[f32]) -> Result<Option<Vec<bool>>, &'static str> {
         self.vad.classify(samples).map(Some)
@@ -920,6 +946,7 @@ impl WakeBackend for NativeBackend {
         self.fallback_name
             .as_ref()
             .map(|_| "AirPods microphone stopped responding. Using the MacBook microphone.")
+            .or(Some("Wake listening · say Hey Jarvis"))
     }
     fn start(&mut self) -> Result<(), &'static str> {
         self.silent_stream.reset();
@@ -1062,7 +1089,7 @@ impl WakeBackend for NativeBackend {
         cancelled: Arc<AtomicBool>,
     ) -> Result<String, &'static str> {
         self.transcriber
-            .transcribe_cancelled(samples, cancelled)
+            .transcribe(samples, cancelled)
             .map_err(|_| "Try saying Jarvis again")
     }
 
@@ -1072,7 +1099,7 @@ impl WakeBackend for NativeBackend {
         cancelled: Arc<AtomicBool>,
     ) -> Result<String, &'static str> {
         self.transcriber
-            .transcribe_command_cancelled(samples, cancelled)
+            .transcribe(samples, cancelled)
             .map_err(|_| "Try saying Jarvis again")
     }
 }

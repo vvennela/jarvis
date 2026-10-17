@@ -41,7 +41,8 @@ fi
 # Finder's shell environment may omit Homebrew and rustup's binary directories.
 export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.cargo/bin:$PATH"
 cd -- "$repo_dir"
-cargo build --release --features metal --manifest-path "$repo_dir/Cargo.toml" --target-dir "$repo_dir/target" -p jarvis-panel
+cargo build --release --manifest-path "$repo_dir/Cargo.toml" --target-dir "$repo_dir/target" -p jarvis-panel
+xcrun swiftc -parse-as-library -O -target "$(uname -m)-apple-macos26.0" "$repo_dir/native/AppleSpeech.swift" -o "$repo_dir/target/release/jarvis-apple-stt"
 mkdir -p "$repo_dir/runtime"
 # Documents can be managed by a file provider that adds Finder/resource metadata
 # after signing. Keep the native executable in local Application Support instead.
@@ -52,6 +53,8 @@ trap 'rm -rf -- "$staging_dir"' EXIT
 staging_app="$staging_dir/Jarvis.app"
 mkdir -p "$staging_app/Contents/MacOS"
 cp -X "$repo_dir/target/release/jarvis-panel" "$staging_app/Contents/MacOS/jarvis-panel"
+cp -X "$repo_dir/target/release/jarvis-apple-stt" "$staging_app/Contents/MacOS/jarvis-apple-stt"
+/usr/bin/codesign --force --sign - --timestamp=none "$staging_app/Contents/MacOS/jarvis-apple-stt"
 cp -X "$repo_dir/crates/jarvis-panel/Info.plist" "$staging_app/Contents/Info.plist"
 chmod 755 "$staging_app/Contents/MacOS/jarvis-panel"
 /usr/bin/plutil -lint "$staging_app/Contents/Info.plist" >/dev/null

@@ -250,7 +250,7 @@ fn opt_in_normal_bundle_stays_alive_until_explicit_termination() {
 }
 
 #[test]
-fn launcher_requests_release_metal_and_packages_the_matching_profile_binary() {
+fn launcher_requests_release_and_packages_matching_binary_and_apple_helper() {
     // Intercept the real launcher's build boundary before signing/installing or
     // invoking any native program. This proves argv/profile selection only.
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -272,7 +272,10 @@ fn launcher_requests_release_metal_and_packages_the_matching_profile_binary() {
     let args: Vec<_> = args.lines().collect();
     assert_eq!(args[0], "build");
     assert!(args.contains(&"--release"));
-    assert!(args.windows(2).any(|pair| pair == ["--features", "metal"]));
+    assert!(
+        !args.contains(&"metal"),
+        "Apple owns speech acceleration; no legacy Whisper Metal build"
+    );
     assert!(args.windows(2).any(|pair| pair == ["-p", "jarvis-panel"]));
     let source = std::fs::read_to_string(launcher).unwrap();
     assert!(
@@ -282,4 +285,13 @@ fn launcher_requests_release_metal_and_packages_the_matching_profile_binary() {
         "packaging must copy the release artifact requested above"
     );
     assert!(!source.contains("target/debug/jarvis-panel"));
+    assert!(source.lines().any(|line| line.starts_with("xcrun swiftc ")
+        && line.contains("$repo_dir/native/AppleSpeech.swift")
+        && line.contains("$repo_dir/target/release/jarvis-apple-stt")));
+    assert!(
+        source.lines().any(|line| line.starts_with("cp -X ")
+            && line.contains("$repo_dir/target/release/jarvis-apple-stt")
+            && line.contains("$staging_app/Contents/MacOS/jarvis-apple-stt")),
+        "bundle must contain the same compiled Apple helper"
+    );
 }

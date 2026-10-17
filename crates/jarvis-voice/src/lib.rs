@@ -1,24 +1,25 @@
 #![forbid(unsafe_code)]
-//! Local bounded speech transcription. Keep one Transcriber resident across
-//! utterances; it reuses the loaded model and inference state. No microphone is
-//! opened implicitly and transcription uses no cloud service.
+//! Bounded local audio, wake detection, and Apple speech transcription.
+//! Microphones open only through explicit capture APIs. The optional Whisper
+//! feature retains the standalone offline WAV utility.
 
+#[cfg(unix)]
+pub mod apple;
 pub mod capture;
 #[cfg(target_os = "macos")]
 pub mod kws;
 #[cfg(target_os = "macos")]
+pub mod openwakeword;
+#[cfg(target_os = "macos")]
 pub mod vad;
 
-use std::{
-    fmt,
-    fs::File,
-    io::Read,
-    path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+#[cfg(feature = "whisper")]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
+use std::{fmt, fs::File, io::Read, path::Path};
+#[cfg(feature = "whisper")]
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
 };
@@ -66,11 +67,13 @@ impl std::error::Error for VoiceError {}
 /// Model/state are retained together; the caller's PCM slice is borrowed.
 /// Native scratch state and latest decoder output are reused between calls;
 /// whisper-rs owns those allocations through its safe wrapper API.
+#[cfg(feature = "whisper")]
 pub struct Transcriber {
     state: WhisperState,
     _context: WhisperContext,
 }
 
+#[cfg(feature = "whisper")]
 impl Transcriber {
     /// Cancellation is checked before and after native inference. A running
     /// native decode finishes before returning; cancelled output is discarded.

@@ -1,5 +1,5 @@
 //! Dedicated keyword backend simulation through the real wake worker, no microphone.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "whisper"))]
 #[path = "../../../tests/support/mod.rs"]
 mod support;
 use jarvis_panel::wakeworker::{KeywordStatus, State, WakeBackend, WakeWorker};
@@ -173,6 +173,7 @@ fn dedicated_spotter_mute_suppression_and_overflow_drop_pending_wake_and_late_re
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires explicit trusted KWS/Whisper models and generated command WAV; no microphone"]
+#[cfg(feature = "whisper")]
 fn opt_in_real_keyword_and_whisper_worker_preserves_same_breath_request() {
     struct LocalBackend {
         kws: jarvis_voice::kws::LocalKeywordSpotter,
@@ -553,7 +554,7 @@ fn queued_primary_keyword_supersedes_old_fallback_transcript_without_double_wake
 /// The same production handoff used by AppKit, with a listening loopback socket
 /// and real conversation/speech workers. Any ambient forwarding reaches this
 /// socket or changes worker state; no external provider can be contacted.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "whisper"))]
 struct NegativeDownstream {
     _directory: support::TempDir,
     listener: std::net::TcpListener,
@@ -561,7 +562,7 @@ struct NegativeDownstream {
     speech: jarvis_panel::speech::SpeechWorker,
     handoff: jarvis_panel::voicehandoff::VoiceHandoff,
 }
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "whisper"))]
 impl NegativeDownstream {
     fn new() -> Self {
         use jarvis::{

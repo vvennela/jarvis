@@ -121,6 +121,7 @@ struct AudioFixture {
     chunks: Mutex<VecDeque<Vec<f32>>>,
     texts: Mutex<VecDeque<String>>,
     decodes: AtomicUsize,
+    polls: AtomicUsize,
 }
 impl AudioFixture {
     fn utterance(&self, text: &str) {
@@ -137,6 +138,7 @@ impl WakeBackend for Backend {
     }
     fn stop(&mut self) {}
     fn poll(&mut self) -> Result<(Vec<f32>, bool), &'static str> {
+        self.0.polls.fetch_add(1, Ordering::Release);
         Ok((
             self.0
                 .chunks
@@ -205,6 +207,10 @@ fn woken_question_uses_shared_context_and_reply_reaches_owned_speech_child_once(
     wake.control.set_enabled(true);
     // The same handoff object is called by the production native panel loop.
     let mut handoff = jarvis_panel::voicehandoff::VoiceHandoff::default();
+    wait(|| {
+        handoff.tick(&wake.control, &chat.control, &speech.control);
+        audio.polls.load(Ordering::Acquire) >= 2
+    });
     audio.utterance("ordinary ambient words");
     wait(|| {
         handoff.tick(&wake.control, &chat.control, &speech.control);
@@ -293,6 +299,8 @@ impl FailureLoop {
         let wake = WakeWorker::with_backend(move || Ok(Box::new(Backend(backend)))).unwrap();
         wait(|| speech.control.available() && chat.control.available());
         wake.control.set_enabled(true);
+        // Observe the actual startup drain before injecting new speech.
+        wait(|| audio.polls.load(Ordering::Acquire) >= 2);
         Self {
             dir,
             chat,
@@ -410,6 +418,7 @@ fn cancelled_voice_request_does_not_speak_late_provider_failure() {
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires trusted local KWS/VAD/Whisper models and generated command WAV; synthesizes an owned audio file, no microphone or playback"]
+#[cfg(feature = "whisper")]
 fn generated_speech_reaches_real_local_recognition_conversation_and_local_speech_synthesis() {
     use jarvis_panel::wakeworker::KeywordStatus;
     struct LocalBackend {
@@ -553,4 +562,59 @@ fn generated_speech_reaches_real_local_recognition_conversation_and_local_speech
     println!(
         "generated_speech_local_models=true cloud_response=localhost_fixture speech_file_verified=true requests=1 microphone=false audible_playback=false"
     );
+}
+
+#[test]
+fn slow_model_keeps_wake_available_and_holds_exactly_one_following_command() {
+    let peer = Peer::responding("A fixture response.", 200, Duration::from_millis(700));
+    let mut fixture = FailureLoop::new(&peer);
+    wait(|| {
+        fixture.tick();
+        fixture.audio.polls.load(Ordering::Acquire) >= 2
+    });
+    fixture.audio.utterance("Jarvis first question");
+    wait(|| {
+        fixture.tick();
+        peer.requests.lock().unwrap().len() == 1
+    });
+    assert!(fixture.chat.control.busy());
+    assert_ne!(
+        fixture.wake.control.snapshot().state,
+        jarvis_panel::wakeworker::State::Suppressed
+    );
+    fixture.audio.utterance("Jarvis second question");
+    wait(|| {
+        fixture.tick();
+        fixture.audio.decodes.load(Ordering::Acquire) >= 2
+            && fixture.wake.control.snapshot().state
+                == jarvis_panel::wakeworker::State::CommandReady
+    });
+    assert_eq!(
+        peer.requests.lock().unwrap().len(),
+        1,
+        "second request ran concurrently"
+    );
+    fixture.audio.utterance("Jarvis stale third question");
+    wait(|| {
+        fixture.tick();
+        peer.requests.lock().unwrap().len() == 2
+    });
+    fs::write(fixture.dir.join("release"), b"done").unwrap();
+    wait(|| {
+        fixture.tick();
+        !fixture.chat.control.busy()
+    });
+    fixture.settle();
+    let requests = peer.requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "queued audio was replayed after the bounded command slot"
+    );
+    let wire = requests[1].to_string();
+    assert!(
+        wire.contains("second question"),
+        "unexpected synthetic request: {wire}"
+    );
+    assert!(!wire.contains("stale third question"));
 }

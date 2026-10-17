@@ -286,7 +286,14 @@ impl VoiceHandoff {
         {
             match reply.state {
                 chat::State::Reply | chat::State::Failed | chat::State::Unavailable
-                    if !conversation.busy() && !playback.busy() =>
+                    if !conversation.busy()
+                        && !playback.busy()
+                        && !matches!(
+                            wake.snapshot().state,
+                            wakeworker::State::CommandListening
+                                | wakeworker::State::Decoding
+                                | wakeworker::State::CommandReady
+                        ) =>
                 {
                     let mut end = reply.text.len().min(speech::MAX_TEXT_BYTES);
                     while !reply.text.is_char_boundary(end) {
@@ -420,8 +427,9 @@ impl VoiceHandoff {
                     Some((reply.revision, conversation.cancellation_epoch()));
             }
         }
-        // Stop capture during owned output and clear buffered audio before resuming.
-        wake.suppress(playback.busy() || conversation.busy());
+        // Keep wake recognition responsive while the provider is thinking.
+        // Owned audible output still suppresses recognition and discards echo.
+        wake.suppress(playback.busy());
         command
     }
 }

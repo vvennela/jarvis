@@ -1,13 +1,15 @@
-//! Local audio validation and opt-in actual Whisper inference. No downloads or microphone use.
+#[cfg(feature = "whisper")]
+use jarvis_voice::Transcriber;
+#[cfg(feature = "whisper")]
+use std::process::Command;
+// Local audio validation and opt-in actual Whisper inference. No downloads or microphone use.
 use jarvis_voice::{
-    MAX_MODEL_BYTES, MAX_SAMPLES, SAMPLE_RATE, Transcriber, load_wav, validate_audio,
-    validate_model_file,
+    MAX_MODEL_BYTES, MAX_SAMPLES, SAMPLE_RATE, load_wav, validate_audio, validate_model_file,
 };
 use std::{
     fs,
     io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    process::Command,
     sync::atomic::{AtomicU64, Ordering},
 };
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -123,6 +125,7 @@ fn invalid_model_paths_and_headers_fail_preflight_without_native_inference() {
     ] {
         fs::write(&path, data).unwrap();
         assert!(validate_model_file(&path).is_err());
+        #[cfg(feature = "whisper")]
         assert!(Transcriber::load(&path).is_err());
     }
     let mut oversized = fs::File::create(&path).unwrap();
@@ -149,6 +152,7 @@ fn model_and_audio_symlinks_are_not_followed() {
 }
 
 #[test]
+#[cfg(feature = "whisper")]
 fn cli_rejects_invalid_requests_without_writes_or_success_transcript() {
     let dir = TempDir::new();
     for args in [
@@ -171,6 +175,7 @@ fn cli_rejects_invalid_requests_without_writes_or_success_transcript() {
 
 #[test]
 #[ignore = "requires explicit local model and generated audio fixture"]
+#[cfg(feature = "whisper")]
 fn opt_in_real_model_transcribes_generated_fixture_twice_without_reloading_file() {
     let (Some(model), Some(audio)) = (
         std::env::var_os("JARVIS_TEST_WHISPER_MODEL"),
@@ -227,6 +232,7 @@ fn opt_in_real_model_transcribes_generated_fixture_twice_without_reloading_file(
 
 #[test]
 #[ignore = "requires explicit local model and generated command fixture"]
+#[cfg(feature = "whisper")]
 fn command_decoder_recognizes_fast_public_fixture_and_respects_bounds_and_precancellation() {
     use jarvis_voice::VoiceError;
     use std::sync::{Arc, atomic::AtomicBool};
