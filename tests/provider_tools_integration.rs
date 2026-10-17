@@ -360,8 +360,8 @@ async fn expanded_registry_accepts_exact_bound_and_rejects_one_more_before_http(
         })
         .collect();
     assert_eq!(
-        MAX_TOOL_SPECS, 12,
-        "the full browser/file registry must fit"
+        MAX_TOOL_SPECS, 16,
+        "the full browser/file/music registry must fit"
     );
     let peer = Peer::new(vec![text_response()], Duration::ZERO);
     let client = peer.client();

@@ -302,7 +302,9 @@ async fn named_artist_uses_model_catalog_and_verified_playback_instead_of_legacy
     );
     assert_eq!(discovery.packets().len(), 2);
     let args = fs::read_to_string(dir.join("artist-args")).unwrap();
-    assert!(args.ends_with(&format!("spotify:artist:{artist_id}\n{name}\n")));
+    assert!(args.ends_with(&format!(
+        "spotify:artist:{artist_id}\n{name}\nspotify:artist:{artist_id}\n"
+    )));
     chat.control.stop();
     wait(|| chat.is_finished()).await;
     chat.join().unwrap();
@@ -563,4 +565,46 @@ async fn completed_task_notice_does_not_discard_an_already_queued_voice_question
     chat.join().unwrap();
     speech.join().unwrap();
     tasks.join().unwrap();
+}
+
+#[tokio::test]
+async fn cancelling_a_completed_clarification_revokes_its_action_authority() {
+    let dir = TempDir::new();
+    seed(&dir);
+    let model = Peer::new(vec![
+        json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":[{"id":"question","type":"function","function":{"name":"ask_user","arguments":"{\"question\":\"Which browser?\"}"}}]}}]}),
+        json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":[{"id":"open","type":"function","function":{"name":"open_application","arguments":"{\"app\":\"Safari\"}"}}]}}]}),
+    ]).await;
+    let executable = script(
+        &dir,
+        "app",
+        "printf 'effect' > \"${0%/*}/effect\"\nprintf 'verified:running\\n'",
+    );
+    let apps = AppExecutor::with_executable(
+        AppPreferences::default(),
+        executable.clone(),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let runtime = Arc::new(ToolRuntime::read_only(dir.join("context.db")).with_apps(apps));
+    let action = ActionExecutor::with_executable(executable, Duration::from_secs(1)).unwrap();
+    let conversation = Conversation::new(dir.join("context.db"), None, model.client());
+    let mut chat =
+        ConversationWorker::with_factory_and_tools(move || Ok(conversation), action, runtime)
+            .unwrap();
+    wait(|| chat.control.available()).await;
+    chat.control.submit("Open the browser".into()).unwrap();
+    wait(|| !chat.control.busy()).await;
+    assert!(chat.control.snapshot().needs_followup);
+    chat.control.cancel();
+    chat.control.submit("Safari".into()).unwrap();
+    wait(|| !chat.control.busy()).await;
+    assert_eq!(model.packets().len(), 2);
+    assert!(
+        !dir.join("effect").exists(),
+        "cancelled question must not authorize a later bare target"
+    );
+    chat.control.stop();
+    wait(|| chat.is_finished()).await;
+    chat.join().unwrap();
 }

@@ -174,7 +174,13 @@ impl SpotifyPlayback {
             return Err(PlaybackError::Timeout);
         }
         let mut child = tokio::process::Command::new(&self.executable)
-            .args(["-e", PLAY_ARTIST_SCRIPT, artist.uri(), artist.name()])
+            .args([
+                "-e",
+                PLAY_ARTIST_SCRIPT,
+                artist.uri(),
+                artist.name(),
+                artist.track_uri().unwrap_or(artist.uri()),
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -239,6 +245,9 @@ impl SpotifyPlayback {
             .ok_or(PlaybackError::Verification)?;
         if observed.state.as_deref() != Some("playing")
             || track_id != url_id
+            || artist
+                .track_uri()
+                .is_some_and(|uri| track_identifier(uri) != Some(track_id))
             || observed.artist.as_deref().is_none_or(|name| {
                 name.chars().any(char::is_control) || normalized(name) != normalized(artist.name())
             })
@@ -291,10 +300,15 @@ use scripting additions
 on run argv
 set artistURI to item 1 of argv
 set expectedArtist to item 2 of argv
+set requestedTrackURI to item 3 of argv
 try
 tell application id "com.spotify.client"
 launch
+if requestedTrackURI is artistURI then
 play track artistURI
+else
+play track requestedTrackURI in context artistURI
+end if
 repeat 60 times
 set playbackState to player state as text
 if playbackState is "playing" then
@@ -306,7 +320,8 @@ set matched to actualArtist is expectedArtist
 end ignoring
 set stableTrack to trackID is (id of current track as text)
 set stillPlaying to (player state as text) is "playing"
-if matched and stableTrack and stillPlaying then
+set matchedTrack to requestedTrackURI is artistURI or trackURL is requestedTrackURI or trackID is requestedTrackURI
+if matched and matchedTrack and stableTrack and stillPlaying then
 set payload to current application's NSDictionary's dictionaryWithObjects:{"observed", playbackState, actualArtist, trackID, trackURL} forKeys:{"status", "state", "artist", "track_id", "track_url"}
 set jsonData to current application's NSJSONSerialization's dataWithJSONObject:payload options:0 |error|:(missing value)
 set jsonText to current application's NSString's alloc()'s initWithData:jsonData encoding:(current application's NSUTF8StringEncoding)

@@ -419,10 +419,11 @@ async fn arbitrary_verified_artists_are_uri_arguments_and_acknowledged_only_afte
         let args = fs::read_to_string(dir.join("args")).unwrap();
         let lines = args.lines().collect::<Vec<_>>();
         assert_eq!(lines[0], "-e");
-        assert_eq!(lines[lines.len() - 2], format!("spotify:artist:{id}"));
-        assert_eq!(lines[lines.len() - 1], name);
+        assert_eq!(lines[lines.len() - 3], format!("spotify:artist:{id}"));
+        assert_eq!(lines[lines.len() - 1], format!("spotify:artist:{id}"));
+        assert_eq!(lines[lines.len() - 2], name);
         assert!(
-            !lines[1..lines.len() - 2].join("\n").contains(name),
+            !lines[1..lines.len() - 3].join("\n").contains(name),
             "artist was interpolated into executable code"
         );
     }
@@ -708,12 +709,12 @@ async fn artist_names_that_begin_with_command_words_or_contain_punctuation_keep_
                 "the command prefix consumed part of the artist name"
             );
             let args = fs::read_to_string(dir.join("args")).unwrap();
-            assert_eq!(args.lines().last(), Some(name));
+            assert_eq!(args.lines().rev().nth(1), Some(name));
             assert!(
                 !args
                     .lines()
                     .skip(1)
-                    .take(args.lines().count() - 3)
+                    .take(args.lines().count() - 4)
                     .collect::<Vec<_>>()
                     .join("\n")
                     .contains(name),
@@ -821,7 +822,9 @@ async fn aliases_merge_only_after_matching_spotify_canonical_entities_and_play_t
     assert!(
         fs::read_to_string(dir.join("args"))
             .unwrap()
-            .ends_with(&format!("spotify:artist:{SECOND_ID}\n{name}\n"))
+            .ends_with(&format!(
+                "spotify:artist:{SECOND_ID}\n{name}\nspotify:artist:{SECOND_ID}\n"
+            ))
     );
 }
 #[tokio::test]
@@ -955,4 +958,89 @@ async fn canonical_embed_redirects_are_not_followed_and_fixture_hosts_stay_loopb
             .await
             .is_err()
     );
+}
+
+fn track(name: &str, id: &str) -> Value {
+    json!({"uri":format!("spotify:track:{id}"),"subtitle":name,"entityType":"track","isPlayable":true,"playabilityReason":"PLAYABLE"})
+}
+#[tokio::test]
+async fn verified_artist_track_is_a_literal_argument_and_current_other_track_cannot_pass() {
+    let name = "Aurora Fixture Quartet";
+    let mut state = embed_entity(name, FIRST_ID);
+    state["props"]["pageProps"]["state"]["data"]["entity"]["trackList"] = json!([
+        track("Wrong Fixture Artist", FIRST_ID),
+        track(name, SECOND_ID)
+    ]);
+    let url = format!("https://open.spotify.com/artist/{FIRST_ID}");
+    let peer = Peer::new(vec![search(&[&url]), oembed(name), embed_html(state)]).await;
+    let artist = canonical_catalog(&peer, Duration::from_secs(2))
+        .resolve_artist(name)
+        .await
+        .unwrap();
+    assert_eq!(
+        artist.track_uri(),
+        Some(format!("spotify:track:{SECOND_ID}").as_str())
+    );
+    let dir = TempDir::new();
+    let playback = SpotifyPlayback::with_executable(
+        executable(&dir, &observed(name).to_string()),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    playback
+        .play_artist(&format!("play some {name}"), &artist)
+        .await
+        .unwrap();
+    let args = fs::read_to_string(dir.join("args")).unwrap();
+    assert!(args.ends_with(&format!(
+        "spotify:artist:{FIRST_ID}\n{name}\nspotify:track:{SECOND_ID}\n"
+    )));
+    let mut stale = observed(name);
+    stale["track_id"] = json!(format!("spotify:track:{FIRST_ID}"));
+    stale["track_url"] = json!(format!("https://open.spotify.com/track/{FIRST_ID}"));
+    let playback = SpotifyPlayback::with_executable(
+        executable(&dir, &stale.to_string()),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    assert!(
+        playback
+            .play_artist(&format!("play {name}"), &artist)
+            .await
+            .is_err(),
+        "old same-artist track passed selected-track verification"
+    );
+}
+
+#[tokio::test]
+async fn unplayable_foreign_or_unbounded_catalog_tracks_never_supply_a_playback_uri() {
+    let name = "Aurora Fixture Quartet";
+    let mut foreign = track(name, FIRST_ID);
+    foreign["uri"] = json!("https://evil.invalid/run");
+    let mut unavailable = track(name, FIRST_ID);
+    unavailable["isPlayable"] = json!(false);
+    let mut blocked = track(name, FIRST_ID);
+    blocked["playabilityReason"] = json!("REGION_RESTRICTED");
+    for tracks in [
+        vec![
+            foreign,
+            unavailable,
+            blocked,
+            track("Wrong artist", FIRST_ID),
+        ],
+        vec![track(name, FIRST_ID); 101],
+    ] {
+        let mut state = embed_entity(name, FIRST_ID);
+        state["props"]["pageProps"]["state"]["data"]["entity"]["trackList"] = json!(tracks);
+        let url = format!("https://open.spotify.com/artist/{FIRST_ID}");
+        let peer = Peer::new(vec![search(&[&url]), oembed(name), embed_html(state)]).await;
+        let result = canonical_catalog(&peer, Duration::from_secs(2))
+            .resolve_artist(name)
+            .await;
+        if tracks.len() > 100 {
+            assert!(result.is_err());
+        } else {
+            assert!(result.unwrap().track_uri().is_none());
+        }
+    }
 }

@@ -156,6 +156,9 @@ impl ConversationWorker {
         if let Ok(apps) = AppExecutor::native() {
             tools = tools.with_apps(apps);
         }
+        if let Ok(opener) = jarvis::web_open::WebOpener::native() {
+            tools = tools.with_web_opener(opener);
+        }
         #[cfg(unix)]
         if let Ok(browser) = jarvis::browser_tools::BrowserClient::native() {
             tools = tools.with_browser(browser);
@@ -259,11 +262,19 @@ impl ConversationWorker {
                     if worker_control.stopping.load(Ordering::Acquire) { break; }
                     let request = tokio::select! {
                         biased;
-                        _ = cancelled.changed() => { continue; }
+                        _ = cancelled.changed() => {
+                            if let Some(conversation) = conversation.as_mut() {
+                                conversation.clear_pending_clarification();
+                            }
+                            continue;
+                        }
                         request = receiver.recv() => { match request { Some(request) => request, None => break } }
                     };
                     if worker_control.stopping.load(Ordering::Acquire) { break; }
                     if *cancelled.borrow() != request.epoch {
+                        if let Some(conversation) = conversation.as_mut() {
+                            conversation.clear_pending_clarification();
+                        }
                         worker_control.update(State::Cancelled, "Request cancelled. File awareness is unchanged.", false);
                         worker_control.busy.store(false, Ordering::Release);
                         continue;
@@ -316,7 +327,12 @@ impl ConversationWorker {
                         }
                     }; // Dropping ask on cancellation prevents successful-turn history commit.
                     match result {
-                        None => worker_control.update(State::Cancelled, "Request cancelled. File awareness is unchanged.", false),
+                        None => {
+                            if let Some(conversation) = conversation.as_mut() {
+                                conversation.clear_pending_clarification();
+                            }
+                            worker_control.update(State::Cancelled, "Request cancelled. File awareness is unchanged.", false);
+                        },
                         Some(Ok(reply)) => {
                             worker_control.update(State::Reply, &reply.text, reply.routing_degraded);
                             worker_control.snapshot.lock().unwrap_or_else(|p|p.into_inner()).needs_followup = reply.needs_followup;

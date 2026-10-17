@@ -8,7 +8,7 @@ use std::{
     io::{Read, Write},
     path::PathBuf,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::Serialize;
@@ -121,6 +121,7 @@ pub struct Conversation {
     history_bytes: usize,
     app_actions_available: bool,
     tool_runtime: Option<Arc<ToolRuntime>>,
+    pending_clarification: Option<(String, Instant)>,
 }
 
 impl Conversation {
@@ -147,6 +148,7 @@ impl Conversation {
             history_bytes: 0,
             app_actions_available: false,
             tool_runtime: None,
+            pending_clarification: None,
         }
     }
 
@@ -161,6 +163,7 @@ impl Conversation {
     }
 
     pub fn record_tool_result(&mut self, question: &str, text: &str) {
+        self.clear_pending_clarification();
         if question.len() <= MAX_QUESTION_BYTES && !question.contains('\0') {
             self.remember(
                 question,
@@ -172,6 +175,7 @@ impl Conversation {
     /// Retain a completed adapter result for conversational follow-ups. This
     /// records an observation at execution time, not ongoing playback state.
     pub fn record_action_result(&mut self, question: &str, result: &crate::actions::ActionResult) {
+        self.clear_pending_clarification();
         if question.len() <= MAX_QUESTION_BYTES && !question.contains('\0') {
             self.remember(
                 question,
@@ -183,6 +187,12 @@ impl Conversation {
     pub fn clear(&mut self) {
         self.history.clear();
         self.history_bytes = 0;
+        self.pending_clarification = None;
+    }
+
+    /// An explicit cancel revokes missing-slot authority without erasing history.
+    pub fn clear_pending_clarification(&mut self) {
+        self.pending_clarification = None;
     }
 
     /// Cancellation by dropping this future leaves retained history unchanged.
@@ -194,23 +204,92 @@ impl Conversation {
         {
             return Err(ConversationError::InvalidQuestion);
         }
+        let resolved = self
+            .pending_clarification
+            .as_ref()
+            .and_then(|(original, at)| {
+                (at.elapsed() < Duration::from_secs(60))
+                    .then(|| crate::request_intent::resolve_action_followup(original, question))
+                    .flatten()
+            });
+        let effective_question = resolved.as_deref().unwrap_or(question);
+        let clauses = match crate::request_intent::command_clauses(effective_question) {
+            Ok(clauses) => clauses,
+            Err(_) => {
+                return Ok(Reply {
+                    text: "Let's do up to three things at a time. Which should I start with?"
+                        .into(),
+                    needs_followup: true,
+                    routing_degraded: false,
+                });
+            }
+        };
         let database = self.database.clone();
-        let query = question.to_owned();
+        let query = effective_question.to_owned();
         let (routing, evidence) = tokio::join!(
-            route_advisory(self.jev.as_ref(), question),
+            route_advisory(self.jev.as_ref(), effective_question),
             tokio::task::spawn_blocking(move || broker::retrieve(database, &query))
         );
         let evidence = evidence
             .map_err(|_| ConversationError::Context)?
             .map_err(|_| ConversationError::Context)?;
-        let input = self.prompt(question, &routing, &evidence)?;
+        let input = self.prompt(effective_question, &routing, &evidence)?;
+        let mut pending = None;
         let reply: ToolReply = if let Some(runtime) = &self.tool_runtime {
-            self.run_tools(question, &input, Arc::clone(runtime))
-                .await?
+            if clauses.len() > 1 {
+                // Each independent clause retains only its own human authority.
+                // Fixed fan-out bounds provider concurrency and retained packets.
+                let conversation = &*self;
+                let run = |index: usize| {
+                    let clause = clauses.get(index).copied();
+                    let runtime = Arc::clone(runtime);
+                    let routing = &routing;
+                    let evidence = &evidence;
+                    async move {
+                        let clause = clause?;
+                        let result = match conversation.prompt(clause, routing, evidence) {
+                            Ok(input) => conversation.run_tools(clause, &input, runtime).await,
+                            Err(error) => Err(error),
+                        };
+                        Some((clause, result))
+                    }
+                };
+                let (first, second, third) = tokio::join!(run(0), run(1), run(2));
+                let mut text = Vec::new();
+                let mut needs_followup = false;
+                for (clause, result) in [first, second, third].into_iter().flatten() {
+                    match result {
+                        Ok(reply) => {
+                            if reply.needs_followup && pending.is_none() {
+                                pending = Some(clause.to_owned());
+                            }
+                            needs_followup |= reply.needs_followup;
+                            text.push(reply.text);
+                        }
+                        Err(_) => text.push(format!(
+                            "I couldn't finish the request to {}.",
+                            clause.trim_end_matches(['.', '!', '?'])
+                        )),
+                    }
+                }
+                ToolReply {
+                    text: text.join(" "),
+                    needs_followup,
+                }
+            } else {
+                let reply = self
+                    .run_tools(effective_question, &input, Arc::clone(runtime))
+                    .await?;
+                if reply.needs_followup {
+                    pending = Some(effective_question.to_owned());
+                }
+                reply
+            }
         } else {
             self.lm.complete(SYSTEM, &input, 1024).await?.into()
         };
         // No await or fallible external operation after this commit boundary.
+        self.pending_clarification = pending.map(|request| (request, Instant::now()));
         self.remember(question, &reply.text);
         Ok(Reply {
             text: reply.text,

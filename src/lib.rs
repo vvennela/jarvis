@@ -19,9 +19,11 @@ pub mod file_work;
 pub mod install;
 pub mod music_catalog;
 pub mod providers;
+pub mod request_intent;
 pub mod spotify_playback;
 pub mod task_journal;
 pub mod tool_runtime;
+pub mod web_open;
 pub mod web_search;
 
 pub const MAX_REVIEW_BYTES: usize = 64 * 1024;

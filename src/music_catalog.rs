@@ -55,6 +55,7 @@ pub struct ResolvedArtist {
     name: String,
     id: String,
     uri: String,
+    track_uri: Option<String>,
 }
 impl ResolvedArtist {
     pub fn name(&self) -> &str {
@@ -65,6 +66,9 @@ impl ResolvedArtist {
     }
     pub fn uri(&self) -> &str {
         &self.uri
+    }
+    pub fn track_uri(&self) -> Option<&str> {
+        self.track_uri.as_deref()
     }
 }
 
@@ -228,7 +232,7 @@ impl MusicCatalog {
                     matches.push(artist);
                 }
             }
-            if matches.len() > 1 && let Some(base) = &self.config.embed {
+            if !matches.is_empty() && let Some(base) = &self.config.embed {
                 let mut canonical = tokio::task::JoinSet::new();
                 for artist in matches {
                     let client = self.client.clone();
@@ -356,6 +360,7 @@ fn verify_oembed_artist(
         name: metadata.title.trim().to_owned(),
         uri: format!("spotify:artist:{id}"),
         id,
+        track_uri: None,
     })
 }
 #[derive(Deserialize)]
@@ -424,17 +429,49 @@ fn verify_embed_artist(requested: &str, body: &[u8]) -> Result<ResolvedArtist, C
     {
         return Err(CatalogError::InvalidResponse);
     }
+    if entity.track_list.len() > 100 {
+        return Err(CatalogError::InvalidResponse);
+    }
+    let track_uri = entity
+        .track_list
+        .iter()
+        .find(|track| {
+            track.kind == "track"
+                && track.playable
+                && track.reason == "PLAYABLE"
+                && normalized(&track.artist) == normalized(&entity.name)
+                && track.uri.strip_prefix("spotify:track:").is_some_and(|id| {
+                    id.len() == 22 && id.bytes().all(|b| b.is_ascii_alphanumeric())
+                })
+        })
+        .map(|track| track.uri.clone());
     Ok(ResolvedArtist {
         name: entity.name.trim().to_owned(),
         id: entity.id,
         uri: entity.uri,
+        track_uri,
     })
 }
 #[derive(Deserialize)]
 struct EmbedArtist {
+    #[serde(default, rename = "trackList")]
+    track_list: Vec<EmbedTrack>,
     name: String,
     id: String,
     uri: String,
     #[serde(rename = "type")]
     kind: String,
+}
+
+#[derive(Deserialize)]
+struct EmbedTrack {
+    uri: String,
+    #[serde(rename = "subtitle")]
+    artist: String,
+    #[serde(rename = "entityType")]
+    kind: String,
+    #[serde(rename = "isPlayable")]
+    playable: bool,
+    #[serde(rename = "playabilityReason")]
+    reason: String,
 }

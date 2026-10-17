@@ -24,9 +24,12 @@ Rust gives explicit ownership and bounded lifetimes, but it does not automatical
 | Browser metadata | URL 8,192 bytes; title 2,048; IDs 128 | Validate before any evidence write |
 | Extension buffers | 32 queued tabs; 256 cached tab/document entries | Latest-state coalescing and bounded eviction |
 | Local `.env` | 16 KiB | Reject oversized or invalid UTF-8 configuration |
+| Compound requests | At most 3 parallel clause-specific tool loops; 8 KiB original request | Each clause keeps its own user authority; acknowledgments retain order; “then” stays intact |
+| Typed tool protocol | At most 16 registered schemas; 4 calls per model response; 4 tool rounds per clause | Validate every proposal; stop when the bounded loop is exhausted |
+| Wikipedia open | 256 KiB API response; 10-second production whole-operation deadline | Canonical topic resolution and native `/usr/bin/open` share the deadline; dropping the future kills the owned opener; no browser DOM success claim |
 | Conversation history | 8 turns, 24 KiB; 4 KiB per stored reply | Drop oldest turns to fit bounded provider packet |
 | Local Whisper | Model file at most 256 MiB; 4 CPU threads | Load model once per voice worker; reuse native state |
-| Wake audio | 4-second rolling wake window; 15-second command cap at mono 16 kHz | Energy gate avoids decoding silence; endpoint or cap finishes command |
+| Wake audio | 4-second rolling wake window; 15-second command cap at mono 16 kHz | Dedicated local keyword detection and Silero activity gating; endpoint or cap finishes command |
 | Voice handoff | One pending command | Backpressure; mute and suppression invalidate pending/late results |
 | Music discovery | 5 search candidates; 512 KiB search, 64 KiB metadata, 256 KiB canonical embed per response; 2 concurrent lookups | Exact verified identities; parallel candidate checks share a 10-second deadline |
 | Artist playback | 35-second whole tool deadline; 20-second native process deadline; 4 KiB stdout/stderr | Only matching playing artist and consistent track identity produce success |
@@ -46,7 +49,7 @@ The library permits explicitly configured inventory/history/ledger limits within
 - History records resource ID, version, kind, actor and timestamp. Previous full content versions are not an application-level archive.
 - Separate page and tab records prevent a metadata-only browser update from replacing full page text. Multi-record observations use one atomic batch.
 - Attribution is `Unknown` or `AgentCandidate`, never proof of human intent. Candidate matching is one-use and invalidated by intervening target changes.
-- Provider outputs are text or registered typed proposals. The runtime validates arguments and caller intent before bounded tool execution. One background draft worker owns its job state.
+- Provider outputs are text or registered typed proposals. The runtime validates arguments and caller intent before bounded tool execution. Independent writing and coding workers each own one active job and its state.
 - The Native Messaging host is a bounded observation process, not a general command server.
 
 ## Freshness and privacy limits
@@ -65,4 +68,4 @@ For the demo, measure idle and active RSS, store/FTS/WAL size, reads per unchang
 
 ## Local observation — October 17
 
-One sample of the installed app after 21 seconds of wake listening reported **148,096 KiB RSS (about 145 MiB)** and **11.7% CPU**. The index was 577,536 bytes, WAL 655,112 bytes, and shared-memory file 32,768 bytes. This is a single warm-up observation, not a steady-state bound. Codex/compiler child-process memory and retained worktrees are additional resources.
+One sample of the installed app after 21 seconds of wake listening reported **148,096 KiB RSS (about 145 MiB)** and **11.7% CPU**. The index was 577,536 bytes, WAL 655,112 bytes, and shared-memory file 32,768 bytes. This is one warm-up sample, not a steady-state measurement, observed peak, or hard RSS bound. Parallel clause loops can retain up to three prompt/tool-result packets while the provider client still admits only two active requests. Model/native allocations, Codex/compiler child-process memory and retained worktrees are additional resources. A sustained idle/active run with peak RSS and child-process accounting is still needed.
