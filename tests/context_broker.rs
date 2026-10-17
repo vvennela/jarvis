@@ -304,3 +304,89 @@ fn readonly_retrieval_never_creates_missing_database_or_permits_accidental_write
             .is_empty()
     );
 }
+
+#[test]
+fn next_work_question_keeps_explicit_unfinished_priority_ahead_of_newer_setup_noise() {
+    let dir = TempDir::new();
+    let mut db = store(&dir);
+    db.observe("file:/approved/project-beacon.md", "Project Beacon\nCurrent task: prepare Brian's handoff note.\nDecision: keep recognition local.\nNext steps:\n1. Validate voice demo.\n2. Review the handoff note with Brian.\n", Source::File, 1).unwrap();
+    for i in 0..12 {
+        db.observe(&format!("file:/approved/setup-guide-{i}.md"), "Jarvis setup reference. Install the next version then work through API key setup. Configuration reference only.",Source::File, 100+i).unwrap();
+    }
+    for question in [
+        "What should I work on next?",
+        "What was my next step?",
+        "Where was I?",
+    ] {
+        let packet = retrieve_at(&db, question, 1000).unwrap();
+        let priority = packet
+            .evidence
+            .iter()
+            .find(|e| e.resource_id == "file:/approved/project-beacon.md")
+            .unwrap_or_else(|| panic!("explicit current work missing for {question}"));
+        assert!(priority.excerpt.contains("Validate voice demo"));
+        assert_eq!(priority.trust, "untrusted_content");
+        assert_eq!(priority.version, 1);
+        assert!(packet.evidence.len() <= MAX_EVIDENCE);
+    }
+}
+
+#[test]
+fn named_work_status_and_tasks_survive_setup_churn_but_explicit_setup_search_still_works() {
+    let dir = TempDir::new();
+    let mut db = store(&dir);
+    db.observe("file:/approved/CURRENT_WORK.md", "Current task: prepare a handoff. Priority: review the integration results. Pending: confirm evidence before review.",Source::File,1).unwrap();
+    db.observe(
+        "file:/approved/TODO.md",
+        "Tasks\n- [ ] Verify microphone input selection.\n- [ ] Review Brian handoff.",
+        Source::File,
+        2,
+    )
+    .unwrap();
+    for i in 0..48 {
+        db.observe(&format!("file:/approved/setup-{i}.md"),"Setup installation reference. Copy the provider API key into configuration before starting.",Source::File,100+i).unwrap();
+    }
+    let next = retrieve_at(&db, "What should I do next?", 1000).unwrap();
+    for id in ["file:/approved/CURRENT_WORK.md", "file:/approved/TODO.md"] {
+        assert!(
+            next.evidence.iter().any(|e| e.resource_id == id),
+            "work record crowded out: {id}"
+        );
+    }
+    db.observe("file:/approved/CURRENT_WORK.md", "Current task changed: prioritize preparing the review artifact. The microphone task is complete.",Source::File,200).unwrap();
+    let changed = retrieve_at(&db, "What should I work on next?", 1000).unwrap();
+    let record = changed
+        .evidence
+        .iter()
+        .find(|e| e.resource_id == "file:/approved/CURRENT_WORK.md")
+        .unwrap();
+    assert_eq!(record.version, 2);
+    assert!(record.excerpt.contains("review artifact"));
+    assert!(!record.excerpt.contains("Pending: confirm"));
+    let setup = retrieve_at(
+        &db,
+        "How do I install and configure the provider API key?",
+        1000,
+    )
+    .unwrap();
+    assert!(
+        setup
+            .evidence
+            .iter()
+            .any(|e| e.resource_id.contains("setup-") && e.selection_reason == "query_match")
+    );
+    let explicit_setup = retrieve_at(
+        &db,
+        "What are the next steps to install and configure the provider API key?",
+        1000,
+    )
+    .unwrap();
+    assert!(
+        explicit_setup
+            .evidence
+            .iter()
+            .any(|e| e.resource_id.contains("setup-") && e.selection_reason == "query_match"),
+        "explicit setup next steps were replaced by unrelated work priorities"
+    );
+    assert!(next.coverage.files <= 3);
+}

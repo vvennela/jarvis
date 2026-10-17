@@ -12,6 +12,15 @@ pub const MAX_EVIDENCE: usize = 8;
 pub const MAX_EXCERPT_BYTES: usize = 4096;
 const PER_SOURCE: usize = 3;
 const FOREGROUND_ID: &str = "os:foreground";
+const WORK_CANDIDATES: usize = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestIntent {
+    General,
+    NextWork,
+    ResumeWork,
+}
 
 #[derive(Serialize)]
 pub struct Evidence {
@@ -51,6 +60,7 @@ impl Coverage {
 #[derive(Serialize)]
 pub struct ContextPacket {
     pub captured_at_ms: i64,
+    pub request_intent: RequestIntent,
     pub evidence: Vec<Evidence>,
     pub coverage: Coverage,
 }
@@ -71,9 +81,11 @@ pub fn retrieve_at(
     if captured_at_ms < 0 {
         return Err(ContextError::InvalidInput);
     }
+    let request_intent = request_intent(query);
     if general_chat(query) {
         return Ok(ContextPacket {
             captured_at_ms,
+            request_intent,
             evidence: Vec::new(),
             coverage: Coverage::from_evidence(&[]),
         });
@@ -90,8 +102,19 @@ pub fn retrieve_at(
         }
         for source in [Source::File, Source::Browser] {
             let mut count = 0;
-            if !query.is_empty() {
+            if source == Source::File && request_intent != RequestIntent::General {
+                for resource in work_files(snapshot, &query)? {
+                    if seen.insert(resource.id.clone()) {
+                        chosen.push((resource, "work_priority"));
+                        count += 1;
+                    }
+                }
+            }
+            if count < PER_SOURCE && !query.is_empty() {
                 for resource in snapshot.search_source(&query, source, PER_SOURCE)? {
+                    if count >= PER_SOURCE {
+                        break;
+                    }
                     if seen.insert(resource.id.clone()) {
                         chosen.push((resource, "query_match"));
                         count += 1;
@@ -167,10 +190,145 @@ pub fn retrieve_at(
         let coverage = Coverage::from_evidence(&evidence);
         Ok(ContextPacket {
             captured_at_ms,
+            request_intent,
             evidence,
             coverage,
         })
     })
+}
+
+fn request_intent(query: &str) -> RequestIntent {
+    let text = excerpt(query, MAX_QUERY_BYTES)
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.split_whitespace().any(|word| {
+        matches!(
+            word,
+            "setup" | "install" | "installation" | "configure" | "configuration"
+        )
+    }) {
+        return RequestIntent::General;
+    }
+    if [
+        "where was i",
+        "resume my work",
+        "resume work",
+        "what was i working",
+        "pick up where",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase))
+    {
+        RequestIntent::ResumeWork
+    } else if [
+        "work on next",
+        "do next",
+        "next task",
+        "next step",
+        "prioritize",
+        "priorities",
+        "focus on next",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase))
+    {
+        RequestIntent::NextWork
+    } else {
+        RequestIntent::General
+    }
+}
+
+/// Select from bounded indexed candidates only. Filenames and explicit task
+/// headings are relevance hints, never proof of authorship, authority or action.
+fn work_files(store: &ContextStore, query: &str) -> Result<Vec<Resource>, ContextError> {
+    let mut selected: Vec<Resource> = Vec::with_capacity(PER_SOURCE + 1);
+    let mut seen = HashSet::new();
+    let searches = [
+        Some(
+            "priority priorities task tasks todo blocker blocked current status milestone unfinished remaining resume deadline",
+        ),
+        (!query.is_empty()).then_some(query),
+        None,
+    ];
+    for search in searches {
+        let candidates = match search {
+            Some(terms) => store.search_source(terms, Source::File, WORK_CANDIDATES)?,
+            None => store.latest_source(Source::File, WORK_CANDIDATES)?,
+        };
+        for resource in candidates {
+            if !seen.insert(resource.id.clone()) {
+                continue;
+            }
+            selected.push(resource);
+            selected.sort_by(|a, b| {
+                work_rank(a)
+                    .cmp(&work_rank(b))
+                    .then_with(|| b.observed_at_ms.cmp(&a.observed_at_ms))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            selected.truncate(PER_SOURCE);
+        }
+    }
+    Ok(selected)
+}
+
+fn work_rank(resource: &Resource) -> u8 {
+    let name = resource.id.rsplit('/').next().unwrap_or(&resource.id);
+    let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    let stem = stem.to_ascii_lowercase().replace('_', "-");
+    if matches!(
+        stem.as_str(),
+        "current-work" | "work-status" | "project-status" | "current-status"
+    ) {
+        return 0;
+    }
+    // Setup guides often have "next steps" too; their title keeps them below
+    // actual work records unless the user explicitly asks a setup question.
+    if stem
+        .split('-')
+        .any(|word| matches!(word, "setup" | "install" | "installation" | "configuration"))
+    {
+        return 5;
+    }
+    if matches!(
+        stem.as_str(),
+        "todo" | "todos" | "tasks" | "priorities" | "worklog" | "notes"
+    ) {
+        return 1;
+    }
+    let task_heading = excerpt(&resource.content, MAX_EXCERPT_BYTES)
+        .lines()
+        .any(|line| {
+            let line = line.trim_start_matches(|c: char| c.is_whitespace() || c == '#');
+            let lower = line.to_ascii_lowercase();
+            [
+                "current task",
+                "current work",
+                "next steps",
+                "priorities",
+                "remaining work",
+                "unfinished",
+                "- [ ]",
+            ]
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
+        });
+    if task_heading {
+        return 1;
+    }
+    if matches!(
+        stem.as_str(),
+        "plan" | "build-plan" | "roadmap" | "implementation-plan"
+    ) {
+        return 2;
+    }
+    if stem == "readme" {
+        return 3;
+    }
+    4
 }
 fn paired_page_id(resource: &Resource) -> Option<String> {
     if resource.source != Source::Browser || !resource.id.starts_with("browser-tab:") {

@@ -458,3 +458,66 @@ async fn runtime_provider_state_overrides_conflicting_setup_documents_without_cl
         "a greeting must not load unrelated setup instructions"
     );
 }
+
+#[tokio::test]
+async fn next_work_request_delivers_stated_priorities_with_provenance_instead_of_only_setup_docs() {
+    let dir = TempDir::new();
+    let lm = Peer::new(vec![
+        chat("Review the handoff note."),
+        chat("Which project are you working on?"),
+    ])
+    .await;
+    let mut agent = conversation(&dir, None, &lm);
+    let mut store = ContextStore::open(&dir.join("context.db"), Limits::default()).unwrap();
+    store.observe("file:/approved/CURRENT_WORK.md","Project Beacon current task: review Brian's handoff. Next step: validate the microphone. STATED_PRIORITY_FIXTURE",Source::File,1).unwrap();
+    for i in 0..20 {
+        store
+            .observe(
+                &format!("file:/approved/setup-{i}.md"),
+                "Setup instructions. Ask for API keys. Next installation step. DOCUMENT_SETUP_ONLY",
+                Source::File,
+                10 + i,
+            )
+            .unwrap();
+    }
+    agent.ask("What should I work on next?").await.unwrap();
+    let requests = lm.requests();
+    let data = packet(&requests[0]);
+    assert_eq!(data["context_snapshot"]["request_intent"], "next_work");
+    let work = data["untrusted_evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["resource_id"] == "file:/approved/CURRENT_WORK.md")
+        .expect("known work priority missing from model packet");
+    assert_eq!(work["trust"], "untrusted_content");
+    assert_eq!(work["version"], 1);
+    assert_eq!(work["source"], "file");
+    assert!(
+        work["excerpt"]
+            .as_str()
+            .unwrap()
+            .contains("STATED_PRIORITY_FIXTURE")
+    );
+    let system = requests[0]["messages"][0]["content"].as_str().unwrap();
+    assert!(!system.contains("STATED_PRIORITY_FIXTURE"));
+    assert!(!system.contains("DOCUMENT_SETUP_ONLY"));
+    assert_eq!(data["runtime_conversation"]["provider_configured"], true);
+    assert!(requests[0].get("tools").is_none());
+    // The request intent must survive even when no evidence exists; a fixture
+    // reply does not establish the live model's factual recommendation quality.
+    let empty = TempDir::new();
+    let mut empty_agent = conversation(&empty, None, &lm);
+    empty_agent.ask("What should I do next?").await.unwrap();
+    let empty_packet = packet(&lm.requests()[1]);
+    assert_eq!(
+        empty_packet["context_snapshot"]["request_intent"],
+        "next_work"
+    );
+    assert!(
+        empty_packet["untrusted_evidence"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
