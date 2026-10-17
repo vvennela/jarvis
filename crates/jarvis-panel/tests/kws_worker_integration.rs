@@ -180,6 +180,7 @@ fn opt_in_real_keyword_and_whisper_worker_preserves_same_breath_request() {
         vad: jarvis_voice::vad::LocalVoiceActivity,
         audio: VecDeque<Vec<f32>>,
         handoff: jarvis_voice::capture::AudioHandoff,
+        resampler: jarvis_voice::capture::CaptureBuffer,
         exhausted: Arc<AtomicBool>,
     }
     impl WakeBackend for LocalBackend {
@@ -197,8 +198,12 @@ fn opt_in_real_keyword_and_whisper_worker_preserves_same_breath_request() {
             if self.audio.is_empty() {
                 self.exhausted.store(true, Ordering::Release);
             }
-            self.handoff
-                .push(&self.audio.pop_front().unwrap_or_default());
+            self.resampler
+                .push_f32(&self.audio.pop_front().unwrap_or_default())
+                .map_err(|_| "fixture resampling failed")?;
+            let (samples, gap) = self.resampler.drain_samples();
+            assert!(!gap, "generated fixture overflowed capture");
+            self.handoff.push(&samples);
             Ok(self.handoff.drain())
         }
         fn keyword_spot(&mut self, samples: &[f32]) -> Result<Option<KeywordStatus>, &'static str> {
@@ -255,12 +260,42 @@ fn opt_in_real_keyword_and_whisper_worker_preserves_same_breath_request() {
         noise_seed = noise_seed.wrapping_mul(1664525).wrapping_add(1013904223);
         ((noise_seed >> 8) as f32 / 16777215.0 * 2.0 - 1.0) * 0.06
     }));
+    let source_rate = std::env::var("JARVIS_TEST_INPUT_RATE")
+        .ok()
+        .map(|s| s.parse::<u32>().unwrap())
+        .unwrap_or(16000);
+    assert!([16000, 48000].contains(&source_rate));
+    if source_rate == 48000 {
+        // Generate continuous 48kHz microphone-like input from a trusted 16kHz
+        // speech fixture, then add an independently generated out-of-band tone.
+        // The production CaptureBuffer, not the test, must remove that tone.
+        let ultrasonic_gain = std::env::var("JARVIS_TEST_HIGH_FREQUENCY_GAIN")
+            .ok()
+            .map(|s| s.parse::<f32>().unwrap())
+            .unwrap_or(0.0);
+        let original = std::mem::take(&mut samples);
+        samples = (0..original.len() * 3)
+            .map(|n| {
+                let index = n / 3;
+                let fraction = (n % 3) as f32 / 3.0;
+                let next = original.get(index + 1).copied().unwrap_or(original[index]);
+                original[index] * (1.0 - fraction)
+                    + next * fraction
+                    + ultrasonic_gain
+                        * (std::f64::consts::TAU * 12000.0 * n as f64 / 48000.0).sin() as f32
+            })
+            .collect();
+    }
     let mut worker = WakeWorker::with_backend(move || {
         Ok(Box::new(LocalBackend {
             kws: jarvis_voice::kws::LocalKeywordSpotter::load(&kws)?,
             vad: jarvis_voice::vad::LocalVoiceActivity::load(&vad)?,
             stt: jarvis_voice::Transcriber::load(&stt).map_err(|_| "local Whisper model failed")?,
-            audio: samples.chunks(320).map(Vec::from).collect(),
+            audio: samples
+                .chunks(source_rate as usize / 50)
+                .map(Vec::from)
+                .collect(),
+            resampler: jarvis_voice::capture::CaptureBuffer::continuous(source_rate, 1).unwrap(),
             handoff: jarvis_voice::capture::AudioHandoff::new(),
             exhausted: backend_exhausted,
         }))

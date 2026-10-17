@@ -214,6 +214,80 @@ impl CaptureHealth {
     }
 }
 
+/// Causal Hamming-windowed sinc low-pass for decimation. Coefficients and
+/// doubled ring storage are allocated once, outside the realtime callback.
+/// The ~1.25ms group delay is constant across input rates. Filtering happens
+/// only at output instants, not at every high-rate input sample.
+struct AntiAliasFilter {
+    coefficients: Box<[f32]>,
+    history: Box<[f32]>,
+    ring_len: usize,
+    next: usize,
+}
+impl AntiAliasFilter {
+    fn new(source_rate: u32) -> Self {
+        let taps = ((source_rate.div_ceil(400) as usize) | 1).min(511);
+        let center = (taps - 1) as f64 / 2.0;
+        let cutoff = 7_000.0 / f64::from(source_rate);
+        let mut coefficients: Vec<f64> = (0..taps)
+            .map(|index| {
+                let offset = index as f64 - center;
+                let sinc = if offset == 0.0 {
+                    2.0 * cutoff
+                } else {
+                    (2.0 * std::f64::consts::PI * cutoff * offset).sin()
+                        / (std::f64::consts::PI * offset)
+                };
+                let window = 0.54
+                    - 0.46 * (2.0 * std::f64::consts::PI * index as f64 / (taps - 1) as f64).cos();
+                sinc * window
+            })
+            .collect();
+        let sum: f64 = coefficients.iter().sum();
+        for coefficient in &mut coefficients {
+            *coefficient /= sum;
+        }
+        let ring_len = taps + 1;
+        Self {
+            coefficients: coefficients
+                .into_iter()
+                .map(|c| c as f32)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            history: vec![0.0; ring_len * 2].into_boxed_slice(),
+            ring_len,
+            next: 0,
+        }
+    }
+    fn push(&mut self, sample: f32) {
+        self.history[self.next] = sample;
+        self.history[self.next + self.ring_len] = sample;
+        self.next += 1;
+        if self.next == self.ring_len {
+            self.next = 0;
+        }
+    }
+    fn sample(&self, fraction: f32) -> f32 {
+        let end = self.next + self.ring_len;
+        let start = end - self.coefficients.len();
+        let current = &self.history[start..end];
+        if fraction == 1.0 {
+            self.coefficients
+                .iter()
+                .zip(current)
+                .map(|(h, x)| h * x)
+                .sum()
+        } else {
+            let previous = &self.history[start - 1..end - 1];
+            self.coefficients
+                .iter()
+                .zip(current.iter().zip(previous))
+                .map(|(h, (current, previous))| h * (previous + (current - previous) * fraction))
+                .sum()
+        }
+    }
+}
+
 pub struct CaptureBuffer {
     source_rate: u32,
     channels: u16,
@@ -222,6 +296,7 @@ pub struct CaptureBuffer {
     channel_count: u16,
     input_frames: u64,
     previous: Option<f32>,
+    antialias: Option<AntiAliasFilter>,
     next_output_numerator: u64,
     invalid: bool,
     continuous: bool,
@@ -240,6 +315,7 @@ impl CaptureBuffer {
             channel_count: 0,
             input_frames: 0,
             previous: None,
+            antialias: (source_rate > OUTPUT_RATE).then(|| AntiAliasFilter::new(source_rate)),
             next_output_numerator: 0,
             invalid: false,
             continuous: false,
@@ -301,6 +377,9 @@ impl CaptureBuffer {
             let mono = (self.channel_sum / f64::from(self.channels)) as f32;
             self.channel_sum = 0.0;
             self.channel_count = 0;
+            if let Some(filter) = &mut self.antialias {
+                filter.push(mono);
+            }
             let current_numerator = self.input_frames * u64::from(OUTPUT_RATE);
             while self.next_output_numerator <= current_numerator
                 && (self.continuous || self.output.len() < MAX_RECORDING_SAMPLES)
@@ -309,9 +388,15 @@ impl CaptureBuffer {
                     let previous_numerator = current_numerator - u64::from(OUTPUT_RATE);
                     let fraction = (self.next_output_numerator - previous_numerator) as f32
                         / OUTPUT_RATE as f32;
-                    previous + (mono - previous) * fraction
+                    if let Some(filter) = &self.antialias {
+                        filter.sample(fraction)
+                    } else {
+                        previous + (mono - previous) * fraction
+                    }
                 } else {
-                    mono
+                    self.antialias
+                        .as_ref()
+                        .map_or(mono, |filter| filter.sample(1.0))
                 };
                 if self.output.len() == MAX_RECORDING_SAMPLES {
                     self.output.drain(..OUTPUT_RATE as usize);
@@ -332,6 +417,10 @@ impl CaptureBuffer {
         let Some(last) = self.previous else {
             return Err(CaptureError::Empty);
         };
+        let last = self
+            .antialias
+            .as_ref()
+            .map_or(last, |filter| filter.sample(1.0));
         // Hold the final frame for the fractional tail when upsampling. This
         // makes duration deterministic without depending on callback boundaries.
         let duration_numerator = self.input_frames * u64::from(OUTPUT_RATE);
