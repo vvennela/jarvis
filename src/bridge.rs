@@ -398,3 +398,278 @@ fn write_ack<W: Write>(
         .and_then(|()| output.flush())
         .map_err(|_| BridgeError::Io)
 }
+
+pub(crate) enum LiveInput {
+    Native(Result<Option<serde_json::Value>, BridgeError>),
+    Command(crate::browser_tools::HostCommand),
+}
+
+/// Production duplex host: browser observations continue while a bounded fresh
+/// read is in flight. The regular framed session remains available for fixtures.
+pub fn run_live_session<R: Read + Send + 'static, W: Write>(
+    mut input: R,
+    mut output: W,
+    store: &mut ContextStore,
+    socket: &std::path::Path,
+) -> Result<SessionReport, BridgeError> {
+    use crate::browser_tools::{BrowserRequest, DEADLINE, Response};
+    use std::{
+        collections::HashMap,
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+    let mut first = read_json_frame(&mut input)?.ok_or(BridgeError::InvalidHandshake)?;
+    let capabilities = first.as_object_mut().and_then(|o| o.remove("capabilities"));
+    if capabilities.is_none() {
+        // Legacy protocol fixtures and older extensions keep observation-only behavior.
+        let body = serde_json::to_vec(&first).map_err(|_| BridgeError::InvalidHandshake)?;
+        let mut replay = (body.len() as u32).to_le_bytes().to_vec();
+        replay.extend(body);
+        return run_session(std::io::Cursor::new(replay).chain(input), output, store);
+    }
+    if capabilities != Some(serde_json::json!(["fresh_reads"])) {
+        return Err(BridgeError::InvalidHandshake);
+    }
+    let hello: Incoming =
+        serde_json::from_value(first).map_err(|_| BridgeError::InvalidHandshake)?;
+    let Incoming::Hello {
+        protocol_version,
+        client_nonce,
+    } = hello
+    else {
+        return Err(BridgeError::InvalidHandshake);
+    };
+    if protocol_version != PROTOCOL_VERSION || !valid_nonce(&client_nonce) {
+        return Err(BridgeError::InvalidHandshake);
+    }
+    let session_id = crate::browser_tools::random_id().map_err(|_| BridgeError::Randomness)?;
+    let (tx, rx) = mpsc::sync_channel(32);
+    let _server =
+        crate::browser_tools::serve_socket(socket, tx.clone()).map_err(|_| BridgeError::Io)?;
+    write_ack(&mut output, &client_nonce, &session_id)?;
+    std::thread::spawn(move || {
+        loop {
+            let message = read_json_frame(&mut input);
+            let finished = !matches!(message, Ok(Some(_)));
+            if tx.send(LiveInput::Native(message)).is_err() || finished {
+                break;
+            }
+        }
+    });
+    let mut pending: Option<(crate::browser_tools::HostCommand, Instant)> = None;
+    let mut discovered = HashMap::new();
+    let mut report = SessionReport::default();
+    let mut last_sequence = 0;
+    let mut last_clock = 0;
+    loop {
+        if pending
+            .as_ref()
+            .is_some_and(|(_, started)| started.elapsed() >= DEADLINE - Duration::from_millis(100))
+            && let Some((command, _)) = pending.take()
+        {
+            let _ = command.response.try_send(Response {
+                request_id: command.request.request_id,
+                status: "timeout".into(),
+                tabs: vec![],
+                page: None,
+            });
+        }
+        match rx.recv_timeout(Duration::from_millis(20)) {
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(_) => return Ok(report),
+            Ok(LiveInput::Command(command)) => {
+                let allowed = match &command.request.request {
+                    BrowserRequest::SearchTabs { query } => {
+                        !query.trim().is_empty()
+                            && query.len() <= 256
+                            && !query.chars().any(char::is_control)
+                    }
+                    BrowserRequest::ReadTab {
+                        resource_id,
+                        expected_document_id,
+                    } => discovered
+                        .get(resource_id)
+                        .is_some_and(|doc: &String| doc == expected_document_id),
+                };
+                if pending.is_some() || !allowed {
+                    let _ = command.response.try_send(Response {
+                        request_id: command.request.request_id,
+                        status: "unavailable".into(),
+                        tabs: vec![],
+                        page: None,
+                    });
+                    continue;
+                }
+                let mut message = serde_json::to_value(&command.request)
+                    .map_err(|_| BridgeError::InvalidFrame)?;
+                let object = message.as_object_mut().ok_or(BridgeError::InvalidFrame)?;
+                object.insert("type".into(), "browser.request".into());
+                object.insert("protocol_version".into(), PROTOCOL_VERSION.into());
+                object.insert("session_id".into(), session_id.clone().into());
+                write_json_frame(&mut output, &message)?;
+                pending = Some((command, Instant::now()));
+            }
+            Ok(LiveInput::Native(Err(error))) => return Err(error),
+            Ok(LiveInput::Native(Ok(None))) => return Ok(report),
+            Ok(LiveInput::Native(Ok(Some(mut message)))) => {
+                if message.get("type").and_then(|v| v.as_str()) == Some("browser.result") {
+                    let Some((command, _)) = pending.as_ref() else {
+                        continue;
+                    };
+                    if message.get("session_id").and_then(|v| v.as_str()) != Some(&session_id)
+                        || message.get("protocol_version").and_then(|v| v.as_u64())
+                            != Some(PROTOCOL_VERSION as u64)
+                        || message.get("request_id").and_then(|v| v.as_str())
+                            != Some(&command.request.request_id)
+                    {
+                        continue;
+                    }
+                    let object = message.as_object_mut().ok_or(BridgeError::InvalidFrame)?;
+                    object.remove("type");
+                    object.remove("session_id");
+                    object.remove("protocol_version");
+                    let response: Response =
+                        serde_json::from_value(message).map_err(|_| BridgeError::InvalidFrame)?;
+                    if !matches!(
+                        response.status.as_str(),
+                        "ok" | "stale_document"
+                            | "permission_required"
+                            | "unavailable"
+                            | "cancelled"
+                            | "timeout"
+                    ) {
+                        return Err(BridgeError::InvalidObservation);
+                    }
+                    if response.status == "ok" {
+                        match &command.request.request {
+                            BrowserRequest::SearchTabs { .. } => {
+                                if response.page.is_some() || response.tabs.len() > 16 {
+                                    return Err(BridgeError::InvalidObservation);
+                                }
+                                discovered.clear();
+                                for tab in &response.tabs {
+                                    if !crate::browser_tools::valid_tab(tab)
+                                        || tab.resource_id
+                                            != format!("browser-live:{session_id}:{}", tab.tab_id)
+                                    {
+                                        return Err(BridgeError::InvalidObservation);
+                                    }
+                                    discovered
+                                        .insert(tab.resource_id.clone(), tab.document_id.clone());
+                                }
+                            }
+                            BrowserRequest::ReadTab {
+                                resource_id,
+                                expected_document_id,
+                            } => {
+                                let page = response
+                                    .page
+                                    .as_ref()
+                                    .ok_or(BridgeError::InvalidObservation)?;
+                                if !response.tabs.is_empty()
+                                    || !crate::browser_tools::valid_tab(&page.tab)
+                                    || page.tab.resource_id != *resource_id
+                                    || page.tab.document_id != *expected_document_id
+                                    || page.content.len() > MAX_CONTENT_BYTES
+                                    || page.content.contains('\0')
+                                    || page.trust != "untrusted_page"
+                                {
+                                    return Err(BridgeError::InvalidObservation);
+                                }
+                                // Persist only a validated fresh response, using host receipt time.
+                                let now = trusted_time()?.max(last_clock);
+                                last_clock = now;
+                                let event = BrowserEvent {
+                                    kind: EventKind::DocumentChanged,
+                                    tab_id: page.tab.tab_id,
+                                    window_id: page.tab.window_id,
+                                    url: page.tab.url.clone(),
+                                    title: page.tab.title.clone(),
+                                    observed_at_ms: now,
+                                    actor: "unknown".into(),
+                                    owner: "unknown".into(),
+                                    document_id: Some(page.tab.document_id.clone()),
+                                    navigation_id: None,
+                                    source: Some("browser_content_script".into()),
+                                    trust: Some("untrusted_page".into()),
+                                    content: Some(page.content.clone()),
+                                };
+                                event.validate()?;
+                                report.resources_changed += apply_event(store, &event, now)?;
+                            }
+                        }
+                    }
+                    if let Some((command, _)) = pending.take() {
+                        let _ = command.response.try_send(response);
+                    }
+                    continue;
+                }
+                let observation: Incoming =
+                    serde_json::from_value(message).map_err(|_| BridgeError::InvalidFrame)?;
+                let Incoming::Observation {
+                    protocol_version,
+                    session_id: observed_session,
+                    sequence,
+                    event,
+                } = observation
+                else {
+                    return Err(BridgeError::InvalidHandshake);
+                };
+                if protocol_version != PROTOCOL_VERSION || observed_session != session_id {
+                    return Err(BridgeError::InvalidSession);
+                }
+                if sequence <= last_sequence || sequence > MAX_JS_INTEGER {
+                    return Err(BridgeError::InvalidSequence);
+                }
+                event.validate()?;
+                let now = trusted_time()?.max(last_clock);
+                report.resources_changed += apply_event(store, &event, now)?;
+                report.observations_accepted += 1;
+                last_sequence = sequence;
+                last_clock = now;
+            }
+        }
+    }
+}
+fn trusted_time() -> Result<i64, BridgeError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .ok_or(BridgeError::Clock)
+}
+fn read_json_frame<R: Read>(input: &mut R) -> Result<Option<serde_json::Value>, BridgeError> {
+    let mut header = [0u8; 4];
+    loop {
+        match input.read(&mut header[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(BridgeError::Io),
+        }
+    }
+    input.read_exact(&mut header[1..]).map_err(read_error)?;
+    let length = u32::from_le_bytes(header) as usize;
+    if length == 0 || length > MAX_FRAME_BYTES {
+        return Err(BridgeError::FrameTooLarge);
+    }
+    let mut bytes = vec![0; length];
+    input.read_exact(&mut bytes).map_err(read_error)?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|_| BridgeError::InvalidFrame)
+}
+fn write_json_frame<W: Write>(
+    output: &mut W,
+    value: &serde_json::Value,
+) -> Result<(), BridgeError> {
+    let bytes = serde_json::to_vec(value).map_err(|_| BridgeError::InvalidFrame)?;
+    if bytes.len() > MAX_FRAME_BYTES {
+        return Err(BridgeError::FrameTooLarge);
+    }
+    output
+        .write_all(&(bytes.len() as u32).to_le_bytes())
+        .and_then(|()| output.write_all(&bytes))
+        .and_then(|()| output.flush())
+        .map_err(|_| BridgeError::Io)
+}

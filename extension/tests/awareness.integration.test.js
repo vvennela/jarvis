@@ -46,9 +46,12 @@ async function background({ tabs = [tab()], approved = true, paused = false } = 
   const storage = {};
   let permission = approved;
   let checkPermission = async () => permission;
+  let readPage = async () => ({content:"fresh fixture content",truncated:false});
+  let getFrame = async ({tabId}) => ({documentId:"document-current",url:tabMap.get(tabId)?.url});
   const chrome = {
     runtime: {
       id: "jarvis-extension", onMessage: new Event(),
+      getURL: path => `chrome-extension://jarvis-extension/${path}`,
       connectNative() {
         const port = { onMessage: new Event(), onDisconnect: new Event(), messages: [], disconnected: false,
           postMessage(message) { if (this.disconnected) throw new Error("disconnected"); this.messages.push(structuredClone(message)); },
@@ -63,11 +66,11 @@ async function background({ tabs = [tab()], approved = true, paused = false } = 
     permissions: { contains: async args => checkPermission(args), onAdded: new Event(), onRemoved: new Event() },
     tabs: { get: async id => { if (!tabMap.has(id)) throw new Error("missing tab"); return structuredClone(tabMap.get(id)); },
       query: async () => [...tabMap.values()].map(item => structuredClone(item)),
-      sendMessage: async (...args) => { controls.push(args); return { ok: true }; },
+      sendMessage: async (...args) => { controls.push(args); return args[1]?.type === "jarvis.read" ? readPage(...args) : { ok: true }; },
       onActivated: new Event(), onUpdated: new Event(), onRemoved: new Event(),
     },
     scripting: { executeScript: async args => { injections.push(args); } },
-    webNavigation: { onCommitted: new Event(), onHistoryStateUpdated: new Event() },
+    webNavigation: { getFrame: args => getFrame(args), onCommitted: new Event(), onHistoryStateUpdated: new Event() },
     alarms: { create() {}, clear: async () => true, onAlarm: new Event() },
   };
   vm.runInNewContext(backgroundSource, { ...protocol, chrome, crypto: webcrypto, URL, TextEncoder,
@@ -77,6 +80,8 @@ async function background({ tabs = [tab()], approved = true, paused = false } = 
     chrome, ports, tabMap, injections, controls, storage, clock,
     permission(value) { permission = value; },
     permissionChecker(fn) { checkPermission = fn; },
+    readPage(fn) { readPage = fn; },
+    getFrame(fn) { getFrame = fn; },
     async handshake(extra = {}) {
       const port = ports.at(-1);
       const hello = port.messages.find(message => message.type === "hello");
@@ -296,4 +301,97 @@ test("unchanged DOM churn is not resent; pause, resume and failed delivery are o
   assert.equal(rejected.sent.length, 2, "unaccepted observations must remain eligible for delivery");
   const unloaded = contentHarness(nodes, { accepted: "throw" }); await unloaded.clock.fire(1000);
   assert.equal(unloaded.observers[0].disconnected, true);
+});
+
+
+test("refresh accepts only the extension options page and preserves observation permission gates", async () => {
+  const harness = await background(); await harness.handshake();
+  const refresh = sender => new Promise(resolve => harness.chrome.runtime.onMessage.listeners[0](
+    { type: "jarvis.refresh" }, sender, resolve));
+  const before = harness.injections.length;
+  for (const sender of [
+    { id: "other-extension", url: "chrome-extension://jarvis-extension/options.html" },
+    { id: "jarvis-extension", url: "https://example.com/page/1", tab: { id: 1 } },
+    { id: "jarvis-extension", url: "chrome-extension://jarvis-extension/options.html?spoof=1" },
+    { id: "jarvis-extension", url: "chrome-extension://jarvis-extension/options.html.evil" },
+  ]) assert.equal((await refresh(sender)).accepted, false);
+  assert.equal(harness.injections.length, before);
+  assert.equal((await refresh({ id: "jarvis-extension", url: harness.chrome.runtime.getURL("options.html") })).accepted, true);
+  assert.ok(harness.injections.length > before);
+  for (const options of [{paused:true},{approved:false},{tabs:[tab(1,{incognito:true})]}]) {
+    const protectedHarness=await background(options); await protectedHarness.handshake();
+    const result=await new Promise(resolve => protectedHarness.chrome.runtime.onMessage.listeners[0](
+      {type:"jarvis.refresh"},{id:"jarvis-extension",url:protectedHarness.chrome.runtime.getURL("options.html")},resolve));
+    assert.equal(result.accepted,true);
+    assert.equal(protectedHarness.injections.length,0);
+    assert.equal(protectedHarness.observations().length,0);
+  }
+});
+
+test("native failure diagnostics redact arbitrary error text and clear after a fresh handshake", async () => {
+  for (const message of [
+    "native messaging host not found PRIVATE_KEY=fixture",
+    "Access to the native messaging host is forbidden /private/path/sensitive",
+    "unexpected PRIVATE_DOCUMENT_TEXT and fixture-secret-key",
+  ]) {
+    const harness=await background(); const port=await harness.handshake();
+    harness.chrome.runtime.lastError={message};
+    port.onDisconnect.emit(); await tick();
+    const problem=harness.storage.bridgeProblem;
+    assert.equal(problem,protocol.nativeFailure(message));
+    assert.ok(!problem.includes("PRIVATE") && !problem.includes("sensitive") && !problem.includes("fixture"));
+    harness.chrome.runtime.lastError=undefined;
+    await harness.clock.fire(1000);
+    await harness.handshake();
+    assert.equal(harness.storage.bridgeProblem,"");
+  }
+});
+
+
+test("fresh browser reads require approved identity and recheck the document after extraction", async () => {
+  const harness=await background(); const session="a".repeat(64);const port=await harness.handshake({session_id:session});
+  let next=0;
+  const request=async (operation,args,extra={}) => {
+    const id=(++next).toString(16).padStart(64,"0");
+    port.onMessage.emit({type:"browser.request",protocol_version:1,session_id:session,request_id:id,operation,arguments:args,...extra});
+    await tick(); return port.messages.find(m=>m.type==="browser.result"&&m.request_id===id);
+  };
+  assert.equal(await request("search_tabs",{query:"Tab"},{session_id:"wrong"}),undefined);
+  const search=await request("search_tabs",{query:"Tab"});assert.equal(search.status,"ok");assert.equal(search.tabs.length,1);
+  const args={resource_id:search.tabs[0].resource_id,expected_document_id:search.tabs[0].document_id};
+  const read=await request("read_tab",args);assert.equal(read.status,"ok");assert.equal(read.page.content,"fresh fixture content");assert.equal(read.page.trust,"untrusted_page");
+  harness.readPage(async()=>{harness.getFrame(async({tabId})=>({documentId:"replaced-document",url:harness.tabMap.get(tabId)?.url}));return {content:"old page must not escape",truncated:false};});
+  const stale=await request("read_tab",args);assert.equal(stale.status,"stale_document");assert.equal(stale.page,null);
+  harness.permission(false);
+  const denied=await request("read_tab",args);assert.equal(denied.status,"permission_required");assert.equal(denied.page,null);
+});
+
+test("fresh read cancellation on pause never returns content already being extracted", async () => {
+  const harness=await background();const session="a".repeat(64);const port=await harness.handshake({session_id:session});
+  let release;harness.readPage(()=>new Promise(resolve=>{release=resolve;}));
+  const id="b".repeat(64);
+  port.onMessage.emit({type:"browser.request",protocol_version:1,session_id:session,request_id:id,operation:"read_tab",arguments:{resource_id:`browser-live:${session}:1`,expected_document_id:"document-current"}});
+  await tick();assert.equal(typeof release,"function");
+  await harness.pause();release({content:"private late text",truncated:false});await tick();
+  const result=port.messages.find(m=>m.type==="browser.result"&&m.request_id===id);
+  assert.equal(result.status,"cancelled");assert.equal(result.page,null);assert.ok(!JSON.stringify(port.messages).includes("private late text"));
+});
+
+test("a stalled fresh read expires and cannot release a newer lease or publish late content", async () => {
+  const harness=await background();const session="a".repeat(64);const port=await harness.handshake({session_id:session});
+  let oldRelease;harness.readPage(()=>new Promise(resolve=>{oldRelease=resolve;}));
+  const args={resource_id:`browser-live:${session}:1`,expected_document_id:"document-current"};
+  const send=id=>port.onMessage.emit({type:"browser.request",protocol_version:1,session_id:session,request_id:id,operation:"read_tab",arguments:args});
+  const oldId="1".repeat(64);send(oldId);await tick();assert.equal(typeof oldRelease,"function");
+  await harness.clock.fire(4500);
+  assert.equal(port.messages.find(m=>m.type==="browser.result"&&m.request_id===oldId).status,"timeout");
+  let newRelease;harness.readPage(()=>new Promise(resolve=>{newRelease=resolve;}));
+  const newId="2".repeat(64);send(newId);await tick();assert.equal(typeof newRelease,"function");
+  oldRelease({content:"late stale content",truncated:false});await tick();
+  const thirdId="3".repeat(64);send(thirdId);await tick();
+  assert.equal(port.messages.find(m=>m.type==="browser.result"&&m.request_id===thirdId).status,"unavailable","late old cleanup released a newer request lease");
+  newRelease({content:"fresh result",truncated:false});await tick();
+  assert.equal(port.messages.find(m=>m.type==="browser.result"&&m.request_id===newId).page.content,"fresh result");
+  assert.equal(port.messages.filter(m=>m.type==="browser.result"&&m.request_id===oldId).length,1);
+  assert.ok(!JSON.stringify(port.messages).includes("late stale content"));
 });

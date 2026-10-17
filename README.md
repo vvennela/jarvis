@@ -6,9 +6,9 @@ Your work, in context. A native Rust companion for Mac that keeps a searchable m
 - **Continuous awareness:** watches selected folders, approved Chrome sites, and foreground app/window metadata.
 - **Fast context:** source-balanced SQLite retrieval, incremental hashes, and parallel context gathering and routing.
 - **Native presence:** a menu-bar companion with a compact glass panel when you call Jarvis.
-- **Conversation:** Jev routing and Nemotron 3.5 Lightning through Crusoe.
-- **Tools:** open approved apps, control Spotify, search and read indexed context, and delegate writing through verified tools.
-- **Ready for review:** prepares and verifies draft artifacts for your review.
+- **Conversation:** Jev routing and NVIDIA Nemotron through Crusoe.
+- **Tools:** open approved apps, select Spotify artists, research with You, read shared context, and delegate writing through verified tools.
+- **Ready for review:** prepares drafts and revised file copies, verifies their sources, and restores review state after restart.
 
 ## Run
 
@@ -33,7 +33,7 @@ Copy `.env.example` to `.env` and set:
 
 For ElevenLabs speech, add `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID`. Jarvis also supports your Mac’s built-in voice.
 
-Model: `nvidia/Nemotron-3.5-Lightning-30B-A3B`.
+Set `JARVIS_CONVERSATION_MODEL` and `JARVIS_WORKER_MODEL` to `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`. Add `YOU_API_KEY` for web research and Spotify artist discovery.
 
 ## Build and test
 

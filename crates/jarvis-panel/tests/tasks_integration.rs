@@ -145,7 +145,14 @@ impl Peer {
             .unwrap()
             .iter()
             .map(|request| {
-                serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap()
+                serde_json::from_str(
+                    request["messages"][1]["content"]
+                        .as_str()
+                        .unwrap()
+                        .strip_prefix("Context packet (history and source evidence):\n")
+                        .unwrap_or(request["messages"][1]["content"].as_str().unwrap()),
+                )
+                .unwrap()
             })
             .collect()
     }
@@ -308,7 +315,13 @@ fn cancellation_and_source_change_during_generation_cannot_publish_stale_artifac
             }
         );
         assert!(worker.control.snapshot().path.is_none());
-        assert_eq!(fs::read_dir(temp.join("drafts")).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_dir(temp.join("drafts"))
+                .unwrap()
+                .filter(|entry| entry.as_ref().unwrap().file_name() != "task-review.json")
+                .count(),
+            0
+        );
         assert!(!temp.join("opened-args").exists());
         peer.hold.store(false, Ordering::Release);
         finish(&mut worker);
@@ -338,7 +351,13 @@ fn absent_document_evidence_and_invalid_requests_do_not_contact_model_or_create_
     wait(|| !worker.control.busy());
     assert_eq!(worker.control.snapshot().state, State::Blocked);
     assert!(peer.packets().is_empty());
-    assert_eq!(fs::read_dir(temp.join("drafts")).unwrap().count(), 0);
+    assert_eq!(
+        fs::read_dir(temp.join("drafts"))
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().file_name() != "task-review.json")
+            .count(),
+        0
+    );
     finish(&mut worker);
 }
 
@@ -554,7 +573,13 @@ fn transient_draft_inference_retries_once_and_publishes_only_one_review_artifact
         assert_eq!(packet["user_instruction"], "Draft a Beacon handoff");
         assert_eq!(packet["untrusted_evidence"][0]["version"], 1);
     }
-    assert_eq!(fs::read_dir(temp.join("drafts")).unwrap().count(), 1);
+    assert_eq!(
+        fs::read_dir(temp.join("drafts"))
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().file_name() != "task-review.json")
+            .count(),
+        1
+    );
     assert!(!temp.join("opened-args").exists());
     finish(&mut worker);
 }
@@ -585,7 +610,13 @@ fn persistent_rate_limit_and_auth_failure_expose_safe_reason_without_unbounded_r
         );
         assert!(!result.text.contains("PRIVATE_ERROR_BODY"));
         assert!(!result.text.contains("fixture-secret-key"));
-        assert_eq!(fs::read_dir(temp.join("drafts")).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_dir(temp.join("drafts"))
+                .unwrap()
+                .filter(|entry| entry.as_ref().unwrap().file_name() != "task-review.json")
+                .count(),
+            0
+        );
         assert!(!temp.join("opened-args").exists());
         finish(&mut worker);
     }
@@ -610,7 +641,13 @@ fn cancelling_draft_during_retry_backoff_prevents_second_provider_call_and_artif
             .contains("retry")
     });
     assert_eq!(peer.packets().len(), 1);
-    assert_eq!(fs::read_dir(temp.join("drafts")).unwrap().count(), 0);
+    assert_eq!(
+        fs::read_dir(temp.join("drafts"))
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().file_name() != "task-review.json")
+            .count(),
+        0
+    );
     worker.control.cancel();
     let start = Instant::now();
     wait(|| !worker.control.busy());
@@ -618,7 +655,13 @@ fn cancelling_draft_during_retry_backoff_prevents_second_provider_call_and_artif
     assert_eq!(worker.control.snapshot().state, State::Cancelled);
     thread::sleep(Duration::from_millis(2200));
     assert_eq!(peer.packets().len(), 1, "cancelled retry reached provider");
-    assert_eq!(fs::read_dir(temp.join("drafts")).unwrap().count(), 0);
+    assert_eq!(
+        fs::read_dir(temp.join("drafts"))
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().file_name() != "task-review.json")
+            .count(),
+        0
+    );
     finish(&mut worker);
 }
 
@@ -647,14 +690,26 @@ fn draft_respects_server_cooldown_before_publishing_a_single_review_artifact() {
         1,
         "draft retried at old2sec delay instead of server3sec"
     );
-    assert_eq!(fs::read_dir(temp.join("drafts")).unwrap().count(), 0);
+    assert_eq!(
+        fs::read_dir(temp.join("drafts"))
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().file_name() != "task-review.json")
+            .count(),
+        0
+    );
     assert!(worker.control.snapshot().path.is_none());
     wait(|| !worker.control.busy());
     assert_eq!(worker.control.snapshot().state, State::ReadyForReview);
     let times = peer.request_times.lock().unwrap().clone();
     assert_eq!(times.len(), 2);
     assert!(times[1].duration_since(times[0]) >= Duration::from_secs(3));
-    assert_eq!(fs::read_dir(temp.join("drafts")).unwrap().count(), 1);
+    assert_eq!(
+        fs::read_dir(temp.join("drafts"))
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().file_name() != "task-review.json")
+            .count(),
+        1
+    );
     assert!(!temp.join("opened-args").exists());
     finish(&mut worker);
 }

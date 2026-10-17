@@ -1,6 +1,6 @@
 use jarvis::providers::{
     CrusoeClient, JevClient, MAX_INPUT_BYTES, MAX_OUTPUT_TOKENS, MAX_RESPONSE_BYTES,
-    NEMOTRON_MODEL, ProviderConfig, ProviderError, Route,
+    NEMOTRON_MODEL, NEMOTRON_NANO_MODEL, ProviderConfig, ProviderError, Route,
 };
 use std::{
     io::{Read, Write},
@@ -519,9 +519,11 @@ async fn deadline_covers_a_body_that_stalls_after_successful_headers() {
 }
 
 #[tokio::test]
-async fn only_exact_verified_nemotron_id_disables_thinking_in_request_template() {
+async fn only_exact_verified_nemotron_models_disable_thinking_in_request_template() {
     for model in [
         NEMOTRON_MODEL,
+        NEMOTRON_NANO_MODEL,
+        "nvidia/nvidia-nemotron-3-nano-30b-a3b",
         "fixture/other-model",
         "nvidia/nemotron-3.5-lightning-30b-a3b",
     ] {
@@ -532,7 +534,7 @@ async fn only_exact_verified_nemotron_id_disables_thinking_in_request_template()
         let body: serde_json::Value =
             serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
         assert_eq!(body["model"], model);
-        if model == NEMOTRON_MODEL {
+        if [NEMOTRON_MODEL, NEMOTRON_NANO_MODEL].contains(&model) {
             assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
         } else {
             assert!(

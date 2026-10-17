@@ -2,6 +2,9 @@
 <html lang="en"><head><meta charset="utf-8"><title>Jarvis browser awareness</title><link rel="stylesheet" href="options.css"></head>
 <body><main><h1>Jarvis browser awareness</h1>
 <p id="status" role="status">Loading bridge status…</p>
+<p id="bridge-problem" role="status"></p>
+<p>Extension ID: <code id="extension-id"></code></p>
+<button id="refresh" type="button">Reconnect and refresh approved tabs</button>
 <p>Only sites you allow below are observed. Jarvis collects page text, titles, and full URLs (including query strings) on those sites. Private windows, form values, editable fields, and hidden content are excluded. Text rendered as ordinary page content may still be sensitive.</p>
 <form id="grant"><label for="origin">Website to allow</label><div><input id="origin" type="url" placeholder="https://example.com" required><button type="submit">Allow website</button></div></form>
 <p id="message" role="alert"></p><h2>Allowed websites</h2><ul id="origins"></ul>

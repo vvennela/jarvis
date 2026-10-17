@@ -2,12 +2,19 @@ import { normalizeOrigin } from "./protocol.js";
 const status = document.querySelector("#status");
 const message = document.querySelector("#message");
 const paused = document.querySelector("#paused");
+document.querySelector("#extension-id").textContent = chrome.runtime.id;
+document.querySelector("#refresh").addEventListener("click", async () => {
+  const result = await chrome.runtime.sendMessage({ type: "jarvis.refresh" });
+  message.textContent = result?.accepted ? (result.paused ? "Awareness is paused. Resume to refresh approved tabs." : "Refreshing approved tabs…") : "Reconnect did not complete. Try again.";
+  await refresh();
+});
 
 async function refresh() {
   const [{ origins = [] }, state] = await Promise.all([
-    chrome.permissions.getAll(), chrome.storage.local.get(["paused", "bridgeStatus"]),
+    chrome.permissions.getAll(), chrome.storage.local.get(["paused", "bridgeStatus", "bridgeProblem"]),
   ]);
   paused.checked = state.paused === true;
+  document.querySelector("#bridge-problem").textContent = state.bridgeProblem || "";
   status.textContent = `Bridge: ${state.bridgeStatus || "disconnected"}${paused.checked ? " · awareness paused" : ""}`;
   document.querySelector("#origins").replaceChildren(...origins.map(origin => {
     const li = document.createElement("li");

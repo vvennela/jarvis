@@ -77,3 +77,71 @@ async fn public_artist_lookup_and_native_playback_are_verified_end_to_end() {
     .await
     .expect("live music check exceeded its total deadline");
 }
+
+#[tokio::test]
+#[ignore = "requires JARVIS_LIVE_SPOTIFY_CONVERSATION=1; real model, public catalog and native playback"]
+async fn real_conversation_plans_artist_tool_and_verifies_native_playback() {
+    use jarvis::{
+        context::{ContextStore, Limits},
+        conversation::Conversation,
+        tool_runtime::ToolRuntime,
+    };
+    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc};
+    assert_eq!(
+        std::env::var("JARVIS_LIVE_SPOTIFY_CONVERSATION").as_deref(),
+        Ok("1")
+    );
+    let mut nonce = [0u8; 8];
+    getrandom::fill(&mut nonce).unwrap();
+    let suffix: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("runtime")
+        .join(format!("live-music-conversation-{suffix}"));
+    fs::create_dir_all(&directory).unwrap();
+    let directory = fs::canonicalize(directory).unwrap();
+    let database = directory.join("context.sqlite");
+    drop(ContextStore::open(&database, Limits::default()).unwrap());
+    SpotifyPlayback::native().expect("Spotify must be installed for this live test");
+    // The owned wrapper records actual invocation, then runs the exact production
+    // AppleScript through macOS. It neither replaces the script nor fakes output.
+    let marker = directory.join("native-invoked");
+    let escaped = marker.to_str().unwrap().replace('\'', "'\\''");
+    let wrapper = directory.join("verified-osascript");
+    fs::write(
+        &wrapper,
+        format!("#!/bin/sh\n: > '{escaped}'\nexec /usr/bin/osascript \"$@\"\n"),
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    let settings = load_provider_settings().unwrap();
+    let catalog = MusicCatalog::production(
+        settings
+            .get("YOU_API_KEY")
+            .expect("You credentials missing")
+            .clone(),
+    )
+    .unwrap();
+    let playback = SpotifyPlayback::with_executable(wrapper, Duration::from_secs(20)).unwrap();
+    let runtime = ToolRuntime::read_only(database.clone()).with_music(catalog, playback);
+    let mut conversation = Conversation::from_env(database).unwrap();
+    conversation.set_tool_runtime(Arc::new(runtime));
+    let started = Instant::now();
+    let reply = tokio::time::timeout(
+        Duration::from_secs(60),
+        conversation.ask("Play Metallica on Spotify"),
+    )
+    .await
+    .expect("conversation deadline exceeded")
+    .expect("conversation provider failed");
+    assert!(
+        marker.is_file(),
+        "the model did not invoke the actual native playback tool; public-fixture reply: {}",
+        reply.text
+    );
+    assert_eq!(reply.text, "Playing Metallica.");
+    println!(
+        "conversation_tool_verified=true native_playback_verified=true elapsed_ms={} acknowledgment_bytes={} private_context_sent=false",
+        started.elapsed().as_millis(),
+        reply.text.len()
+    );
+}

@@ -9,8 +9,10 @@
   let timer = null;
   let previous = null;
   let collecting = true;
+  let extractionTruncated = false;
 
   function extract() {
+    extractionTruncated = false;
     if (!document.body) return "";
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
     let text = "";
@@ -27,11 +29,12 @@
       // Cap before iteration to avoid giant text nodes consuming unbounded work.
       for (const point of `${fragment.slice(0, MAX_BYTES)} `) {
         const size = encoder.encode(point).length;
-        if (bytes + size > MAX_BYTES) return text.trim();
+        if (bytes + size > MAX_BYTES) { extractionTruncated = true; return text.trim(); }
         text += point;
         bytes += size;
       }
     }
+    extractionTruncated = seen >= MAX_NODES || bytes >= MAX_BYTES;
     return text.trim();
   }
 
@@ -61,7 +64,11 @@
   });
   chrome.runtime.onMessage.addListener((message, sender, reply) => {
     if (sender.id !== chrome.runtime.id) return;
-    if (message?.type === "jarvis.pause") {
+    if (message?.type === "jarvis.read") {
+      if (!collecting) { reply({ unavailable: true }); return; }
+      const content = extract();
+      reply({ content, truncated: extractionTruncated });
+    } else if (message?.type === "jarvis.pause") {
       collecting = false;
       previous = null;
       clearTimeout(timer);

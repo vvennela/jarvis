@@ -143,11 +143,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             jarvis::bridge::validate_extension_origin(id, origin)?;
             let mut store =
                 jarvis::context::ContextStore::open(std::path::Path::new(db), Default::default())?;
-            jarvis::bridge::run_session(
-                std::io::stdin().lock(),
+            jarvis::bridge::run_live_session(
+                std::io::stdin(),
                 std::io::stdout().lock(),
                 &mut store,
+                &jarvis::browser_tools::socket_path()?,
             )?;
+            Ok(())
+        }
+        [command] if command == "browser-status" => {
+            println!(
+                "{}",
+                serde_json::to_string(&jarvis::browser_tools::setup_status().await)?
+            );
             Ok(())
         }
         [command] if command == "doctor" => {
@@ -227,7 +235,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         [flag] if flag == "--help" || flag == "-h" => {
             println!(
-                "Jarvis context and review CLI\n\njarvis index --db <path> --root <directory>\njarvis watch --db <path> --root <directory> --seconds <1..3600>\njarvis search --db <path> <query>\njarvis recent --db <path>\njarvis doctor\njarvis route <question>\njarvis ask --db <path> --question <text>\njarvis draft --db <path> --request <text> --output <file> [--source <resource-id>]\njarvis install-browser-host --extension-id <id> --db <absolute-path>\njarvis demo --output <directory> (scripted review fixture)\njarvis policy <send|pay|delete>"
+                "Jarvis context and review CLI\n\njarvis index --db <path> --root <directory>\njarvis watch --db <path> --root <directory> --seconds <1..3600>\njarvis search --db <path> <query>\njarvis recent --db <path>\njarvis doctor\njarvis browser-status\njarvis route <question>\njarvis ask --db <path> --question <text>\njarvis draft --db <path> --request <text> --output <file> [--source <resource-id>]\njarvis install-browser-host --extension-id <id> --db <absolute-path>\njarvis demo --output <directory> (scripted review fixture)\njarvis policy <send|pay|delete>"
             );
             Ok(())
         }

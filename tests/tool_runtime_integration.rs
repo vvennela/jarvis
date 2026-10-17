@@ -145,7 +145,14 @@ impl DraftSubmitter for DraftProbe {
     }
 }
 fn packet(request: &Value) -> Value {
-    serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap()
+    serde_json::from_str(
+        request["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("Context packet (history and source evidence):\n")
+            .unwrap_or(request["messages"][1]["content"].as_str().unwrap()),
+    )
+    .unwrap()
 }
 fn tool_results(request: &Value) -> Vec<Value> {
     request["messages"]
@@ -186,6 +193,26 @@ async fn search_then_read_uses_actual_versioned_context_and_returns_a_final_answ
     );
     let requests = peer.requests();
     assert_eq!(requests.len(), 3);
+    let initial_messages = requests[0]["messages"].as_array().unwrap();
+    assert_eq!(initial_messages.len(), 3);
+    assert_eq!(initial_messages.last().unwrap()["role"], "user");
+    assert_eq!(
+        initial_messages.last().unwrap()["content"],
+        "What should I review for Beacon?"
+    );
+    assert!(
+        initial_messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("Context packet (history and source evidence):\n")
+    );
+    assert!(
+        packet(&requests[0])["untrusted_evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["trust"] == "untrusted_content")
+    );
     let specs = requests[0]["tools"].as_array().unwrap();
     assert!(
         specs

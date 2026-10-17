@@ -21,6 +21,7 @@ pub use tool_protocol::{
 pub const JEV_ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
 pub const CRUSOE_ENDPOINT: &str = "https://api.inference.crusoecloud.com/v1/chat/completions";
 pub const NEMOTRON_MODEL: &str = "nvidia/Nemotron-3.5-Lightning-30B-A3B";
+pub const NEMOTRON_NANO_MODEL: &str = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B";
 pub const MAX_INPUT_BYTES: usize = 64 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const MAX_OUTPUT_TOKENS: u32 = 4096;
@@ -581,7 +582,11 @@ impl CrusoeClient {
             stream: false,
             // Verified against Crusoe's live model catalog and endpoint. Keep
             // short conversational calls in direct-answer mode for this model.
-            chat_template_kwargs: (self.model == NEMOTRON_MODEL).then_some(ThinkingOptions {
+            chat_template_kwargs: matches!(
+                self.model.as_str(),
+                NEMOTRON_MODEL | NEMOTRON_NANO_MODEL
+            )
+            .then_some(ThinkingOptions {
                 enable_thinking: false,
             }),
         };

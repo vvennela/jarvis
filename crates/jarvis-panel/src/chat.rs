@@ -143,17 +143,28 @@ impl ConversationWorker {
         if let Ok(apps) = AppExecutor::native() {
             tools = tools.with_apps(apps);
         }
+        #[cfg(unix)]
+        if let Ok(browser) = jarvis::browser_tools::BrowserClient::native() {
+            tools = tools.with_browser(browser);
+        }
         if let Some(tasks) = tasks {
-            tools = tools.with_draft_submitter(tasks);
+            tools = tools
+                .with_file_edits(tasks.clone())
+                .with_draft_submitter(tasks);
         }
         if let Ok(settings) = jarvis::conversation::load_provider_settings()
             && let Some(key) = settings
                 .get("YOU_API_KEY")
                 .filter(|key| !key.trim().is_empty())
-            && let Ok(catalog) = MusicCatalog::production(key.clone())
-            && let Ok(playback) = SpotifyPlayback::native()
         {
-            tools = tools.with_music(catalog, playback);
+            if let Ok(catalog) = MusicCatalog::production(key.clone())
+                && let Ok(playback) = SpotifyPlayback::native()
+            {
+                tools = tools.with_music(catalog, playback);
+            }
+            if let Ok(search) = jarvis::web_search::WebSearch::production(key.clone()) {
+                tools = tools.with_web_search(search);
+            }
         }
         Self::with_factory_and_tools(
             move || Conversation::from_env(database),

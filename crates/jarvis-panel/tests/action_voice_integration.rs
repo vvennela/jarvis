@@ -372,8 +372,14 @@ async fn only_verified_action_results_reach_followup_conversation_history() {
         wait(|| !chat.control.busy());
         assert_eq!(chat.control.snapshot().state, State::Reply);
         let request = server.await.unwrap();
-        let packet: serde_json::Value =
-            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+        let packet: serde_json::Value = serde_json::from_str(
+            request["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("Context packet (history and source evidence):\n")
+                .unwrap_or(request["messages"][1]["content"].as_str().unwrap()),
+        )
+        .unwrap();
         let history = packet["history"].as_array().unwrap();
         if outcome == "success" {
             assert_eq!(history.len(), 1);

@@ -133,7 +133,14 @@ impl Peer {
             .unwrap()
             .iter()
             .map(|request| {
-                serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap()
+                serde_json::from_str(
+                    request["messages"][1]["content"]
+                        .as_str()
+                        .unwrap()
+                        .strip_prefix("Context packet (history and source evidence):\n")
+                        .unwrap_or(request["messages"][1]["content"].as_str().unwrap()),
+                )
+                .unwrap()
             })
             .collect()
     }

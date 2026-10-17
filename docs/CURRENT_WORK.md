@@ -1,29 +1,30 @@
 # Jarvis — current work
 
-Verified checkpoint: October 17, 2026, canonical artist-selection increment after `7343960`. Maintained from Vishnu's requests and repository/test results; this note is not a complete desktop activity log.
+Maintained development note, October 17, 2026. This records the project priorities and verified progress; it is not a complete desktop activity log.
 
-## Objective and deadline
+## Next action
 
-Prepare a useful, always-on Mac companion for judging by approximately **3:41 PM Pacific today (22:41 UTC)**. Show maintained context, hands-free requests, responsive conversation, approved app actions, and background work ending with a verified artifact for human review.
+Finish the installed-app rehearsal: reliable voice request, fresh shared context, an actual tool action, and a background result opened for review. The next checkpoint is **3:23 PM Pacific today (22:23 UTC)**, followed by two hours of product fixes requested by Vishnu.
 
 ## Current priorities
 
-1. **Rehearse artist selection by voice once Crusoe tool calling is available.** The You key is configured and live search → canonical Spotify identity → native Metallica playback passed in **3.276 seconds** (lookup: 2.470 seconds). Spotify aliases are resolved from its own structured embed identity. The full model → search → native path has passed integration fixtures, but the live model planning call still receives HTTP 429. Exact approved app requests continue to bypass hosted inference.
-2. **Verify the complete Nemotron tool-call protocol against Crusoe.** Typed tools and their bounded runner are implemented and fixture-tested. Recent full-protocol probes received HTTP 429, identified as `max_requests_limit (orchestrator)`; a minimal 16-token text request returned HTTP 200. This is not evidence of missing API keys. Respect provider cooldown; do not describe full live tool calling as verified yet.
-3. **Check the current voice build with ordinary human speech.** A previous human wake worked on the first attempt, but the current quiet-audio/preroll increment still needs acceptance. The current app reports loaded wake listening with healthy numeric capture counters and zero reported capture errors; that does not prove a human command succeeded. AirPods input and output were previously verified at 24 kHz mono, but the current device name has not been confirmed.
-4. **Rehearse shared context and background review.** Ask what to do next, save a truthful priority change, ask again, and delegate a handoff. Confirm the new draft reflects the changed note and opens only after explicit verified review. Then time the three-minute walkthrough in `docs/demo.md`.
+1. Make model-directed actions execute consistently. The Spotify adapter resolves a named artist and verifies real playback. The conversational model still sometimes asks for redundant confirmation; fix this before presenting the full voice-to-music path.
+2. Connect the browser extension in Arc and demonstrate a fresh page change reaching the shared index. Extension/native-host/fresh-read integration tests pass; installation in the current browser session is pending.
+3. Rehearse human voice on the current AirPods route. Generated audio passes real local wake detection, VAD, Whisper, handoff and speech synthesis; the model response in that test is a fixture. Test natural pauses and first-attempt wake separately.
+4. Demonstrate a file edit or handoff while conversation remains available. Open the verified result explicitly. Rehearse the three-minute story in demo.md.
 
-## Verified implementation
+## Verified now
 
-- Artist-selection validation: **334 workspace tests passed, 15 ignored**; formatting and all-target clippy passed. Independent tests cover arbitrary artist identities, unsafe proposals, ambiguity, credential boundaries, cancellation and wrong playback. Production You search and native Spotify playback passed a live combined check; model planning and human voice were outside that measurement. The live hosted tool protocol still returned HTTP 429. Ignored live/hardware tests are not included as successes.
-- Native menu-bar companion with compact glass card, real busy spinner, local keyword detection and Whisper transcription, microphone controls and spoken responses. Awareness and draft work run independently.
-- Explicit-root file notifications, hashes, SQLite history/FTS, foreground app metadata, source-balanced retrieval and next-work ranking. The current demo scope is this project's docs, not all Documents/Downloads.
-- Jev routing overlaps context retrieval. Jev can propose typed Spotify actions; the original caller request still passes the policy gate. Ordinary exact app actions need no model.
-- Nemotron function-call adapter and bounded runner support indexed search/read, approved application opening, Spotify play/pause, named-artist selection when You is configured, and local draft delegation. Tool results retain untrusted provenance. Model prose cannot execute tools; actions recheck original caller intent and return observed outcomes without a further model call.
-- Independent TaskWorker creates local drafts, rechecks evidence versions and artifact identity/content, and leaves results ready for explicit review. One earlier production check completed in **8.064 seconds**, producing **4,521 bytes** from the real project index. Tampering correctly blocked review. That measurement is an engine check, not spoken end-to-end latency.
+- Nemotron Nano through Crusoe completes live native function-call/result continuation. Lightning's earlier HTTP 429 was a model quota response, not a missing API key. The configured conversation and worker model is `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`.
+- Live conversation → file-edit tool → background worker → verified review artifact → restart recovery passed in 2.098 seconds using a fictional Markdown fixture. Original content stayed unchanged. Malformed reasoning delimiters now block publication.
+- Production You search → canonical Spotify identity → native playback passed in 3.276 seconds. This measurement excludes model planning and human voice.
+- Public You web research returned five results in 3.45 seconds. Only the original user request can become the search query; model-added file or page contents cannot be appended.
+- Separate live fictional file-edit and draft checks passed. Background work preserves source versions and verifies exact artifacts before review; changed sources or modified artifacts revoke readiness.
+- Menu-bar companion, glass card and spinner; local keyword recognition and transcription; spoken replies; incremental file indexing; foreground application metadata; parallel context retrieval and Jev routing; typed, policy-checked app/context/music/draft/file/browser tools.
+- Durable job metadata restores verified review results without replaying model calls or actions. Interrupted jobs become blocked and need an explicit new request.
 
-## Still pending
+## Remaining scope
 
-Live installed browser-page collection and browser actions, a general coding worker, durable job restart recovery, utterance-frozen focus, full-duplex voice interruption and speaker identification remain future milestones. The browser bridge currently provides read-only collection code and fixtures. Recheck the current microphone route during rehearsal rather than assuming it from an output connection.
+Current awareness watches the approved project docs. Browser actions, arbitrary repository coding/testing, continuous task reconstruction across every app, utterance-frozen focus, full-duplex voice interruption and speaker identification remain later work. The browser bridge provides approved-site collection and fresh read tools; actual browser-session installation still needs acceptance.
 
-Sending messages, paying, deleting and final booking submission have no automatic capability. Drafts remain local and unsent; preparing a handoff for Brian does not resolve an email address or send it.
+Sensitive tasks produce local review artifacts. Sending, payment, deletion and final booking submission are not automatic capabilities.

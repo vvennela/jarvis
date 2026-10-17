@@ -1,7 +1,7 @@
 //! Real loopback function protocol checks. No tool is executed.
 use jarvis::providers::{
-    CrusoeClient, NEMOTRON_MODEL, ProviderConfig, ProviderError, ToolCall, ToolMessage, ToolSpec,
-    ToolStep,
+    CrusoeClient, MAX_TOOL_SPECS, NEMOTRON_MODEL, NEMOTRON_NANO_MODEL, ProviderConfig,
+    ProviderError, ToolCall, ToolMessage, ToolSpec, ToolStep,
 };
 use serde_json::{Value, json};
 use std::{
@@ -319,4 +319,72 @@ async fn live_nemotron_function_proposal_without_execution() {
     })
     .await
     .expect("probe deadline exceeded");
+}
+
+#[tokio::test]
+async fn tool_requests_disable_thinking_only_for_verified_models() {
+    for model in [
+        NEMOTRON_MODEL,
+        NEMOTRON_NANO_MODEL,
+        "fixture/unrelated",
+        "nvidia/nvidia-nemotron-3-nano-30b-a3b",
+    ] {
+        let peer = Peer::new(vec![text_response()], Duration::ZERO);
+        let client = CrusoeClient::new(
+            "fixture-key",
+            model,
+            ProviderConfig::loopback_for_tests(&peer.url, Duration::from_secs(2)).unwrap(),
+        )
+        .unwrap();
+        client
+            .step_with_tools(&[ToolMessage::user("Inspect fixture")], &spec(), 128)
+            .await
+            .unwrap();
+        let requests = peer.requests.lock().unwrap();
+        let request = &requests[0];
+        assert_eq!(request["model"], model);
+        if [NEMOTRON_MODEL, NEMOTRON_NANO_MODEL].contains(&model) {
+            assert_eq!(request["chat_template_kwargs"]["enable_thinking"], false);
+        } else {
+            assert!(request.get("chat_template_kwargs").is_none());
+        }
+    }
+}
+#[tokio::test]
+async fn expanded_registry_accepts_exact_bound_and_rejects_one_more_before_http() {
+    let tools: Vec<_> = (0..=MAX_TOOL_SPECS)
+        .map(|i| ToolSpec {
+            name: format!("fixture_{i}"),
+            description: "Read fixture".into(),
+            parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
+        })
+        .collect();
+    assert_eq!(
+        MAX_TOOL_SPECS, 12,
+        "the full browser/file registry must fit"
+    );
+    let peer = Peer::new(vec![text_response()], Duration::ZERO);
+    let client = peer.client();
+    assert_eq!(
+        client
+            .step_with_tools(&[ToolMessage::user("Read fixture")], &tools, 128)
+            .await,
+        Err(ProviderError::InvalidInput)
+    );
+    assert!(peer.requests.lock().unwrap().is_empty());
+    client
+        .step_with_tools(
+            &[ToolMessage::user("Read fixture")],
+            &tools[..MAX_TOOL_SPECS],
+            128,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        peer.requests.lock().unwrap()[0]["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
+        MAX_TOOL_SPECS
+    );
 }

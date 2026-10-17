@@ -1,6 +1,6 @@
 # Fresh browser tools — implementation contract
 
-**Status: pending implementation.** The current extension publishes approved browser context to the index. This increment adds fresh reads through that extension session while the user keeps working.
+**Status: implemented; installed-browser validation pending.** The extension publishes approved context and serves fresh reads through its native session. Real Unix-socket/native-frame tests and JavaScript browser simulations cover the transport; the remaining live step is loading the extension in Arc and approving a site.
 
 ## Tools and behavior
 
@@ -22,7 +22,7 @@ Identity is `(session_id, tab_id, document_id)`. Tag page-derived fields `untrus
 
 ## Bounds and lifecycle
 
-Allow one active command, four queued commands, 512 KiB frames and a five-second end-to-end deadline. Multiplex observations and commands so idle stdin cannot block requests. A per-tab read lease tracks expected identity without locking the browser. Navigation, permission removal, pause, disconnect or cancellation invalidates it. Drop late/duplicate results; reconnect invalidates old handles. Statuses: `ok`, `stale_document`, `permission_required`, `unavailable`, `cancelled`, `timeout`.
+Allow one active fresh command, a bounded 32-message native observation inbox, 512 KiB native frames, 4 KiB client requests and a five-second end-to-end deadline. The extension releases a stalled read lease after 4.5 seconds. Multiplex observations and commands so idle stdin cannot block requests. A per-tab read lease tracks expected identity without locking the browser. Navigation, permission removal, pause, disconnect or cancellation invalidates it. Drop late/duplicate results; reconnect invalidates old handles. Statuses: `ok`, `stale_document`, `permission_required`, `unavailable`, `cancelled`, `timeout`.
 
 ## Acceptance
 

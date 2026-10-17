@@ -1,7 +1,7 @@
 //! Bounded OpenAI-compatible function proposals. This module never executes tools.
 use super::{
-    CrusoeClient, MAX_INPUT_BYTES, MAX_OUTPUT_TOKENS, NEMOTRON_MODEL, ProviderError,
-    ThinkingOptions, check_text,
+    CrusoeClient, MAX_INPUT_BYTES, MAX_OUTPUT_TOKENS, NEMOTRON_MODEL, NEMOTRON_NANO_MODEL,
+    ProviderError, ThinkingOptions, check_text,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -10,7 +10,7 @@ use std::{
     io::{self, Write},
 };
 
-pub const MAX_TOOL_SPECS: usize = 8;
+pub const MAX_TOOL_SPECS: usize = 12;
 pub const MAX_TOOL_CALLS: usize = 4;
 pub const MAX_TOOL_ARGUMENT_BYTES: usize = 8192;
 
@@ -335,7 +335,11 @@ impl CrusoeClient {
             tool_choice: "auto",
             max_tokens: max_output_tokens,
             stream: false,
-            chat_template_kwargs: (self.model == NEMOTRON_MODEL).then_some(ThinkingOptions {
+            chat_template_kwargs: matches!(
+                self.model.as_str(),
+                NEMOTRON_MODEL | NEMOTRON_NANO_MODEL
+            )
+            .then_some(ThinkingOptions {
                 enable_thinking: false,
             }),
         };

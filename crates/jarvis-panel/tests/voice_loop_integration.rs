@@ -233,8 +233,14 @@ fn woken_question_uses_shared_context_and_reply_reaches_owned_speech_child_once(
     assert_eq!(fs::read_to_string(dir.join("plays")).unwrap(), "played\n");
     let requests = peer.requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
-    let packet: Value =
-        serde_json::from_str(requests[0]["messages"][1]["content"].as_str().unwrap()).unwrap();
+    let packet: Value = serde_json::from_str(
+        requests[0]["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("Context packet (history and source evidence):\n")
+            .unwrap_or(requests[0]["messages"][1]["content"].as_str().unwrap()),
+    )
+    .unwrap();
     assert_eq!(packet["user_request"], "where was I?");
     let evidence = packet["untrusted_evidence"].as_array().unwrap();
     assert!(evidence.iter().any(|item| {
@@ -398,5 +404,153 @@ fn cancelled_voice_request_does_not_speak_late_provider_failure() {
     assert_eq!(
         fixture.wake.control.snapshot().state,
         jarvis_panel::wakeworker::State::WakeListening
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires trusted local KWS/VAD/Whisper models and generated command WAV; synthesizes an owned audio file, no microphone or playback"]
+fn generated_speech_reaches_real_local_recognition_conversation_and_local_speech_synthesis() {
+    use jarvis_panel::wakeworker::KeywordStatus;
+    struct LocalBackend {
+        kws: jarvis_voice::kws::LocalKeywordSpotter,
+        vad: jarvis_voice::vad::LocalVoiceActivity,
+        stt: jarvis_voice::Transcriber,
+        chunks: VecDeque<Vec<f32>>,
+    }
+    impl WakeBackend for LocalBackend {
+        fn start(&mut self) -> Result<(), &'static str> {
+            Ok(())
+        }
+        fn stop(&mut self) {}
+        fn poll(&mut self) -> Result<(Vec<f32>, bool), &'static str> {
+            Ok((self.chunks.pop_front().unwrap_or_default(), false))
+        }
+        fn wake_fallback_enabled(&self) -> bool {
+            true
+        }
+        fn speech_activity(&mut self, samples: &[f32]) -> Result<Option<Vec<bool>>, &'static str> {
+            self.vad.classify(samples).map(Some)
+        }
+        fn keyword_spot(&mut self, samples: &[f32]) -> Result<Option<KeywordStatus>, &'static str> {
+            Ok(Some(KeywordStatus {
+                lookback_samples: self.kws.accept(samples)?.map(|v| v.lookback_samples),
+            }))
+        }
+        fn reset_keyword(&mut self) {
+            self.kws.reset();
+            self.vad.reset();
+        }
+        fn transcribe(
+            &mut self,
+            samples: &[f32],
+            cancel: Arc<AtomicBool>,
+        ) -> Result<String, &'static str> {
+            self.stt
+                .transcribe_cancelled(samples, cancel)
+                .map_err(|_| "fixture transcription failed")
+        }
+    }
+    let path = |name| {
+        std::path::PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("set {name}")))
+    };
+    let kws = path("JARVIS_TEST_KWS_MODEL");
+    let vad = path("JARVIS_TEST_VAD_MODEL");
+    let whisper = path("JARVIS_TEST_WHISPER_MODEL");
+    let wav = path("JARVIS_TEST_WAKE_WAV");
+    let mut samples = vec![0.0; 16000];
+    samples.extend(jarvis_voice::load_wav(&wav).unwrap());
+    samples.extend(vec![0.0; 32000]);
+    let dir = TempDir::new();
+    let database = dir.join("context.db");
+    let mut store = ContextStore::open(&database, Limits::default()).unwrap();
+    store
+        .observe(
+            "file:CURRENT_WORK.md",
+            "Current task: complete the Orchid latency benchmark before the demo",
+            Source::File,
+            1,
+        )
+        .unwrap();
+    drop(store);
+    let response = "Finish the Orchid latency benchmark before the demo.";
+    let peer = Peer::new(response);
+    let client = CrusoeClient::new(
+        "fixture-only-key",
+        NEMOTRON_MODEL,
+        ProviderConfig::loopback_for_tests(&peer.url, Duration::from_secs(3)).unwrap(),
+    )
+    .unwrap();
+    let mut chat =
+        ConversationWorker::with_factory(move || Ok(Conversation::new(database, None, client)))
+            .unwrap();
+    let executable = dir.join("synthesize-reply");
+    fs::write(&executable,"#!/bin/sh\nfixture_dir=${0%/*}\n/bin/cat > \"$fixture_dir/spoken\"\n/usr/bin/say -f \"$fixture_dir/spoken\" -o \"$fixture_dir/reply.aiff\"\nprintf 'synthesized\\n' >> \"$fixture_dir/plays\"\n").unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut speech = SpeechWorker::with_executable(executable).unwrap();
+    let mut wake = WakeWorker::with_backend(move || {
+        Ok(Box::new(LocalBackend {
+            kws: jarvis_voice::kws::LocalKeywordSpotter::load(&kws)?,
+            vad: jarvis_voice::vad::LocalVoiceActivity::load(&vad)?,
+            stt: jarvis_voice::Transcriber::load(&whisper)
+                .map_err(|_| "local model unavailable")?,
+            chunks: samples.chunks(320).map(Vec::from).collect(),
+        }))
+    })
+    .unwrap();
+    wait(|| chat.control.available() && speech.control.available());
+    wake.control.set_enabled(true);
+    let mut handoff = jarvis_panel::voicehandoff::VoiceHandoff::default();
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while !dir.join("plays").exists() {
+        handoff.tick(&wake.control, &chat.control, &speech.control);
+        assert!(
+            Instant::now() < deadline,
+            "real local voice loop did not finish: {:?}",
+            wake.control.snapshot().state
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(fs::read_to_string(dir.join("spoken")).unwrap(), response);
+    let audio = fs::read(dir.join("reply.aiff")).unwrap();
+    assert!(audio.len() > 4096);
+    assert_eq!(&audio[..4], b"FORM");
+    assert_eq!(
+        fs::read_to_string(dir.join("plays")).unwrap(),
+        "synthesized\n"
+    );
+    let requests = peer.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let packet: Value = serde_json::from_str(
+        requests[0]["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("Context packet (history and source evidence):\n")
+            .unwrap_or(requests[0]["messages"][1]["content"].as_str().unwrap()),
+    )
+    .unwrap();
+    let question = packet["user_request"].as_str().unwrap().to_lowercase();
+    assert!(question.contains("work") && question.contains("next"));
+    assert!(!question.contains("jarvis"));
+    assert!(
+        packet["untrusted_evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["excerpt"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Orchid latency benchmark"))
+    );
+    drop(requests);
+    wake.control.shutdown();
+    chat.control.stop();
+    speech.control.shutdown();
+    wait(|| wake.is_finished() && chat.is_finished() && speech.is_finished());
+    wake.join().unwrap();
+    chat.join().unwrap();
+    speech.join().unwrap();
+    println!(
+        "generated_speech_local_models=true cloud_response=localhost_fixture speech_file_verified=true requests=1 microphone=false audible_playback=false"
     );
 }

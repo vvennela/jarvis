@@ -91,3 +91,11 @@ export class ObservationQueue {
   clear() { this.items.clear(); }
   get size() { return this.items.size; }
 }
+
+// Keep native-host failures useful without persisting arbitrary browser error text.
+export function nativeFailure(message) {
+  if (typeof message !== "string") return "The browser bridge disconnected. Reconnect to try again.";
+  if (/native messaging host not found/i.test(message)) return "Register the Jarvis native host, then reconnect.";
+  if (/access .* native messaging host is forbidden/i.test(message)) return "The registered extension ID does not match. Check the native host registration.";
+  return "The browser bridge disconnected. Reconnect to try again.";
+}

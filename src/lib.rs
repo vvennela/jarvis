@@ -8,15 +8,20 @@ pub mod app_tools;
 pub mod awareness;
 pub mod bridge;
 pub mod broker;
+#[cfg(unix)]
+pub mod browser_tools;
 pub mod context;
 pub mod conversation;
 pub mod draft;
 pub mod elevenlabs;
+pub mod file_work;
 pub mod install;
 pub mod music_catalog;
 pub mod providers;
 pub mod spotify_playback;
+pub mod task_journal;
 pub mod tool_runtime;
+pub mod web_search;
 
 pub const MAX_REVIEW_BYTES: usize = 64 * 1024;
 pub const MAX_ANSWER_BYTES: usize = 8192;
@@ -34,6 +39,7 @@ pub enum Operation {
     PauseMedia,
     CloseTab,
     DraftMessage,
+    PrepareFileEdit,
     PreparePurchase,
     PrepareDeletion,
     SendMessage,
@@ -47,7 +53,10 @@ impl Operation {
     pub fn needs_review(self) -> bool {
         matches!(
             self,
-            Self::DraftMessage | Self::PreparePurchase | Self::PrepareDeletion
+            Self::DraftMessage
+                | Self::PrepareFileEdit
+                | Self::PreparePurchase
+                | Self::PrepareDeletion
         )
     }
 }

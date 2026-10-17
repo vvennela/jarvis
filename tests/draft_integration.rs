@@ -178,8 +178,14 @@ async fn produces_verified_unsent_artifact_and_keeps_model_instructions_inert() 
             .unwrap()
             .contains("SOURCE_INJECTION")
     );
-    let packet: Value =
-        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    let packet: Value = serde_json::from_str(
+        request["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("Context packet (history and source evidence):\n")
+            .unwrap_or(request["messages"][1]["content"].as_str().unwrap()),
+    )
+    .unwrap();
     assert_eq!(packet["untrusted_evidence"][0]["resource_id"], "file:spec");
     assert_eq!(packet["untrusted_evidence"][0]["version"], 1);
     assert_eq!(

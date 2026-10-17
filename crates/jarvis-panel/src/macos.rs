@@ -109,7 +109,7 @@ define_class!(
         #[unsafe(method(openDraft:))]
         fn open_draft(&self, _sender: Option<&AnyObject>) {
             self.ivars().action_error.set(
-                self.ivars().tasks.request_review().err().map(|_| "The draft is not ready to open yet.")
+                self.ivars().tasks.request_review().err().map(|_| "The result is not ready to open yet.")
             );
         }
         #[unsafe(method(readAloud:))]
@@ -419,7 +419,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     // SAFETY: This retained main-thread target implements openDraft:.
     let review_button = unsafe {
         NSButton::buttonWithTitle_target_action(
-            &NSString::from_str("Open draft"),
+            &NSString::from_str("Open result"),
             Some(&actions),
             Some(sel!(openDraft:)),
             mtm,

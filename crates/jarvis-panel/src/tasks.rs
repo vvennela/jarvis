@@ -1,9 +1,11 @@
-//! One background draft at a time. Artifacts persist; job state is in-process.
+//! One background task at a time, with verified review recovery after restart.
 //! Text generation never sends a message or chooses an executable or output path.
 use jarvis::{
     broker,
     context::Source,
     draft::{BlockReason, DraftError, DraftOutcome, DraftTask, MAX_INSTRUCTION_BYTES},
+    file_work::FileEditTask,
+    task_journal::{EvidenceSnapshot, RecoveredReview, Restore, TaskJournal, TaskKind},
 };
 use std::{
     fs,
@@ -44,6 +46,10 @@ pub enum SubmitError {
 }
 enum Command {
     Generate(String),
+    Edit {
+        instruction: String,
+        resource_id: String,
+    },
     Review,
 }
 pub struct Control {
@@ -70,6 +76,24 @@ impl jarvis::tool_runtime::DraftSubmitter for Control {
         })
     }
 }
+impl jarvis::tool_runtime::FileEditSubmitter for Control {
+    fn submit_edit(&self, original_user_request: &str, resource_id: &str) -> Result<(), String> {
+        self.submit_file_edit(original_user_request.to_owned(), resource_id.to_owned())
+            .map_err(|error| {
+                match error {
+                    SubmitError::Busy => {
+                        "A background task is already running. Let it finish or cancel it first."
+                    }
+                    SubmitError::Unavailable => "The background file worker is unavailable.",
+                    SubmitError::InvalidRequest => {
+                        "The file edit request or indexed resource is invalid."
+                    }
+                    SubmitError::NotReady => "The file edit is not ready for review.",
+                }
+                .to_owned()
+            })
+    }
+}
 impl Control {
     pub fn snapshot(&self) -> Snapshot {
         self.snapshot
@@ -88,6 +112,25 @@ impl Control {
             return Err(SubmitError::InvalidRequest);
         }
         self.enqueue(Command::Generate(instruction))
+    }
+    pub fn submit_file_edit(
+        &self,
+        instruction: String,
+        resource_id: String,
+    ) -> Result<(), SubmitError> {
+        if instruction.trim().is_empty()
+            || instruction.len() > MAX_INSTRUCTION_BYTES
+            || instruction.contains('\0')
+            || !resource_id.starts_with("file:")
+            || resource_id.len() > 2048
+            || resource_id.contains('\0')
+        {
+            return Err(SubmitError::InvalidRequest);
+        }
+        self.enqueue(Command::Edit {
+            instruction,
+            resource_id,
+        })
     }
     pub fn request_review(&self) -> Result<(), SubmitError> {
         if self.snapshot().state != State::ReadyForReview {
@@ -141,6 +184,20 @@ impl Control {
     }
 }
 
+enum RetainedTask {
+    Draft(DraftTask),
+    Edit(FileEditTask),
+    Recovered(RecoveredReview),
+}
+impl RetainedTask {
+    fn review(&mut self) -> Result<DraftOutcome, DraftError> {
+        match self {
+            Self::Draft(task) => task.review(),
+            Self::Edit(task) => task.review(),
+            Self::Recovered(task) => task.review().map_err(|_| DraftError::Artifact),
+        }
+    }
+}
 pub struct TaskWorker {
     pub control: Arc<Control>,
     handle: Option<JoinHandle<()>>,
@@ -158,7 +215,24 @@ impl TaskWorker {
     pub fn with_factory(
         database: PathBuf,
         output_dir: PathBuf,
+        factory: impl FnMut(PathBuf, String, String) -> Result<DraftTask, DraftError> + Send + 'static,
+        opener: PathBuf,
+    ) -> Result<Self, &'static str> {
+        Self::with_factories(
+            database,
+            output_dir,
+            factory,
+            FileEditTask::from_env,
+            opener,
+        )
+    }
+    pub fn with_factories(
+        database: PathBuf,
+        output_dir: PathBuf,
         mut factory: impl FnMut(PathBuf, String, String) -> Result<DraftTask, DraftError>
+        + Send
+        + 'static,
+        mut edit_factory: impl FnMut(PathBuf, String, String) -> Result<FileEditTask, DraftError>
         + Send
         + 'static,
         opener: PathBuf,
@@ -167,6 +241,32 @@ impl TaskWorker {
         if !opener.is_absolute() {
             return Err("Review opener must be an absolute executable path");
         }
+        let journal = TaskJournal::new(&database, &output_dir)
+            .map_err(|_| "Background task journal could not be initialized")?;
+        let restored = journal.restore();
+        let (initial_state, initial_text, initial_path, recovered) = match restored {
+            Restore::Empty => (State::Idle, "Ready to prepare a local draft.", None, None),
+            Restore::Blocked => (
+                State::Blocked,
+                "The previous task was interrupted or its evidence changed. Start a fresh task.",
+                None,
+                None,
+            ),
+            Restore::Ready(review) => match review.review() {
+                Ok(DraftOutcome::ReadyForReview { path, .. }) => (
+                    State::ReadyForReview,
+                    "Your previous result is verified and ready for review.",
+                    Some(path),
+                    Some(RetainedTask::Recovered(review)),
+                ),
+                _ => (
+                    State::Blocked,
+                    "The previous result could not be verified. Start a fresh task.",
+                    None,
+                    None,
+                ),
+            },
+        };
         let (sender, mut receiver) = mpsc::channel(1);
         let (changed, mut changes) = watch::channel(0u64);
         let control = Arc::new(Control {
@@ -177,10 +277,10 @@ impl TaskWorker {
             stopping: AtomicBool::new(false),
             submission: Mutex::new(()),
             snapshot: Mutex::new(Snapshot {
-                state: State::Idle,
-                text: "Ready to prepare a local draft.".into(),
+                state: initial_state,
+                text: initial_text.into(),
                 revision: 0,
-                path: None,
+                path: initial_path,
             }),
         });
         let state = control.clone();
@@ -190,7 +290,7 @@ impl TaskWorker {
                 Err(_)=>{state.update(State::Failed,"The background draft runtime could not start.",None);state.stopping.store(true,Ordering::Release);state.busy.store(false,Ordering::Release);return;}
             };
             runtime.block_on(async move {
-                let mut retained:Option<DraftTask>=None;
+                let mut retained:Option<RetainedTask>=recovered;
                 loop {
                     if state.stopping.load(Ordering::Acquire) { break; }
                     let command=tokio::select! {
@@ -199,6 +299,13 @@ impl TaskWorker {
                         command=receiver.recv()=>match command {Some(command)=>command,None=>break},
                     };
                     if state.stopping.load(Ordering::Acquire) { break; }
+                    let new_kind = match &command { Command::Generate(_) => Some(TaskKind::Draft), Command::Edit {..} => Some(TaskKind::FileEdit), Command::Review => None };
+                    if let Some(kind) = new_kind
+                        && journal.mark_running(kind).is_err() {
+                        retained=None;
+                        state.update(State::Blocked,"The task journal could not be saved. No background work was started.",None);
+                        state.busy.store(false,Ordering::Release); continue;
+                    }
                     if state.cancel.load(Ordering::Acquire) {
                         state.update(State::Cancelled,"Draft request cancelled.",None);
                         state.busy.store(false,Ordering::Release); continue;
@@ -224,16 +331,20 @@ impl TaskWorker {
                                     if ids.is_empty() {
                                         state.update(State::Blocked,"No indexed document or browser evidence is available for this draft. Add the relevant work context first.",None);
                                     } else {
+                                        let evidence = match journal.capture(TaskKind::Draft,&ids) {
+                                            Ok(evidence)=>evidence,
+                                            Err(_)=>{state.update(State::Blocked,"The source evidence could not be verified for recovery. No draft was generated.",None);state.busy.store(false,Ordering::Release);continue;}
+                                        };
                                         let id=fresh_id();
                                         let output=output_dir.join(format!("{id}.txt"));
                                         match factory(database.clone(),id.clone(),id) {
                                             Err(error)=>state.update(State::Failed,error_text(error),None),
                                             Ok(mut task)=>{
                                                 match generate_with_retry(&mut task,&instruction,&ids,&output,&state).await {
-                                                    Ok(outcome)=>publish(&state,outcome),
+                                                    Ok(outcome)=>publish_persisted(&journal,evidence,&state,outcome,false),
                                                     Err(error)=>state.update(State::Failed,error_text(error),None),
                                                 }
-                                                retained=Some(task);
+                                                retained=Some(RetainedTask::Draft(task));
                                             }
                                         }
                                     }
@@ -241,18 +352,40 @@ impl TaskWorker {
                                 Some(_)=>state.update(State::Blocked,"The local context index could not be read. No draft was generated.",None),
                             }
                         }
+                        Command::Edit {instruction,resource_id}=>{
+                            retained=None;
+                            state.update(State::Running,"Preparing a revised file in the background…",None);
+                            let evidence = match journal.capture(TaskKind::FileEdit,std::slice::from_ref(&resource_id)) {
+                                Ok(evidence)=>evidence,
+                                Err(_)=>{state.update(State::Blocked,"The source file could not be verified for recovery. No revised file was generated.",None);state.busy.store(false,Ordering::Release);continue;}
+                            };
+                            let id=fresh_id();
+                            let output=output_dir.join(format!("{id}.prepared.txt"));
+                            match edit_factory(database.clone(),id.clone(),id) {
+                                Err(error)=>state.update(State::Failed,error_text(error),None),
+                                Ok(mut task)=>{
+                                    match generate_edit_with_retry(&mut task,&instruction,&resource_id,&output,&state).await {
+                                        Ok(outcome)=>publish_persisted(&journal,evidence,&state,outcome,true),
+                                        Err(error)=>state.update(State::Failed,error_text(error),None),
+                                    }
+                                    retained=Some(RetainedTask::Edit(task));
+                                }
+                            }
+                        }
                         Command::Review=>{
-                            match retained.as_mut().map(DraftTask::review) {
+                            let editing=matches!(retained,Some(RetainedTask::Edit(_))) || matches!(&retained,Some(RetainedTask::Recovered(review)) if review.kind()==TaskKind::FileEdit);
+                            let recovered=matches!(retained,Some(RetainedTask::Recovered(_)));
+                            match retained.as_mut().map(RetainedTask::review) {
                                 Some(Ok(DraftOutcome::ReadyForReview{path,..}))=>{
                                     let result=open_review(&opener,&path,&state.cancel).await;
                                     match result {
-                                        Ok(())=>state.update(State::ReadyForReview,"Opened the verified local draft for your review. Nothing was sent.",Some(path)),
+                                        Ok(())=>state.update(State::ReadyForReview,if editing {"Opened the revised file for your review. The original is unchanged."} else {"Opened the verified local draft for your review. Nothing was sent."},Some(path)),
                                         Err(OpenError::Cancelled)=>state.update(State::ReadyForReview,"Opening the draft was cancelled. The local draft remains ready for review.",Some(path)),
                                         Err(OpenError::Failed)=>state.update(State::ReadyForReview,"The draft is verified, but its viewer could not open. Try Review again.",Some(path)),
                                     }
                                 }
-                                Some(Ok(outcome))=>publish(&state,outcome),
-                                Some(Err(error))=>state.update(State::Failed,error_text(error),None),
+                                Some(Ok(outcome))=>{ let _=journal.mark_running(if editing {TaskKind::FileEdit} else {TaskKind::Draft}); if editing {publish_edit(&state,outcome)} else {publish(&state,outcome)} },
+                                Some(Err(error))=>{ let _=journal.mark_running(if editing {TaskKind::FileEdit} else {TaskKind::Draft}); state.update(if recovered {State::Blocked} else {State::Failed},if recovered {"The recovered result or its source changed. Start a fresh task."} else {error_text(error)},None); },
                                 None=>state.update(State::Blocked,"There is no retained draft to review.",None),
                             }
                         }
@@ -361,6 +494,29 @@ fn fresh_id() -> String {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     )
+}
+fn publish_persisted(
+    journal: &TaskJournal,
+    evidence: EvidenceSnapshot,
+    control: &Control,
+    outcome: DraftOutcome,
+    editing: bool,
+) {
+    if matches!(outcome, DraftOutcome::ReadyForReview { .. })
+        && journal.save_ready(evidence, &outcome).is_err()
+    {
+        control.update(
+            State::Blocked,
+            "The result could not be durably verified. Start a fresh task before review.",
+            None,
+        );
+        return;
+    }
+    if editing {
+        publish_edit(control, outcome);
+    } else {
+        publish(control, outcome);
+    }
 }
 fn publish(control: &Control, outcome: DraftOutcome) {
     match outcome {
@@ -520,4 +676,40 @@ async fn open_review(executable: &Path, path: &Path, cancel: &AtomicBool) -> Res
         let _ = child.wait().await;
     }
     result
+}
+
+fn publish_edit(control: &Control, outcome: DraftOutcome) {
+    match outcome {
+        DraftOutcome::ReadyForReview { path, .. } => control.update(
+            State::ReadyForReview,
+            "I've prepared a revised file for your review. The original is unchanged.",
+            Some(path),
+        ),
+        DraftOutcome::Cancelled { .. } => control.update(
+            State::Cancelled,
+            "File edit cancelled. No revised file was published.",
+            None,
+        ),
+        other => publish(control, other),
+    }
+}
+async fn generate_edit_with_retry(
+    task: &mut FileEditTask,
+    instruction: &str,
+    resource_id: &str,
+    output: &Path,
+    control: &Control,
+) -> Result<DraftOutcome, DraftError> {
+    let started = Instant::now();
+    tokio::time::timeout(Duration::from_secs(90),async {
+        let result=task.generate(instruction,resource_id,output,control.cancel.clone()).await;
+        let delay=match &result {Err(DraftError::Provider(error))=>error.retry_delay(0),_=>None};
+        if let Some(delay)=delay {
+            let delay=delay.max(Duration::from_secs(2));
+            if delay>=Duration::from_secs(90).saturating_sub(started.elapsed()) {return result;}
+            control.update(State::Running,"The file-edit provider is busy. Retrying once…",None);
+            tokio::select! {biased; _=cancelled(&control.cancel)=>{},_=tokio::time::sleep(delay)=>{}}
+            task.generate(instruction,resource_id,output,control.cancel.clone()).await
+        } else {result}
+    }).await.unwrap_or(Err(DraftError::Provider(jarvis::providers::ProviderError::Timeout)))
 }

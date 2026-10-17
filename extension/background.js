@@ -1,6 +1,6 @@
 import {
   PROTOCOL_VERSION, HOST_NAME, MAX_CONTENT_BYTES, ObservationQueue,
-  cappedText, httpUrl, allowedTab, validContentSender, tabEvent,
+  cappedText, httpUrl, allowedTab, validContentSender, tabEvent, nativeFailure,
 } from "./protocol.js";
 
 const queue = new ObservationQueue();
@@ -47,7 +47,7 @@ function flush() {
 
 function emit(event) { queue.put(event); flush(); }
 
-function disconnect() {
+function disconnect(problem = "") {
   clearTimeout(handshakeTimer);
   handshakeTimer = null;
   const old = port;
@@ -55,6 +55,7 @@ function disconnect() {
   sessionId = null;
   clientNonce = null;
   if (old) { try { old.disconnect(); } catch { /* already disconnected */ } }
+  chrome.storage.local.set({ bridgeProblem: problem });
   status("disconnected");
   if (retryTimer === null) {
     retryTimer = setTimeout(() => { retryTimer = null; connect(); }, retryMs);
@@ -75,7 +76,10 @@ async function connect() {
     status("connecting");
     current.onMessage.addListener(message => {
       if (port !== current) return;
-      if (sessionId !== null) return; // No inbound execution capability.
+      if (sessionId !== null) {
+        if (message?.type === "browser.request") handleBrowserRequest(message, current);
+        return;
+      }
       if (message?.type !== "hello_ack" || message.protocol_version !== PROTOCOL_VERSION
           || message.client_nonce !== clientNonce || typeof message.session_id !== "string"
           || message.session_id.length < 16 || message.session_id.length > 128) {
@@ -87,16 +91,17 @@ async function connect() {
       sessionId = message.session_id;
       retryMs = 1000;
       chrome.alarms.clear("jarvis-reconnect");
+      chrome.storage.local.set({ bridgeProblem: "" });
       status("connected");
       flush();
       reconcile(); // Re-observe open permitted tabs after connection gaps.
     });
     current.onDisconnect.addListener(() => {
       // Reading lastError prevents noisy logs; never log page payloads.
-      void chrome.runtime.lastError;
-      if (port === current) disconnect();
+      const problem = nativeFailure(chrome.runtime.lastError?.message);
+      if (port === current) disconnect(problem);
     });
-    current.postMessage({ type: "hello", protocol_version: PROTOCOL_VERSION, client_nonce: clientNonce });
+    current.postMessage({ type: "hello", protocol_version: PROTOCOL_VERSION, client_nonce: clientNonce, capabilities: ["fresh_reads"] });
     handshakeTimer = setTimeout(() => { if (port === current && !sessionId) disconnect(); }, 5000);
   } catch { disconnect(); }
 }
@@ -143,6 +148,21 @@ async function reconcile() {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, reply) => {
+  if (message?.type === "jarvis.refresh") {
+    if (sender.id !== chrome.runtime.id || sender.url !== chrome.runtime.getURL("options.html")) {
+      reply({ accepted: false });
+      return;
+    }
+    (async () => {
+      await ready;
+      clearTimeout(retryTimer);
+      retryTimer = null;
+      await connect();
+      await reconcile();
+      return { accepted: true, paused };
+    })().then(reply, () => reply({ accepted: false }));
+    return true;
+  }
   if (message?.type !== "jarvis.content") return;
   (async () => {
     await ready;
@@ -223,3 +243,74 @@ chrome.alarms.onAlarm.addListener(alarm => {
 });
 chrome.action.onClicked.addListener(() => chrome.runtime.openOptionsPage());
 connect();
+
+
+let readLease = null;
+async function handleBrowserRequest(message, current) {
+  if (message.protocol_version !== PROTOCOL_VERSION || message.session_id !== sessionId
+      || typeof message.request_id !== "string" || !/^[a-f0-9]{64}$/.test(message.request_id)) return;
+  const replySession = sessionId;
+  const epoch = generation;
+  let finished = false;
+  const send = (status, data = {}) => {
+    if (finished || port !== current || sessionId !== replySession) return;
+    finished = true;
+    try { current.postMessage({ type: "browser.result", protocol_version: PROTOCOL_VERSION,
+      session_id: replySession, request_id: message.request_id, status, tabs: [], page: null, ...data }); }
+    catch { disconnect(); }
+  };
+  if (readLease !== null || paused) { send("unavailable"); return; }
+  if (!["search_tabs", "read_tab"].includes(message.operation)) { send("unavailable"); return; }
+  const lease = message.request_id;
+  readLease = lease;
+  const expiry = setTimeout(() => {
+    if (readLease === lease) readLease = null;
+    send("timeout");
+  }, 4500);
+  const stillValid = () => readLease === lease && epoch === generation && !paused && port === current && sessionId === replySession;
+  const identity = async tab => {
+    if (!stillValid() || !await permitted(tab)) return null;
+    const frame = await chrome.webNavigation.getFrame({ tabId: tab.id, frameId: 0 });
+    if (!stillValid() || typeof frame?.documentId !== "string" || !frame.documentId.length
+        || frame.documentId.length > 128 || frame.url !== tab.url) return null;
+    return { resource_id: `browser-live:${replySession}:${tab.id}`, tab_id: tab.id, window_id: tab.windowId,
+      document_id: frame.documentId, url: cappedText(tab.url, 8192), title: cappedText(tab.title, 2048) };
+  };
+  try {
+    const args = message.arguments;
+    if (message.operation === "search_tabs") {
+      if (typeof args?.query !== "string" || !args.query.trim() || new TextEncoder().encode(args.query).length > 256) { send("unavailable"); return; }
+      const needle = args.query.toLocaleLowerCase();
+      const matches = [];
+      for (const tab of (await chrome.tabs.query({})).slice(0, 256)) {
+        if (matches.length === 16 || !stillValid()) break;
+        if (!`${tab.title || ""} ${tab.url || ""}`.toLocaleLowerCase().includes(needle)) continue;
+        try {
+          const found = await identity(tab);
+          if (found && stillValid() && await permitted(await chrome.tabs.get(tab.id))) matches.push(found);
+        } catch { /* A closed or replaced document is not a search result. */ }
+      }
+      if (!stillValid()) { send("cancelled"); return; }
+      send("ok", { tabs: matches });
+      return;
+    }
+    const prefix = `browser-live:${replySession}:`;
+    if (typeof args?.resource_id !== "string" || !args.resource_id.startsWith(prefix)
+        || typeof args.expected_document_id !== "string" || args.expected_document_id.length > 128) { send("stale_document"); return; }
+    const id = args.resource_id.slice(prefix.length);
+    if (!/^(0|[1-9][0-9]{0,9})$/.test(id) || Number(id) > 2147483647) { send("stale_document"); return; }
+    const tab = await chrome.tabs.get(Number(id));
+    if (!await permitted(tab)) { send("permission_required"); return; }
+    const before = await identity(tab);
+    if (!before || before.document_id !== args.expected_document_id) { send("stale_document"); return; }
+    await inject(tab.id);
+    if (!stillValid()) { send("cancelled"); return; }
+    const response = await chrome.tabs.sendMessage(tab.id, { type: "jarvis.read" }, { documentId: before.document_id });
+    const after = await identity(await chrome.tabs.get(tab.id));
+    if (!stillValid()) { send("cancelled"); return; }
+    if (!after || after.document_id !== before.document_id || after.url !== before.url) { send("stale_document"); return; }
+    if (typeof response?.content !== "string" || new TextEncoder().encode(response.content).length > MAX_CONTENT_BYTES || typeof response.truncated !== "boolean") { send("unavailable"); return; }
+    send("ok", { page: { tab: after, content: response.content, truncated: response.truncated, trust: "untrusted_page" } });
+  } catch { send(stillValid() ? "unavailable" : "cancelled"); }
+  finally { clearTimeout(expiry); if (readLease === lease) readLease = null; }
+}
