@@ -70,10 +70,33 @@ impl Peer {
                         }
                     }
                 }
-                let body = plans
+                let mut response = plans
                     .pop_front()
-                    .unwrap_or_else(|| answer("unexpected extra provider call"))
-                    .to_string();
+                    .unwrap_or_else(|| answer("unexpected extra provider call"));
+                if let Some(delay) = response["__fixture_delay_ms"].as_u64() {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    response
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("__fixture_delay_ms");
+                }
+                if let Some(title) = response["__fixture_track_title"].as_str() {
+                    let artist = response["artist"].as_str().unwrap();
+                    let packet = captured.lock().unwrap().last().unwrap().clone();
+                    let state: Value =
+                        serde_json::from_str(packet["state"].as_str().unwrap()).unwrap();
+                    let spans = state["candidate_spans"].as_array().unwrap();
+                    let title_index = spans.iter().position(|s| s == title).unwrap();
+                    let artist_index = spans.iter().position(|s| s == artist).unwrap();
+                    response = json!({"answers":{
+                        "title":{"type":"choice","choice":format!("title_{title_index}"),"confidence":0.99},
+                        "artist":{"type":"choice","choice":format!("artist_{artist_index}"),"confidence":0.99}
+                    }});
+                }
+                let body = response["__fixture_html"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| response.to_string());
                 let _=socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await;
             }
         });
@@ -604,6 +627,345 @@ async fn cancelling_a_completed_clarification_revokes_its_action_authority() {
         !dir.join("effect").exists(),
         "cancelled question must not authorize a later bare target"
     );
+    chat.control.stop();
+    wait(|| chat.is_finished()).await;
+    chat.join().unwrap();
+}
+
+#[tokio::test]
+async fn worker_retains_bound_artist_confirmation_across_real_submit_turns() {
+    use jarvis::{
+        music_catalog::{CatalogConfig, MusicCatalog},
+        spotify_playback::SpotifyPlayback,
+    };
+    let dir = TempDir::new();
+    seed(&dir);
+    let name = "Aurora Fixture Quartet";
+    let artist_id = "0123456789ABCDEFGHIJKL";
+    let track_id = "abcdefghijklmnopqrstuv";
+    let model = Peer::new(vec![json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":[{"id":"confirm-artist","type":"function","function":{"name":"spotify_play_artist","arguments":json!({"artist":name}).to_string()}}]}}]})]).await;
+    let discovery = Peer::new(vec![json!({"results":{"web":[{"url":format!("https://open.spotify.com/artist/{artist_id}")}]}}),json!({"provider_name":"Spotify","provider_url":"https://spotify.com","type":"rich","title":name})]).await;
+    let observed = json!({"status":"observed","state":"playing","artist":name,"track_id":format!("spotify:track:{track_id}"),"track_url":format!("https://open.spotify.com/track/{track_id}")});
+    fs::write(dir.join("artist-observation"), observed.to_string()).unwrap();
+    let playback = SpotifyPlayback::with_executable(
+        script(
+            &dir,
+            "confirmed-player",
+            "printf 'play\\n' >> \"${0%/*}/played\"\n/bin/cat \"${0%/*}/artist-observation\"",
+        ),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    let catalog = MusicCatalog::new(
+        "fixture",
+        CatalogConfig::loopback_for_tests(
+            &format!("{}/search", discovery.url),
+            &format!("{}/oembed", discovery.url),
+            Duration::from_secs(2),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let runtime =
+        Arc::new(ToolRuntime::read_only(dir.join("context.db")).with_music(catalog, playback));
+    let legacy = ActionExecutor::with_executable(
+        script(&dir, "legacy", "printf 'wrong' > \"${0%/*}/legacy-called\""),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    let conversation = Conversation::new(dir.join("context.db"), None, model.client());
+    let mut chat =
+        ConversationWorker::with_factory_and_tools(move || Ok(conversation), legacy, runtime)
+            .unwrap();
+    wait(|| chat.control.available()).await;
+    chat.control
+        .submit(format!("nice open {name} on Spotify."))
+        .unwrap();
+    wait(|| !chat.control.busy()).await;
+    let first = chat.control.snapshot();
+    assert!(first.needs_followup, "{}", first.text);
+    assert!(first.text.contains(name));
+    assert!(discovery.packets().is_empty());
+    chat.control.submit("yes".into()).unwrap();
+    wait(|| !chat.control.busy()).await;
+    assert_eq!(chat.control.snapshot().text, format!("Playing {name}."));
+    assert_eq!(
+        model.packets().len(),
+        1,
+        "worker lost confirmation and sent yes back to the LM"
+    );
+    assert_eq!(discovery.packets().len(), 2);
+    assert_eq!(fs::read_to_string(dir.join("played")).unwrap(), "play\n");
+    assert!(!dir.join("legacy-called").exists());
+    chat.control.submit("yes".into()).unwrap();
+    wait(|| !chat.control.busy()).await;
+    assert_eq!(discovery.packets().len(), 2, "confirmed action replayed");
+    assert_eq!(fs::read_to_string(dir.join("played")).unwrap(), "play\n");
+    chat.control.stop();
+    wait(|| chat.is_finished()).await;
+    chat.join().unwrap();
+}
+
+#[tokio::test]
+async fn worker_never_downgrades_the_live_named_song_utterance_to_artist_playback() {
+    use jarvis::{
+        music_catalog::{CatalogConfig, MusicCatalog},
+        spotify_playback::SpotifyPlayback,
+    };
+    let dir = TempDir::new();
+    seed(&dir);
+    let name = "Taylor Swift";
+    let artist_id = "0123456789ABCDEFGHIJKL";
+    let track_id = "abcdefghijklmnopqrstuv";
+    let model = Peer::new(vec![json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":[{"id":"confirm-artist","type":"function","function":{"name":"spotify_play_artist","arguments":json!({"artist":name}).to_string()}}]}}]})]).await;
+    let discovery = Peer::new(vec![json!({"results":{"web":[{"url":format!("https://open.spotify.com/artist/{artist_id}")}]}}),json!({"provider_name":"Spotify","provider_url":"https://spotify.com","type":"rich","title":name})]).await;
+    let observed = json!({"status":"observed","state":"playing","artist":name,"track_id":format!("spotify:track:{track_id}"),"track_url":format!("https://open.spotify.com/track/{track_id}")});
+    fs::write(dir.join("artist-observation"), observed.to_string()).unwrap();
+    let playback = SpotifyPlayback::with_executable(
+        script(
+            &dir,
+            "confirmed-player",
+            "printf 'play\\n' >> \"${0%/*}/played\"\n/bin/cat \"${0%/*}/artist-observation\"",
+        ),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    let catalog = MusicCatalog::new(
+        "fixture",
+        CatalogConfig::loopback_for_tests(
+            &format!("{}/search", discovery.url),
+            &format!("{}/oembed", discovery.url),
+            Duration::from_secs(2),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let forced_router = Peer::new(vec![
+        json!({"answers":{"music":{"type":"choice","choice":"play_artist","confidence":1.0}}});
+        3
+    ])
+    .await;
+    let jev = jarvis::providers::JevClient::new(
+        "fixture",
+        ProviderConfig::loopback_for_tests(&forced_router.url, Duration::from_secs(2)).unwrap(),
+    )
+    .unwrap();
+    let runtime = Arc::new(
+        ToolRuntime::read_only(dir.join("context.db"))
+            .with_music(catalog, playback)
+            .with_music_intent(Arc::new(jev)),
+    );
+    let legacy = ActionExecutor::with_executable(
+        script(&dir, "legacy", "printf 'wrong' > \"${0%/*}/legacy-called\""),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    let conversation = Conversation::new(dir.join("context.db"), None, model.client());
+    let mut chat =
+        ConversationWorker::with_factory_and_tools(move || Ok(conversation), legacy, runtime)
+            .unwrap();
+    wait(|| chat.control.available()).await;
+    chat.control
+        .submit("oh play Shake It Off by Taylor Swift on Spotify".into())
+        .unwrap();
+    wait(|| !chat.control.busy()).await;
+    let first = chat.control.snapshot();
+    assert!(discovery.packets().is_empty());
+    chat.control.submit("yes".into()).unwrap();
+    wait(|| !chat.control.busy()).await;
+    assert!(
+        discovery.packets().is_empty(),
+        "named song downgraded to artist selection after confirmation: {}",
+        first.text
+    );
+    assert!(
+        !dir.join("played").exists(),
+        "unrelated artist track started for a named-song request"
+    );
+    assert!(!dir.join("legacy-called").exists());
+    chat.control.stop();
+    wait(|| chat.is_finished()).await;
+    chat.join().unwrap();
+}
+
+#[tokio::test]
+async fn worker_resolves_filler_song_as_exact_track_without_artist_confirmation_or_model() {
+    for (title, artist) in [
+        ("Shake It Off", "Taylor Swift"),
+        ("Glass Beacon", "Aurora Quartet"),
+    ] {
+        assert_worker_song(title, artist, None).await;
+    }
+}
+
+#[tokio::test]
+async fn worker_song_confirmation_preserves_both_slots_and_revokes_rejected_or_cancelled_yes() {
+    for response in ["yes", "no", "cancel", "worker-cancel", "timeout-yes"] {
+        assert_worker_song("Shake It Off", "Taylor Swift", Some(response)).await;
+    }
+}
+
+async fn assert_worker_song(title: &str, artist: &str, followup: Option<&str>) {
+    use jarvis::{
+        providers::JevClient,
+        spotify_tracks::{SpotifyTracks, TrackConfig},
+    };
+
+    let dir = TempDir::new();
+    seed(&dir);
+    let id = "0123456789ABCDEFGHIJKL";
+    let artist_id = "abcdefghijklmnopqrstuv";
+    let original = format!("oh play {title} by {artist} on Spotify");
+    let model = Peer::new(vec![]).await;
+    let router = Peer::new(vec![
+            json!({"__fixture_track_title":title,"artist":artist}),
+            json!({"__fixture_delay_ms":if followup == Some("timeout-yes") { 200 } else { 0 },"answers":{"track":{"type":"choice","choice":"play_track","confidence":if followup.is_some() { 0.90 } else { 0.999 }}}}),
+        ])
+        .await;
+    let entity = json!({"props":{"pageProps":{"state":{"data":{"entity":{
+        "type":"track","name":title,"title":title,"id":id,"uri":format!("spotify:track:{id}"),
+        "artists":[{"name":artist,"uri":format!("spotify:artist:{artist_id}")}],
+        "isPlayable":true,"playabilityReason":"PLAYABLE"
+    }}}}}});
+    let catalog = Peer::new(vec![
+            json!({"results":{"web":[{"url":format!("https://open.spotify.com/track/{id}")}]}}),
+            json!({"__fixture_html":format!("<script id=\"__NEXT_DATA__\" type=\"application/json\">{entity}</script>")})
+        ]).await;
+    fs::write(
+        dir.join("track-observation"),
+        json!({"state":"playing","track_uri":format!("spotify:track:{id}")}).to_string(),
+    )
+    .unwrap();
+    let player = script(
+        &dir,
+        "track-player",
+        "printf '%s\\n' \"$@\" > \"${0%/*}/track-args\"\n/bin/cat \"${0%/*}/track-observation\"",
+    );
+    let tracks = SpotifyTracks::new(
+        "fixture",
+        TrackConfig::loopback_for_tests(
+            &format!("{}/search", catalog.url),
+            &format!("{}/embed/", catalog.url),
+            Duration::from_secs(2),
+        )
+        .unwrap(),
+        player,
+    )
+    .unwrap();
+    let jev = JevClient::new(
+        "fixture",
+        ProviderConfig::loopback_for_tests(
+            &router.url,
+            if followup == Some("timeout-yes") {
+                Duration::from_millis(50)
+            } else {
+                Duration::from_secs(2)
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let runtime = Arc::new(
+        ToolRuntime::read_only(dir.join("context.db"))
+            .with_tracks(tracks)
+            .with_music_intent(Arc::new(jev)),
+    );
+    let legacy = ActionExecutor::with_executable(
+        script(&dir, "legacy", "printf 'wrong' > \"${0%/*}/legacy-called\""),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    let conversation = Conversation::new(dir.join("context.db"), None, model.client());
+    let mut chat =
+        ConversationWorker::with_factory_and_tools(move || Ok(conversation), legacy, runtime)
+            .unwrap();
+    wait(|| chat.control.available()).await;
+    chat.control.submit(original.clone()).unwrap();
+    wait(|| !chat.control.busy()).await;
+    let mut reply = chat.control.snapshot();
+    if let Some(response) = followup {
+        assert!(reply.needs_followup, "{}", reply.text);
+        assert!(reply.text.to_lowercase().contains(&title.to_lowercase()));
+        assert!(reply.text.to_lowercase().contains(&artist.to_lowercase()));
+        assert!(
+            catalog.packets().is_empty(),
+            "lookup happened before confirmation"
+        );
+        assert!(!dir.join("track-args").exists());
+        if response == "worker-cancel" {
+            chat.control.cancel();
+            chat.control.submit("yes".into()).unwrap();
+        } else {
+            chat.control
+                .submit(
+                    if response == "timeout-yes" {
+                        "yes"
+                    } else {
+                        response
+                    }
+                    .into(),
+                )
+                .unwrap();
+        }
+        wait(|| !chat.control.busy()).await;
+        reply = chat.control.snapshot();
+    }
+    let should_play = followup.is_none() || matches!(followup, Some("yes" | "timeout-yes"));
+    if !should_play {
+        assert!(
+            catalog.packets().is_empty(),
+            "rejected/cancelled confirmation played"
+        );
+        assert!(!dir.join("track-args").exists());
+        chat.control.submit("yes".into()).unwrap();
+        wait(|| !chat.control.busy()).await;
+        assert!(
+            catalog.packets().is_empty(),
+            "stale rejected confirmation replayed"
+        );
+        assert_eq!(router.packets().len(), 2);
+        chat.control.stop();
+        wait(|| chat.is_finished()).await;
+        chat.join().unwrap();
+        return;
+    }
+    assert!(!reply.needs_followup, "{}", reply.text);
+    assert!(
+        reply.text.to_lowercase().contains(&title.to_lowercase()),
+        "{}",
+        reply.text
+    );
+    assert!(
+        reply.text.to_lowercase().contains(&artist.to_lowercase()),
+        "{}",
+        reply.text
+    );
+    assert!(
+        model.packets().is_empty(),
+        "exact pair unexpectedly used LM"
+    );
+    assert_eq!(
+        router.packets().len(),
+        2,
+        "must jointly authorize selected title+artist"
+    );
+    let auth: Value = serde_json::from_str(router.packets()[1]["state"].as_str().unwrap()).unwrap();
+    assert_eq!(auth["original_user_utterance"], original);
+    assert_eq!(catalog.packets().len(), 2);
+    assert!(
+        fs::read_to_string(dir.join("track-args"))
+            .unwrap()
+            .ends_with(&format!("spotify:track:{id}\n"))
+    );
+    assert!(!dir.join("legacy-called").exists());
+    chat.control.submit("yes".into()).unwrap();
+    wait(|| !chat.control.busy()).await;
+    assert_eq!(
+        catalog.packets().len(),
+        2,
+        "successful song replayed after another yes"
+    );
+    assert_eq!(router.packets().len(), 2);
     chat.control.stop();
     wait(|| chat.is_finished()).await;
     chat.join().unwrap();

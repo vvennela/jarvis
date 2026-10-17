@@ -743,3 +743,95 @@ async fn revoked_empty_app_allowlist_keeps_read_only_conversation_available() {
     )));
     assert!(!dir.join("effects").exists());
 }
+
+#[derive(Default)]
+struct CodingProbe {
+    requests: Mutex<Vec<String>>,
+}
+impl jarvis::tool_runtime::CodingSubmitter for CodingProbe {
+    fn submit_coding(&self, original: &str) -> Result<(), String> {
+        self.requests.lock().unwrap().push(original.to_owned());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn read_only_codex_question_recovers_from_unrequested_coding_proposal_without_starting_job() {
+    let dir = TempDir::new();
+    let _store = seed(&dir);
+    let coding = Arc::new(CodingProbe::default());
+    let peer = Peer::new(vec![
+        calls(vec![call("wrong-coding", "delegate_coding", json!({}))]),
+        calls(vec![call(
+            "read-after-denial",
+            "read_context",
+            json!({"resource_id":"file:beacon"}),
+        )]),
+        text("The current task is reviewing the Beacon launch checklist, due Friday."),
+    ])
+    .await;
+    let mut conversation = peer.conversation(
+        &dir,
+        ToolRuntime::read_only(dir.join("context.db")).with_coding_submitter(coding.clone()),
+    );
+    let original =
+        "What is Codex working on in the project, and what remains on the launch checklist?";
+    let reply = conversation.ask(original).await.unwrap();
+    assert_eq!(
+        reply.text,
+        "The current task is reviewing the Beacon launch checklist, due Friday."
+    );
+    assert!(!reply.needs_followup);
+    assert!(
+        coding.requests.lock().unwrap().is_empty(),
+        "read-only question launched coding"
+    );
+    let requests = peer.requests();
+    assert_eq!(requests.len(), 3);
+    let second = &requests[1];
+    assert!(
+        second["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["role"] == "tool" && m["tool_call_id"] == "wrong-coding"),
+        "rejection must be correlated to the original tool call"
+    );
+    let third = requests[2].to_string();
+    assert!(third.contains("Beacon current task"));
+    assert!(third.contains("file:beacon"));
+    assert!(requests.iter().all(|r| r.to_string().contains(original)));
+}
+
+#[tokio::test]
+async fn repeated_unauthorized_coding_proposals_are_bounded_without_side_effects() {
+    let dir = TempDir::new();
+    let _store = seed(&dir);
+    let coding = Arc::new(CodingProbe::default());
+    let peer = Peer::new(
+        (0..8)
+            .map(|n| {
+                calls(vec![call(
+                    &format!("wrong-{n}"),
+                    "delegate_coding",
+                    json!({}),
+                )])
+            })
+            .collect(),
+    )
+    .await;
+    let mut conversation = peer.conversation(
+        &dir,
+        ToolRuntime::read_only(dir.join("context.db")).with_coding_submitter(coding.clone()),
+    );
+    let reply = conversation
+        .ask("Tell me what Codex is currently working on.")
+        .await
+        .unwrap();
+    assert!(coding.requests.lock().unwrap().is_empty());
+    assert!(peer.requests().len() <= 4, "unbounded rejection retry loop");
+    assert!(
+        !reply.needs_followup,
+        "rejected job proposal must not turn yes into authority"
+    );
+}

@@ -267,7 +267,11 @@ async fn malformed_or_ambiguous_track_identity_never_plays_an_existing_selection
             vec![
                 discovery(&[ID, OTHER]),
                 embed(e),
-                embed(entity("Northern Fixture", "Aurora Quartet", OTHER)),
+                embed({
+                    let mut other_artist = entity("Northern Fixture", "Aurora Quartet", OTHER);
+                    other_artist["artists"][0]["uri"] = json!(format!("spotify:artist:{ID}"));
+                    other_artist
+                }),
             ]
         } else {
             vec![discovery(&[ID]), embed(e)]
@@ -461,4 +465,102 @@ async fn song_lookup_redirects_bounds_and_deadlines_cannot_reach_playback() {
             if scenario == "embed-size" { 2 } else { 1 }
         );
     }
+}
+
+#[tokio::test]
+async fn duplicate_exact_recordings_choose_first_search_rank_only_for_same_verified_artist_identity()
+ {
+    for reverse_delay in [false, true] {
+        let title = "Northern Fixture";
+        let artist = "Aurora Quartet";
+        let mut first = embed(entity(title, artist, ID));
+        let mut second = embed(entity(title, artist, OTHER));
+        if reverse_delay {
+            first.delay = Duration::from_millis(80);
+        } else {
+            second.delay = Duration::from_millis(80);
+        }
+        let peer = Peer::new(vec![discovery(&[ID, OTHER]), first, second]).await;
+        let dir = TempDir::new();
+        let reply = tracks(&peer, &dir, &playing(ID))
+            .play(&format!("play {title} by {artist}"), title, artist)
+            .await
+            .unwrap();
+        assert!(reply.to_lowercase().contains(&title.to_lowercase()));
+        assert_eq!(
+            peer.requests().len(),
+            3,
+            "all candidates must be checked before choosing"
+        );
+        assert!(
+            fs::read_to_string(dir.join("args"))
+                .unwrap()
+                .ends_with(&format!("spotify:track:{ID}\n")),
+            "completion order changed search-rank preference"
+        );
+    }
+}
+
+#[tokio::test]
+async fn same_named_but_different_artist_ids_and_invalid_late_candidates_never_select_a_default() {
+    for conflict in ["different-artist", "two-matching-artists", "invalid-late"] {
+        let title = "Northern Fixture";
+        let artist = "Aurora Quartet";
+        let mut later = entity(title, artist, OTHER);
+        match conflict {
+            "different-artist" => {
+                later["artists"][0]["uri"] = json!(format!("spotify:artist:{ID}"))
+            }
+            "two-matching-artists" => later["artists"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"name":artist,"uri":format!("spotify:artist:{ID}")})),
+            _ => later["uri"] = json!("spotify:track:unverified"),
+        }
+        let mut late_plan = embed(later);
+        late_plan.delay = Duration::from_millis(50);
+        let peer = Peer::new(vec![
+            discovery(&[ID, OTHER]),
+            embed(entity(title, artist, ID)),
+            late_plan,
+        ])
+        .await;
+        let dir = TempDir::new();
+        let error = tracks(&peer, &dir, &playing(ID))
+            .play(&format!("play {title} by {artist}"), title, artist)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            if conflict == "invalid-late" {
+                TrackError::InvalidResponse
+            } else {
+                TrackError::Ambiguous
+            }
+        );
+        assert!(!dir.join("args").exists(), "{conflict} reached player");
+        assert_eq!(peer.requests().len(), 3);
+    }
+}
+
+#[tokio::test]
+async fn requested_recording_version_is_not_silently_replaced_by_other_same_artist_version() {
+    let title = "Northern Fixture (Live)";
+    let artist = "Aurora Quartet";
+    let peer = Peer::new(vec![
+        discovery(&[ID, OTHER]),
+        embed(entity("Northern Fixture", artist, ID)),
+        embed(entity(title, artist, OTHER)),
+    ])
+    .await;
+    let dir = TempDir::new();
+    tracks(&peer, &dir, &playing(OTHER))
+        .play(&format!("play {title} by {artist}"), title, artist)
+        .await
+        .unwrap();
+    assert!(
+        fs::read_to_string(dir.join("args"))
+            .unwrap()
+            .ends_with(&format!("spotify:track:{OTHER}\n"))
+    );
 }

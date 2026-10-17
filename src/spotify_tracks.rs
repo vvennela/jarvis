@@ -42,7 +42,7 @@ impl fmt::Display for TrackError {
         Self::Timeout => "That took too long. I couldn't confirm the song started.",
         Self::InvalidResponse | Self::ResponseTooLarge => "I couldn't verify that song's details.",
         Self::NotFound => "I couldn't verify that exact song and artist together on Spotify.",
-        Self::Ambiguous => "I found multiple recordings with that exact title and artist. Which version did you want?",
+        Self::Ambiguous => "I found different Spotify artists with that name for this song. Which artist did you mean?",
         Self::Verification => "I couldn't confirm that Spotify started the song you requested.",
     })
     }
@@ -292,6 +292,29 @@ impl SpotifyTracks {
         artist: &str,
     ) -> Result<String, TrackError> {
         authorize_track_request(request, title, artist)?;
+        self.play_verified(title, artist, None).await
+    }
+
+    pub(crate) async fn play_authorized_track(
+        &self,
+        request: &str,
+        intent: &crate::music_intent::TrackIntent,
+        title: &str,
+        artist: &str,
+    ) -> Result<String, TrackError> {
+        if !intent.matches(request, title, artist) {
+            return Err(TrackError::NotAuthorized);
+        }
+        self.play_verified(title, artist, Some((request, intent)))
+            .await
+    }
+
+    async fn play_verified(
+        &self,
+        title: &str,
+        artist: &str,
+        authority: Option<(&str, &crate::music_intent::TrackIntent)>,
+    ) -> Result<String, TrackError> {
         tokio::time::timeout(self.config.timeout, async {
             let _permit = self
                 .permits
@@ -308,6 +331,9 @@ impl SpotifyTracks {
             ) != GateDecision::Allow
             {
                 return Err(TrackError::Timeout);
+            }
+            if authority.is_some_and(|(request, intent)| !intent.matches(request, title, artist)) {
+                return Err(TrackError::NotAuthorized);
             }
             self.execute(&track).await?;
             Ok(format!("Playing {} by {}.", track.title, track.artist))
@@ -334,7 +360,7 @@ impl SpotifyTracks {
         }
         let mut candidates = HashSet::new();
         let mut checks = tokio::task::JoinSet::new();
-        for hit in hits {
+        for (rank, hit) in hits.iter().enumerate() {
             let Some(candidate) = hit.get("url").and_then(Value::as_str).and_then(track_id) else {
                 continue;
             };
@@ -356,22 +382,29 @@ impl SpotifyTracks {
                     .await
                     .map_err(|_| TrackError::Unavailable)?;
                 let body = bounded(response, MAX_EMBED).await?;
-                verify_embed(&body, &title, &artist)
+                verify_embed(&body, &title, &artist).map(|track| (rank, track))
             });
         }
         let mut matches = Vec::new();
-        let mut ids = HashSet::new();
         while let Some(result) = checks.join_next().await {
-            match result.map_err(|_| TrackError::Unavailable)?? {
-                Some(track) if ids.insert(track.uri.clone()) => matches.push(track),
-                _ => {}
+            if let (rank, Some(track)) = result.map_err(|_| TrackError::Unavailable)?? {
+                matches.push((rank, track));
             }
         }
-        match matches.len() {
-            0 => Err(TrackError::NotFound),
-            1 => Ok(matches.remove(0)),
-            _ => Err(TrackError::Ambiguous),
+        matches.sort_by_key(|(rank, _)| *rank);
+        let Some((_, first)) = matches.first() else {
+            return Err(TrackError::NotFound);
+        };
+        if matches
+            .iter()
+            .any(|(_, track)| track.artist_uri != first.artist_uri)
+        {
+            return Err(TrackError::Ambiguous);
         }
+        // Search rank chooses among independently verified recordings of the
+        // same exact title and Spotify artist identity. Fetch completion order,
+        // shared display names, and search snippets never establish identity.
+        Ok(matches.remove(0).1)
     }
     async fn execute(&self, track: &VerifiedTrack) -> Result<(), TrackError> {
         let mut child = tokio::process::Command::new(&self.executable)
@@ -420,6 +453,7 @@ struct Observed {
 struct VerifiedTrack {
     title: String,
     artist: String,
+    artist_uri: String,
     uri: String,
 }
 fn track_id(raw: &str) -> Option<String> {
@@ -537,7 +571,13 @@ fn verify_embed(
             return Err(TrackError::InvalidResponse);
         }
         if normalized(n) == normalized(artist) {
-            matched = Some(n.to_owned());
+            if matched
+                .as_ref()
+                .is_some_and(|(_, prior): &(String, String)| prior != u)
+            {
+                return Err(TrackError::Ambiguous);
+            }
+            matched = Some((n.to_owned(), u.to_owned()));
         }
     }
     if normalized(name_value) != normalized(title)
@@ -548,9 +588,11 @@ fn verify_embed(
     {
         return Ok(None);
     }
+    let (artist_name, artist_uri) = matched.unwrap();
     Ok(Some(VerifiedTrack {
         title: title_value.into(),
-        artist: matched.unwrap(),
+        artist: artist_name,
+        artist_uri,
         uri: uri.into(),
     }))
 }

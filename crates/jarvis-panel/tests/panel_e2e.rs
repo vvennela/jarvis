@@ -35,14 +35,18 @@ impl Drop for TempDir {
 }
 
 fn run_bounded(dir: &TempDir, args: &[&str], deadline: Duration) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_jarvis-panel"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_jarvis-panel"));
+    command
         .current_dir(dir.path())
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    let speaker = dir.path().join("silent-speaker");
+    if speaker.is_file() {
+        command.env("JARVIS_SMOKE_SPEAKER", speaker);
+    }
+    let mut child = command.spawn().unwrap();
     let started = Instant::now();
     loop {
         if child.try_wait().unwrap().is_some() {
@@ -136,6 +140,14 @@ fn real_appkit_smoke_exercises_awareness_pause_resume_and_quit() {
     let dir = TempDir::new();
     fs::create_dir(dir.join("approved")).unwrap();
     fs::write(dir.join("approved/spec.md"), "panel mango fixture").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let speaker = dir.join("silent-speaker");
+    fs::write(
+        &speaker,
+        "#!/bin/sh\nprintf '%s' \"$$\" > \"${0%/*}/speaker-pid\"\nexec /bin/sleep 30\n",
+    )
+    .unwrap();
+    fs::set_permissions(&speaker, fs::Permissions::from_mode(0o700)).unwrap();
     let output = run_bounded(
         &dir,
         &["--root", "approved", "--db", "state.db", "--smoke-test"],
@@ -143,8 +155,21 @@ fn real_appkit_smoke_exercises_awareness_pause_resume_and_quit() {
     );
     assert!(
         output.status.success(),
-        "AppKit smoke failed: {}",
+        "AppKit smoke failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+    let pid = fs::read_to_string(dir.join("speaker-pid")).unwrap();
+    let pid: u32 = pid.parse().unwrap();
+    assert!(
+        !Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success(),
+        "dismissed owned speech process remains alive"
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     for field in [
@@ -163,6 +188,7 @@ fn real_appkit_smoke_exercises_awareness_pause_resume_and_quit() {
         "\"menu_bar_present\":true",
         "\"wake_revealed\":true",
         "\"dismissed_hidden\":true",
+        "\"dismissed_speech_cancelled\":true",
         "\"workers_alive_after_dismiss\":true",
         "\"voice_unchanged_after_dismiss\":true",
         "\"menu_toggle_revealed\":true",

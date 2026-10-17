@@ -68,6 +68,7 @@ define_class!(
         }
         #[unsafe(method(dismissPanel:))]
         fn dismiss_panel(&self, _sender: Option<&AnyObject>) {
+            self.ivars().speech.stop_speaking();
             self.ivars().visible.set(false);
             self.ivars().wake_opened.set(false);
         }
@@ -220,7 +221,15 @@ pub fn run(options: Options) -> Result<(), &'static str> {
         Arc::clone(&tasks.control),
         coding.as_ref().map(|worker| Arc::clone(&worker.control)),
     )?;
-    let mut speech = SpeechWorker::start()?;
+    let smoke_speaker = options
+        .smoke_test
+        .then(|| std::env::var_os("JARVIS_SMOKE_SPEAKER"))
+        .flatten();
+    let mut speech = if let Some(executable) = &smoke_speaker {
+        SpeechWorker::with_executable(std::path::PathBuf::from(executable))?
+    } else {
+        SpeechWorker::start()?
+    };
     let mut voice = WakeWorker::from_env()?;
     // Smoke mode never enables microphone hardware.
     voice.control.set_enabled(!options.smoke_test);
@@ -565,6 +574,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     let mut visible = false;
     let mut wake_revealed = false;
     let mut dismissed_hidden = false;
+    let mut dismissed_speech_cancelled = false;
     let mut workers_alive_after_dismiss = false;
     let initial_voice_enabled = voice.control.enabled();
     let mut voice_unchanged_after_dismiss = false;
@@ -995,7 +1005,10 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             wake_idle_since = None;
         }
         if options.smoke_test {
-            if smoke_phase == 0 && active_observed {
+            if smoke_phase == 0 && active_observed && speech.control.available() {
+                if smoke_speaker.is_some() {
+                    let _ = speech.control.speak("Panel cancellation check".into());
+                }
                 actions.reveal_for_wake();
                 smoke_phase = 1;
             } else if smoke_phase == 1 && panel.isVisible() {
@@ -1006,9 +1019,11 @@ pub fn run(options: Options) -> Result<(), &'static str> {
                 actions.toggle_details(sel!(toggleDetails:), None);
                 smoke_phase = 3;
             } else if smoke_phase == 3 && collapsed_observed {
+                let speech_epoch = speech.control.cancellation_epoch();
                 actions.dismiss_panel(sel!(dismissPanel:), None);
+                dismissed_speech_cancelled = speech.control.cancellation_epoch() != speech_epoch;
                 smoke_phase = 4;
-            } else if smoke_phase == 4 && !panel.isVisible() {
+            } else if smoke_phase == 4 && !panel.isVisible() && !speech.control.busy() {
                 dismissed_hidden = true;
                 workers_alive_after_dismiss =
                     !worker.control.stop_requested() && !worker.is_finished();
@@ -1086,7 +1101,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     let task_worker_stopped = tasks.is_finished();
     if options.smoke_test {
         println!(
-            "{{\"panel_created\":true,\"active_observed\":{active_observed},\"paused_observed\":{paused_observed},\"resumed_observed\":{resumed_observed},\"microphone_active\":false,\"compact_width\":{compact_width},\"compact_height\":{compact_height},\"expanded_observed\":{expanded_observed},\"collapsed_observed\":{collapsed_observed},\"translucent\":{translucent},\"native_glass\":{native_glass},\"nonactivating\":{nonactivating},\"initial_hidden\":{initial_hidden},\"menu_bar_present\":{menu_bar_present},\"wake_revealed\":{wake_revealed},\"dismissed_hidden\":{dismissed_hidden},\"workers_alive_after_dismiss\":{workers_alive_after_dismiss},\"voice_unchanged_after_dismiss\":{voice_unchanged_after_dismiss},\"menu_toggle_revealed\":{menu_toggle_revealed},\"review_initially_disabled\":{review_initially_disabled},\"task_worker_stopped\":{task_worker_stopped},\"spinner_indeterminate\":{spinner_indeterminate},\"spinner_busy_visible\":{spinner_busy_visible},\"spinner_idle_hidden\":{spinner_idle_hidden}}}"
+            "{{\"panel_created\":true,\"active_observed\":{active_observed},\"paused_observed\":{paused_observed},\"resumed_observed\":{resumed_observed},\"microphone_active\":false,\"compact_width\":{compact_width},\"compact_height\":{compact_height},\"expanded_observed\":{expanded_observed},\"collapsed_observed\":{collapsed_observed},\"translucent\":{translucent},\"native_glass\":{native_glass},\"nonactivating\":{nonactivating},\"initial_hidden\":{initial_hidden},\"menu_bar_present\":{menu_bar_present},\"wake_revealed\":{wake_revealed},\"dismissed_hidden\":{dismissed_hidden},\"dismissed_speech_cancelled\":{dismissed_speech_cancelled},\"workers_alive_after_dismiss\":{workers_alive_after_dismiss},\"voice_unchanged_after_dismiss\":{voice_unchanged_after_dismiss},\"menu_toggle_revealed\":{menu_toggle_revealed},\"review_initially_disabled\":{review_initially_disabled},\"task_worker_stopped\":{task_worker_stopped},\"spinner_indeterminate\":{spinner_indeterminate},\"spinner_busy_visible\":{spinner_busy_visible},\"spinner_idle_hidden\":{spinner_idle_hidden}}}"
         );
         if had_error
             || !active_observed
@@ -1098,6 +1113,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             || !menu_bar_present
             || !wake_revealed
             || !dismissed_hidden
+            || (smoke_speaker.is_some() && !dismissed_speech_cancelled)
             || !workers_alive_after_dismiss
             || !voice_unchanged_after_dismiss
             || !menu_toggle_revealed

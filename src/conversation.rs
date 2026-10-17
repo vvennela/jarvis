@@ -19,7 +19,7 @@ use crate::{
         CrusoeClient, JevClient, MAX_INPUT_BYTES, NEMOTRON_MODEL, ProviderError, Route,
         ToolMessage, ToolStep,
     },
-    tool_runtime::{ArtistConfirmation, ToolRuntime, is_read_tool},
+    tool_runtime::{MusicConfirmation, ToolRuntime, is_read_tool},
 };
 
 pub const MAX_QUESTION_BYTES: usize = 8192;
@@ -92,7 +92,7 @@ pub struct Reply {
 struct ToolReply {
     text: String,
     needs_followup: bool,
-    confirmation: Option<ArtistConfirmation>,
+    confirmation: Option<MusicConfirmation>,
 }
 impl From<String> for ToolReply {
     fn from(text: String) -> Self {
@@ -124,7 +124,7 @@ pub struct Conversation {
     app_actions_available: bool,
     tool_runtime: Option<Arc<ToolRuntime>>,
     pending_clarification: Option<(String, Instant)>,
-    pending_artist_confirmation: Option<(ArtistConfirmation, Instant)>,
+    pending_music_confirmation: Option<(MusicConfirmation, Instant)>,
 }
 
 impl Conversation {
@@ -152,7 +152,7 @@ impl Conversation {
             app_actions_available: false,
             tool_runtime: None,
             pending_clarification: None,
-            pending_artist_confirmation: None,
+            pending_music_confirmation: None,
         }
     }
 
@@ -198,7 +198,7 @@ impl Conversation {
     /// An explicit cancel revokes missing-slot authority without erasing history.
     pub fn clear_pending_clarification(&mut self) {
         self.pending_clarification = None;
-        self.pending_artist_confirmation = None;
+        self.pending_music_confirmation = None;
     }
 
     /// Cancellation by dropping this future leaves retained history unchanged.
@@ -213,11 +213,11 @@ impl Conversation {
         // A semantic clarification carries a runtime-created authority token,
         // not executable model prose. Consume it before awaiting execution so
         // cancellation or a failed observation cannot replay the action.
-        if let Some((confirmation, at)) = self.pending_artist_confirmation.take() {
+        if let Some((confirmation, at)) = self.pending_music_confirmation.take() {
             self.pending_clarification = None;
             if at.elapsed() < Duration::from_secs(60)
                 && let Some(runtime) = &self.tool_runtime
-                && let Some(result) = runtime.confirm_artist(&confirmation, question).await
+                && let Some(result) = runtime.confirm_music(&confirmation, question).await
             {
                 let reply = Reply {
                     text: result
@@ -272,7 +272,7 @@ impl Conversation {
             && let Some(runtime) = &self.tool_runtime
             && let Some(result) = runtime.handle_resolved_intent(effective_question).await
         {
-            self.pending_artist_confirmation =
+            self.pending_music_confirmation =
                 result.confirmation.map(|token| (token, Instant::now()));
             let reply = Reply {
                 text: result
@@ -312,7 +312,9 @@ impl Conversation {
                     async move {
                         let clause = clause?;
                         let result = match conversation.prompt(clause, routing, evidence) {
-                            Ok(input) => conversation.run_tools(clause, &input, runtime).await,
+                            Ok(input) => {
+                                conversation.run_tools(clause, &input, runtime, true).await
+                            }
                             Err(error) => Err(error),
                         };
                         Some((clause, result))
@@ -351,7 +353,7 @@ impl Conversation {
                 }
             } else {
                 let reply = self
-                    .run_tools(effective_question, &input, Arc::clone(runtime))
+                    .run_tools(effective_question, &input, Arc::clone(runtime), false)
                     .await?;
                 if reply.needs_followup {
                     pending = Some(effective_question.to_owned());
@@ -365,7 +367,7 @@ impl Conversation {
         self.pending_clarification = pending
             .map(|request| (request, Instant::now()))
             .or(deferred);
-        self.pending_artist_confirmation = reply.confirmation.map(|token| (token, Instant::now()));
+        self.pending_music_confirmation = reply.confirmation.map(|token| (token, Instant::now()));
         self.remember(question, &reply.text);
         Ok(Reply {
             text: reply.text,
@@ -379,8 +381,9 @@ impl Conversation {
         question: &str,
         input: &str,
         runtime: Arc<ToolRuntime>,
+        resolve_intent: bool,
     ) -> Result<ToolReply, ConversationError> {
-        if let Some(result) = runtime.handle_resolved_intent(question).await {
+        if resolve_intent && let Some(result) = runtime.handle_resolved_intent(question).await {
             return Ok(ToolReply {
                 text: result
                     .acknowledgment
@@ -450,6 +453,21 @@ impl Conversation {
                     // observed result is immediately committed as the reply.
                     if has_action {
                         let result = runtime.execute(question, &calls[0]).await;
+                        // A rejected proposal with no side effect may be
+                        // corrected. Completed/attempted actions return an
+                        // acknowledgment and never enter this retry path.
+                        if result.acknowledgment.is_none() {
+                            let proposal = ToolMessage::assistant_calls(&calls);
+                            let observation =
+                                ToolMessage::tool_result(&calls[0].id, &result.content);
+                            message_bytes += proposal.encoded_len()? + observation.encoded_len()?;
+                            if message_bytes > 44 * 1024 {
+                                return Ok("I couldn't match that action to your request.".into());
+                            }
+                            messages.push(proposal);
+                            messages.push(observation);
+                            continue;
+                        }
                         return Ok(ToolReply {
                             text: result.acknowledgment.unwrap_or_else(|| {
                                 "That tool wasn't available, so I haven't taken an action.".into()

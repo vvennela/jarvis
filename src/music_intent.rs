@@ -13,6 +13,111 @@ pub(crate) struct ArtistIntent {
     issued: Instant,
 }
 
+/// A semantic song proposal is bound to both caller-supplied names. This token
+/// cannot be constructed from model prose or re-used for an artist-only action.
+pub(crate) struct TrackIntent {
+    original: String,
+    title: String,
+    artist: String,
+    issued: Instant,
+}
+
+impl TrackIntent {
+    pub(crate) fn explicit(original: &str, title: &str, artist: &str) -> Option<Self> {
+        crate::spotify_tracks::authorize_track_request(original, title, artist).ok()?;
+        Some(Self::new(original, title, artist))
+    }
+
+    fn new(original: &str, title: &str, artist: &str) -> Self {
+        Self {
+            original: original.to_owned(),
+            title: normalized(title),
+            artist: normalized(artist),
+            issued: Instant::now(),
+        }
+    }
+
+    pub(crate) fn confirmed(original: &str, title: &str, artist: &str) -> Option<Self> {
+        (track_eligible(original)
+            && contains_target(original, title)
+            && contains_target(original, artist))
+        .then(|| Self::new(original, title, artist))
+    }
+
+    pub(crate) fn matches(&self, original: &str, title: &str, artist: &str) -> bool {
+        self.original == original
+            && self.title == normalized(title)
+            && self.artist == normalized(artist)
+            && self.issued.elapsed() < Duration::from_secs(35)
+    }
+
+    pub(crate) async fn semantic(
+        original: &str,
+        title: &str,
+        artist: &str,
+        jev: &JevClient,
+    ) -> Option<Self> {
+        if !track_eligible(original)
+            || !contains_target(original, title)
+            || !contains_target(original, artist)
+        {
+            return None;
+        }
+        let decision = tokio::time::timeout(
+            SEMANTIC_DEADLINE,
+            jev.authorize_track_request(original, title, artist),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        (decision.choice == crate::providers::TrackChoice::PlayTrack
+            && decision.confidence >= MIN_CONFIDENCE)
+            .then(|| Self::new(original, title, artist))
+    }
+
+    pub(crate) async fn resolve_proposal(
+        original: &str,
+        jev: &JevClient,
+    ) -> Option<(Option<Self>, crate::spotify_tracks::TrackRequest)> {
+        if !track_eligible(original) {
+            return None;
+        }
+        let candidates = candidates(original);
+        if candidates.is_empty() {
+            return None;
+        }
+        let started = Instant::now();
+        let selected = tokio::time::timeout(
+            SEMANTIC_DEADLINE,
+            jev.resolve_track_request(original, &candidates),
+        )
+        .await
+        .ok()?
+        .ok()??;
+        let title = candidates.get(selected.title_index)?.clone();
+        let artist = candidates.get(selected.artist_index)?.clone();
+        // Independent span choices do not establish a relation. Verify the
+        // selected pair together; retain it only as a clarification proposal
+        // when the remaining authorization budget expires.
+        if !contains_target(original, &title) || !contains_target(original, &artist) {
+            return None;
+        }
+        let remaining = SEMANTIC_DEADLINE.saturating_sub(started.elapsed());
+        let intent = if remaining.is_zero() {
+            None
+        } else {
+            tokio::time::timeout(remaining, Self::semantic(original, &title, &artist, jev))
+                .await
+                .ok()
+                .flatten()
+        };
+        Some((
+            intent,
+            crate::spotify_tracks::TrackRequest { title, artist },
+        ))
+    }
+}
+
 fn normalized(text: &str) -> String {
     text.split_whitespace()
         .collect::<Vec<_>>()
@@ -23,6 +128,33 @@ fn normalized(text: &str) -> String {
 impl ArtistIntent {
     pub(crate) fn explicit(original: &str, artist: &str) -> Option<Self> {
         crate::spotify_playback::authorize_artist_request(original, artist).ok()?;
+        // Strict grammar has already bound the COMPLETE verified artist name.
+        // A word such as "By" inside that name is not a song/artist separator.
+        // Inspect only text outside the exact target, without relaxing semantic
+        // authorization or removing conversational prefixes from the request.
+        let original_normalized = normalized(original);
+        let target = normalized(artist);
+        let (start, _) = original_normalized
+            .rmatch_indices(&target)
+            .find(|(start, _)| {
+                let end = start + target.len();
+                original_normalized[..*start]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_alphanumeric())
+                    && original_normalized[end..]
+                        .chars()
+                        .next()
+                        .is_none_or(|c| !c.is_alphanumeric())
+            })?;
+        let outside_target = format!(
+            "{} artist-target {}",
+            &original_normalized[..start],
+            &original_normalized[start + target.len()..]
+        );
+        if has_track_constraint(&outside_target) {
+            return None;
+        }
         Some(Self::new(original, artist))
     }
 
@@ -94,6 +226,31 @@ impl ArtistIntent {
 /// Coarse trust/intent guards, not an English command-prefix grammar. Jev still
 /// sees every original word and must affirm the exact selected artist.
 pub(crate) fn eligible(original: &str) -> bool {
+    if has_track_constraint(original) {
+        return false;
+    }
+    music_eligible(original, false)
+}
+
+fn has_track_constraint(original: &str) -> bool {
+    let normalized = normalized(original);
+    let by_count = normalized
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| *word == "by")
+        .count();
+    let generic_music = by_count == 1
+        && ["music by ", "songs by ", "something by "]
+            .iter()
+            .any(|phrase| normalized.contains(phrase));
+    (by_count > 0 && !generic_music)
+        || crate::spotify_tracks::track_confirmation(original).is_some()
+}
+
+fn track_eligible(original: &str) -> bool {
+    music_eligible(original, true)
+}
+
+fn music_eligible(original: &str, allow_track: bool) -> bool {
     if original.is_empty()
         || original.len() > 8192
         || original.chars().any(|c| {
@@ -153,11 +310,9 @@ pub(crate) fn eligible(original: &str) -> bool {
                 | "about"
                 | "example"
                 | "hypothetically"
-                | "song"
-                | "track"
                 | "album"
                 | "playlist"
-        )
+        ) || (!allow_track && matches!(*word, "song" | "track"))
     }) {
         return false;
     }
