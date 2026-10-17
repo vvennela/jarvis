@@ -10,5 +10,6 @@
   <key>CFBundleName</key><string>Jarvis</string>
   <key>CFBundleDisplayName</key><string>Jarvis</string>
   <key>NSMicrophoneUsageDescription</key><string>Jarvis listens locally for Jarvis and transcribes your request on your Mac. Use Mute microphone to stop listening.</string>
+  <key>NSAppleEventsUsageDescription</key><string>Jarvis controls Spotify playback when you ask and checks that the requested action completed.</string>
   <key>NSHighResolutionCapable</key><true/>
 </dict></plist>

@@ -521,3 +521,42 @@ async fn next_work_request_delivers_stated_priorities_with_provenance_instead_of
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn runtime_advertises_only_configured_app_actions_and_keeps_model_text_non_executable() {
+    let dir = TempDir::new();
+    let lm = Peer::new(vec![
+        chat("open Spotify"),
+        chat("open Spotify"),
+        chat("plain reply"),
+    ])
+    .await;
+    let mut agent = conversation(&dir, None, &lm);
+    assert_eq!(
+        agent.ask("What actions are available?").await.unwrap().text,
+        "open Spotify"
+    );
+    let initial = packet(&lm.requests()[0]);
+    assert_eq!(initial["runtime_conversation"]["app_actions"], json!([]));
+    agent.set_app_actions_available(true);
+    let reply = agent.ask("Describe your app actions").await.unwrap();
+    assert_eq!(
+        reply.text, "open Spotify",
+        "model text must remain a text reply"
+    );
+    let configured = packet(&lm.requests()[1]);
+    assert_eq!(
+        configured["runtime_conversation"]["app_actions"],
+        json!(["open_spotify", "play_spotify", "pause_spotify"])
+    );
+    assert_eq!(
+        configured["runtime_conversation"]["can_execute_tools"],
+        false
+    );
+    agent.set_app_actions_available(false);
+    agent.ask("What is available now?").await.unwrap();
+    assert_eq!(
+        packet(&lm.requests()[2])["runtime_conversation"]["app_actions"],
+        json!([])
+    );
+}

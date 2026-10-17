@@ -1,5 +1,6 @@
 //! One cancellable conversation worker, independent of file awareness.
 use jarvis::{
+    actions::ActionExecutor,
     conversation::{Conversation, ConversationError, Reply},
     providers::ProviderError,
 };
@@ -121,11 +122,28 @@ pub struct ConversationWorker {
 }
 impl ConversationWorker {
     pub fn start(database: PathBuf) -> Result<Self, &'static str> {
-        Self::with_factory(move || Conversation::from_env(database))
+        Self::with_factory_and_actions(
+            move || Conversation::from_env(database),
+            ActionExecutor::native(),
+        )
     }
     /// Test injection accepts real Conversation clients pointing at loopback fixtures.
     pub fn with_factory(
         factory: impl FnOnce() -> Result<Conversation, ConversationError> + Send + 'static,
+    ) -> Result<Self, &'static str> {
+        Self::build(factory, None)
+    }
+    /// The action adapter is independent of provider configuration. Tests inject
+    /// a literal process fixture; production uses the fixed Spotify adapter.
+    pub fn with_factory_and_actions(
+        factory: impl FnOnce() -> Result<Conversation, ConversationError> + Send + 'static,
+        actions: ActionExecutor,
+    ) -> Result<Self, &'static str> {
+        Self::build(factory, Some(actions))
+    }
+    fn build(
+        factory: impl FnOnce() -> Result<Conversation, ConversationError> + Send + 'static,
+        actions: Option<ActionExecutor>,
     ) -> Result<Self, &'static str> {
         let (sender, mut receiver) = mpsc::channel::<Request>(1);
         let (cancellation, mut cancelled) = watch::channel(0_u64);
@@ -149,12 +167,16 @@ impl ConversationWorker {
                 Err(_) => { worker_control.update(State::Unavailable, "Conversation runtime is unavailable. File awareness still works.", false); return; }
             };
             runtime.block_on(async move {
-                let mut conversation = match factory() {
-                    Ok(conversation) => conversation,
-                    Err(error) => {
+                let (mut conversation, initialization_error) = match factory() {
+                    Ok(mut conversation) => {
+                        conversation.set_app_actions_available(actions.is_some());
+                        (Some(conversation), None)
+                    }
+                    Err(error) if actions.is_none() => {
                         worker_control.update(State::Unavailable, error_message(error), false);
                         return;
                     }
+                    Err(error) => (None, Some(error)),
                 };
                 worker_control.ready.store(true, Ordering::Release);
                 worker_control.update(State::Ready, "Ask about your work or the files you approved. Selected context is sent to your configured model provider.", false);
@@ -175,7 +197,25 @@ impl ConversationWorker {
                     let result = {
                         let ask = tokio::time::timeout(
                             REQUEST_TIMEOUT,
-                            ask_with_retry(&mut conversation, &request.question, &worker_control),
+                            async {
+                                if let Some(actions) = &actions
+                                    && let Some(result) = actions.handle(&request.question).await {
+                                    if let Ok(result) = &result
+                                        && let Some(conversation) = conversation.as_mut() {
+                                        conversation.record_action_result(&request.question, result);
+                                    }
+                                    // Tool failures have static, actionable text. They
+                                    // are never provider errors and are never retried.
+                                    return Ok(Reply {
+                                        text: result.map(|result| result.text).unwrap_or_else(|error| error.to_string()),
+                                        routing_degraded: false,
+                                    });
+                                }
+                                match conversation.as_mut() {
+                                    Some(conversation) => ask_with_retry(conversation, &request.question, &worker_control).await,
+                                    None => Err(initialization_error.unwrap_or(ConversationError::Configuration)),
+                                }
+                            },
                         );
                         tokio::pin!(ask);
                         loop {

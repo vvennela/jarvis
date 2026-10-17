@@ -3,6 +3,7 @@
 //! never from model-supplied safety labels. Desktop adapters are not built yet.
 #![forbid(unsafe_code)]
 
+pub mod actions;
 pub mod awareness;
 pub mod bridge;
 pub mod broker;
@@ -24,6 +25,9 @@ use std::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operation {
+    OpenApplication,
+    PlayMedia,
+    PauseMedia,
     CloseTab,
     DraftMessage,
     PreparePurchase,
