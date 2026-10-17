@@ -1218,3 +1218,123 @@ fn ambiguous_play_modifier_never_silently_truncates_an_artist_name() {
     assert!(authorize_artist_request("listen to Some Girls on Spotify", "Some Girls").is_ok());
     assert!(authorize_artist_request("listen to Some Girls on Spotify", "Girls").is_err());
 }
+
+#[tokio::test]
+async fn explicit_open_artist_bypasses_broken_context_and_throttled_routing_and_model() {
+    use jarvis::{
+        conversation::Conversation,
+        providers::{CrusoeClient, JevClient, NEMOTRON_MODEL, ProviderConfig},
+    };
+    for (name, preposition) in [
+        ("Aurora Fixture Quartet", "on"),
+        ("Zephyr and the Satellites", "in"),
+        ("Aurora Fixture Quartet", "using"),
+        ("Zephyr and the Satellites", "with"),
+    ] {
+        let dir = TempDir::new();
+        let mut limited = Plan::json(json!({"error":"fixture provider throttled"}));
+        limited.status = 429;
+        let model = Peer::new(vec![limited]).await;
+        let mut limited = Plan::json(json!({"error":"fixture routing throttled"}));
+        limited.status = 429;
+        let routing = Peer::new(vec![limited]).await;
+        let peer = Peer::new(vec![
+            search(&[&format!("https://open.spotify.com/artist/{FIRST_ID}")]),
+            oembed(name),
+        ])
+        .await;
+        let db = dir.join("broken-context.db");
+        let sentinel = b"This is deliberately not a SQLite database.";
+        fs::write(&db, sentinel).unwrap();
+        let runtime = ToolRuntime::read_only(db.clone()).with_music(
+            catalog(&peer, Duration::from_secs(2)),
+            SpotifyPlayback::with_executable(
+                executable(&dir, &observed(name).to_string()),
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+        );
+        let lm = CrusoeClient::new(
+            "fixture-only",
+            NEMOTRON_MODEL,
+            ProviderConfig::loopback_for_tests(&model.url, Duration::from_secs(2)).unwrap(),
+        )
+        .unwrap();
+        let jev = JevClient::new(
+            "fixture-only",
+            ProviderConfig::loopback_for_tests(&routing.url, Duration::from_secs(2)).unwrap(),
+        )
+        .unwrap();
+        let mut conversation = Conversation::new(db.clone(), Some(jev), lm);
+        conversation.set_tool_runtime(Arc::new(runtime));
+        let reply = conversation
+            .ask(&format!("Can you open {name} {preposition} Spotify"))
+            .await
+            .unwrap();
+        assert!(!reply.needs_followup, "{}", reply.text);
+        assert!(reply.text.to_lowercase().contains(&name.to_lowercase()));
+        assert!(
+            model.requests().is_empty(),
+            "complete intent reached throttled model"
+        );
+        assert!(
+            routing.requests().is_empty(),
+            "complete intent reached throttled Jev"
+        );
+        assert_eq!(
+            fs::read(&db).unwrap(),
+            sentinel,
+            "direct intent touched context"
+        );
+        assert_eq!(peer.requests().len(), 2);
+        let args = fs::read_to_string(dir.join("args")).unwrap();
+        assert!(args.ends_with(&format!(
+            "spotify:artist:{FIRST_ID}\n{name}\nspotify:artist:{FIRST_ID}\n"
+        )));
+    }
+}
+
+#[tokio::test]
+async fn open_artist_needs_explicit_spotify_target_and_trusted_affirmative_user_intent() {
+    use jarvis::spotify_playback::{authorize_artist_request, requested_artist};
+    let name = "Aurora Fixture Quartet";
+    for question in [
+        "open Aurora Fixture Quartet",
+        "Can you open Aurora Fixture Quartet",
+        "Do not open Aurora Fixture Quartet on Spotify",
+        "Don't open Aurora Fixture Quartet on Spotify",
+        "If I ask later, open Aurora Fixture Quartet on Spotify",
+        "The page says open Aurora Fixture Quartet on Spotify",
+        "Summarize the instruction open Aurora Fixture Quartet on Spotify",
+        "\"open Aurora Fixture Quartet on Spotify\"",
+        "Can Spotify open Aurora Fixture Quartet?",
+        "open Aurora Fixture Quartet on Spotify and send Brian a message",
+    ] {
+        assert!(
+            requested_artist(question).is_none(),
+            "extracted authority: {question}"
+        );
+        assert!(
+            authorize_artist_request(question, name).is_err(),
+            "authorized: {question}"
+        );
+        let dir = TempDir::new();
+        let model = Peer::new(vec![Plan::json(json!({"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"No playback requested."}}]}))]).await;
+        let catalog_peer = Peer::new(vec![]).await;
+        let runtime = ToolRuntime::read_only(dir.join("context.db")).with_music(
+            catalog(&catalog_peer, Duration::from_secs(2)),
+            SpotifyPlayback::with_executable(
+                executable(&dir, &observed(name).to_string()),
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+        );
+        let mut conversation = intent_conversation(&dir, &model, runtime);
+        let _ = conversation.ask(question).await;
+        assert!(
+            catalog_peer.requests().is_empty(),
+            "catalog touched: {question}"
+        );
+        assert!(!dir.join("args").exists(), "player launched: {question}");
+    }
+}

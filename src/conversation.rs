@@ -224,6 +224,26 @@ impl Conversation {
                 });
             }
         };
+        // A complete, authorized tool request does not need routing inference
+        // or indexed context. Preserve the same execution gate and clarification
+        // state as the conversational path, even when providers are throttled.
+        if clauses.len() == 1
+            && let Some(runtime) = &self.tool_runtime
+            && let Some(result) = runtime.handle_resolved_intent(effective_question).await
+        {
+            let reply = Reply {
+                text: result
+                    .acknowledgment
+                    .unwrap_or_else(|| "I couldn't confirm that action completed.".into()),
+                needs_followup: result.needs_followup,
+                routing_degraded: false,
+            };
+            self.pending_clarification = reply
+                .needs_followup
+                .then(|| (effective_question.to_owned(), Instant::now()));
+            self.remember(question, &reply.text);
+            return Ok(reply);
+        }
         let database = self.database.clone();
         let query = effective_question.to_owned();
         let (routing, evidence) = tokio::join!(

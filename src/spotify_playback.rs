@@ -84,20 +84,20 @@ fn artist_candidates(request: &str) -> Option<Vec<String>> {
         };
         request = rest;
     }
-    request = [
+    let explicit_spotify = [
         " on spotify",
         " in spotify",
         " using spotify",
         " with spotify",
     ]
     .iter()
-    .find_map(|suffix| request.strip_suffix(suffix))
-    .unwrap_or(request);
+    .find_map(|suffix| request.strip_suffix(suffix));
+    request = explicit_spotify.unwrap_or(request);
     request = request
         .strip_prefix("open spotify and ")
         .or_else(|| request.strip_prefix("launch spotify and "))
         .unwrap_or(request);
-    let candidates: Vec<String> = [
+    let mut candidates: Vec<String> = [
         "play music by ",
         "play songs by ",
         "play something by ",
@@ -112,6 +112,14 @@ fn artist_candidates(request: &str) -> Option<Vec<String>> {
     .filter(|target| valid_artist_target(target))
     .map(str::to_owned)
     .collect();
+    // In a named music destination, opening an artist selects their music.
+    // Keep a bare "open NAME" ambiguous; it may refer to an app or document.
+    if explicit_spotify.is_some()
+        && let Some(target) = request.strip_prefix("open ")
+        && valid_artist_target(target)
+    {
+        candidates.push(target.to_owned());
+    }
     (!candidates.is_empty()).then_some(candidates)
 }
 fn valid_artist_target(target: &str) -> bool {
