@@ -120,10 +120,55 @@ pub struct Control {
     cancelled: Arc<AtomicBool>,
     snapshot: Mutex<Snapshot>,
     command: Mutex<Option<(u64, String)>>,
+    followup: Mutex<Option<(u64, Instant)>>,
 }
 impl Control {
     pub fn enabled(&self) -> bool {
         self.enabled.load(Ordering::Acquire)
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+    pub fn arm_followup(&self) -> bool {
+        self.arm_followup_for(Duration::from_secs(8))
+    }
+    /// Trusted UI/test seam. A question grants one bounded answer, not persistent listening.
+    pub fn arm_followup_for(&self, duration: Duration) -> bool {
+        if duration.is_zero()
+            || duration > Duration::from_secs(8)
+            || !self.enabled()
+            || self.suppressed.load(Ordering::Acquire)
+            || self.stopped.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        self.invalidate();
+        let generation = self.generation();
+        *self.followup.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some((generation, Instant::now() + duration));
+        true
+    }
+    pub fn followup_active(&self) -> bool {
+        self.followup_deadline(self.generation())
+            .is_some_and(|deadline| Instant::now() < deadline)
+    }
+    pub fn cancel_followup(&self) {
+        // Also discard an answer that finished decoding just before cancellation.
+        self.invalidate();
+    }
+    fn clear_followup(&self) -> bool {
+        self.followup
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .is_some()
+    }
+    fn followup_deadline(&self, generation: u64) -> Option<Instant> {
+        self.followup
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .filter(|(epoch, _)| *epoch == generation)
+            .map(|(_, deadline)| deadline)
     }
     pub fn set_enabled(&self, value: bool) {
         if self.enabled.swap(value, Ordering::AcqRel) != value {
@@ -136,6 +181,7 @@ impl Control {
         }
     }
     fn invalidate(&self) {
+        self.clear_followup();
         self.cancelled.store(true, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.command
@@ -301,6 +347,7 @@ impl WakeWorker {
                 diagnostics: Diagnostics::default(),
             }),
             command: Mutex::new(None),
+            followup: Mutex::new(None),
         });
         let c = control.clone();
         let handle = thread::Builder::new()
@@ -318,6 +365,7 @@ impl WakeWorker {
                 let mut running = false;
                 let mut keyword_audio = Vec::<f32>::with_capacity(64_000);
                 let mut seen_generation = c.generation.load(Ordering::Acquire);
+                let mut followup_armed = false;
                 loop {
                     if c.stopped.load(Ordering::Acquire) {
                         break;
@@ -331,6 +379,7 @@ impl WakeWorker {
                         detector.reset();
                         next_decode = None;
                         seen_generation = generation;
+                        followup_armed = false;
                     }
                     let suppressed = c.suppressed.load(Ordering::Acquire);
                     if !c.enabled() || suppressed {
@@ -368,8 +417,30 @@ impl WakeWorker {
                             continue;
                         }
                         running = true;
-                        c.input(backend.input_info());
+                        let previous_input = c.snapshot().diagnostics.input;
+                        let input = backend.input_info();
+                        if previous_input.is_some() && previous_input != input {
+                            c.clear_followup();
+                        }
+                        c.input(input);
                         c.cancelled.store(false, Ordering::Release);
+                    }
+                    let followup = c.followup_deadline(generation);
+                    if followup.is_some_and(|deadline| Instant::now() >= deadline)
+                        || (followup_armed && followup.is_none())
+                    {
+                        c.clear_followup();
+                        detector.reset();
+                        next_decode = None;
+                        backend.reset_keyword();
+                        keyword_audio.clear();
+                        followup_armed = false;
+                    } else if followup.is_some() && !followup_armed {
+                        detector.arm_followup();
+                        next_decode = None;
+                        backend.reset_keyword();
+                        keyword_audio.clear();
+                        followup_armed = true;
                     }
                     if c.command
                         .lock()
@@ -413,7 +484,10 @@ impl WakeWorker {
                         c.audio(&samples, overflow);
                         if overflow || samples.len() > jarvis_voice::capture::MAX_RECORDING_SAMPLES
                         {
+                            c.clear_followup();
+                            followup_armed = false;
                             detector.reset();
+                            next_decode = None;
                             backend.reset_keyword();
                             keyword_audio.clear();
                             c.input(backend.input_info());
@@ -491,6 +565,21 @@ impl WakeWorker {
                         let decode_started = Instant::now();
                         let result = backend.transcribe(&request.samples, c.cancelled.clone());
                         c.decode_finished(decode_started.elapsed(), result.is_err());
+                        if followup_armed
+                            && c.followup_deadline(generation)
+                                .is_none_or(|deadline| Instant::now() >= deadline)
+                        {
+                            c.clear_followup();
+                            followup_armed = false;
+                            detector.reset();
+                            next_decode = None;
+                            backend.reset_keyword();
+                            keyword_audio.clear();
+                            // Restart capture to discard audio recorded after this answer expired.
+                            backend.stop();
+                            running = false;
+                            continue;
+                        }
                         if generation != c.generation.load(Ordering::Acquire)
                             || c.stopped.load(Ordering::Acquire)
                         {
@@ -525,7 +614,10 @@ impl WakeWorker {
                         c.capture_diagnostics(backend.capture_diagnostics());
                         c.audio(&queued, overflow);
                         if overflow || queued.len() > jarvis_voice::capture::MAX_RECORDING_SAMPLES {
+                            c.clear_followup();
+                            followup_armed = false;
                             detector.reset();
+                            next_decode = None;
                             backend.reset_keyword();
                             keyword_audio.clear();
                             c.input(backend.input_info());
@@ -596,9 +688,15 @@ impl WakeWorker {
                                     keyword_audio.clear();
                                 }
                                 if let Some(command) = outcome.command {
+                                    let within_followup = !followup_armed
+                                        || c.followup_deadline(generation)
+                                            .is_some_and(|deadline| Instant::now() < deadline);
+                                    c.clear_followup();
+                                    followup_armed = false;
                                     let mut slot =
                                         c.command.lock().unwrap_or_else(|p| p.into_inner());
-                                    if generation == c.generation.load(Ordering::Acquire)
+                                    if within_followup
+                                        && generation == c.generation.load(Ordering::Acquire)
                                         && c.enabled()
                                         && !c.suppressed.load(Ordering::Acquire)
                                         && !c.stopped.load(Ordering::Acquire)
@@ -610,6 +708,8 @@ impl WakeWorker {
                                 }
                             }
                             Err(_) => {
+                                c.clear_followup();
+                                followup_armed = false;
                                 detector.reset();
                                 next_decode =
                                     detector.ingest_with_activity(&queued, activity.as_deref());

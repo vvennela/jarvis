@@ -21,7 +21,14 @@ pub fn dispatch_question(
         .to_ascii_lowercase();
     if matches!(
         normalized.as_str(),
-        "open the draft" | "review the draft" | "open my draft" | "show the draft"
+        "open the draft"
+            | "review the draft"
+            | "open my draft"
+            | "show the draft"
+            | "open result"
+            | "open the result"
+            | "review the result"
+            | "open the file"
     ) {
         task.request_review()
             .map_err(|_| "There isn't a verified draft ready to open yet.")?;
@@ -42,10 +49,20 @@ pub fn dispatch_question(
     }
 }
 
+struct SpokenQuestion {
+    speech_revision: u64,
+    speech_epoch: u64,
+    wake_generation: u64,
+    chat_epoch: u64,
+    chat_revision: u64,
+}
 #[derive(Default)]
 pub struct VoiceHandoff {
-    pending_reply_after: Option<u64>,
+    pending_reply_after: Option<(u64, u64)>,
     pending_task_notice: bool,
+    spoken_question: Option<SpokenQuestion>,
+    active_followup: Option<(u64, u64)>,
+    task_revision: Option<u64>,
 }
 
 impl VoiceHandoff {
@@ -82,8 +99,69 @@ impl VoiceHandoff {
     ) -> Option<String> {
         let reply = conversation.snapshot();
         if self
+            .active_followup
+            .is_some_and(|(chat_epoch, speech_epoch)| {
+                chat_epoch != conversation.cancellation_epoch()
+                    || speech_epoch != playback.cancellation_epoch()
+            })
+        {
+            wake.cancel_followup();
+            self.active_followup = None;
+        }
+        if self.active_followup.is_some() && !wake.followup_active() {
+            self.active_followup = None;
+        }
+        if self
             .pending_reply_after
-            .is_some_and(|revision| revision != reply.revision)
+            .is_some_and(|(_, epoch)| epoch != conversation.cancellation_epoch())
+        {
+            self.pending_reply_after = None;
+        }
+        if let Some(task) = tasks {
+            let snapshot = task.snapshot();
+            if self
+                .task_revision
+                .is_some_and(|revision| revision != snapshot.revision)
+            {
+                match snapshot.state {
+                    tasks::State::Running
+                    | tasks::State::ReadyForReview
+                    | tasks::State::Blocked
+                    | tasks::State::Failed => self.pending_task_notice = true,
+                    tasks::State::Cancelled | tasks::State::Stopped => {
+                        self.pending_task_notice = false
+                    }
+                    _ => {}
+                }
+            }
+            // Initial recovered results are visible in Details, not newly completed work.
+            self.task_revision = Some(snapshot.revision);
+        }
+        if let Some(question) = &self.spoken_question {
+            let valid = question.speech_epoch == playback.cancellation_epoch()
+                && question.chat_epoch == conversation.cancellation_epoch()
+                && question.chat_revision == reply.revision
+                && question.wake_generation == wake.generation()
+                && wake.enabled();
+            if !valid {
+                self.spoken_question = None;
+            } else if !playback.busy() {
+                let state = playback.snapshot();
+                if state.state == speech::State::Idle && state.revision != question.speech_revision
+                {
+                    // Only successful completion of this owned clarification may
+                    // reopen capture. Suppression's generation reset clears TTS echo.
+                    wake.suppress(false);
+                    if wake.arm_followup() {
+                        self.active_followup = Some((question.chat_epoch, question.speech_epoch));
+                    }
+                }
+                self.spoken_question = None;
+            }
+        }
+        if self
+            .pending_reply_after
+            .is_some_and(|(revision, _)| revision != reply.revision)
         {
             match reply.state {
                 chat::State::Reply | chat::State::Failed | chat::State::Unavailable
@@ -93,7 +171,20 @@ impl VoiceHandoff {
                     while !reply.text.is_char_boundary(end) {
                         end -= 1;
                     }
-                    let _ = playback.speak(reply.text[..end].to_owned());
+                    let speech_revision = playback.snapshot().revision;
+                    if playback.speak(reply.text[..end].to_owned()).is_ok()
+                        && reply.state == chat::State::Reply
+                        && reply.needs_followup
+                    {
+                        wake.suppress(true);
+                        self.spoken_question = Some(SpokenQuestion {
+                            speech_revision,
+                            speech_epoch: playback.cancellation_epoch(),
+                            wake_generation: wake.generation(),
+                            chat_epoch: conversation.cancellation_epoch(),
+                            chat_revision: reply.revision,
+                        });
+                    }
                     self.pending_reply_after = None;
                 }
                 chat::State::Cancelled | chat::State::Stopped => {
@@ -104,6 +195,13 @@ impl VoiceHandoff {
         }
 
         if self.pending_task_notice
+            && self.active_followup.is_none()
+            && !matches!(
+                wake.snapshot().state,
+                wakeworker::State::CommandReady
+                    | wakeworker::State::CommandListening
+                    | wakeworker::State::Decoding
+            )
             && !conversation.busy()
             && !playback.busy()
             && let Some(task) = tasks
@@ -127,9 +225,13 @@ impl VoiceHandoff {
             None
         };
         if let Some(command) = &command {
+            self.active_followup = None;
             if let Some(tasks) = tasks {
                 match dispatch_question(command.clone(), conversation, tasks) {
-                    Ok(Dispatch::Conversation) => self.pending_reply_after = Some(reply.revision),
+                    Ok(Dispatch::Conversation) => {
+                        self.pending_reply_after =
+                            Some((reply.revision, conversation.cancellation_epoch()))
+                    }
                     Ok(Dispatch::Draft) => {
                         self.pending_task_notice = true;
                         let _ = playback.speak("I'll prepare that draft in the background. You can keep talking to me.".into());
@@ -140,7 +242,8 @@ impl VoiceHandoff {
                     }
                 }
             } else if conversation.submit(command.clone()).is_ok() {
-                self.pending_reply_after = Some(reply.revision);
+                self.pending_reply_after =
+                    Some((reply.revision, conversation.cancellation_epoch()));
             }
         }
         // Stop capture during owned output and clear buffered audio before resuming.

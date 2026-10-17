@@ -83,6 +83,9 @@ impl Control {
         }
         Ok(())
     }
+    pub fn cancellation_epoch(&self) -> u64 {
+        *self.cancellation.borrow()
+    }
     pub fn stop_speaking(&self) {
         if self.busy() {
             self.set_state(State::Stopping);

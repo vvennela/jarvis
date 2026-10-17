@@ -40,6 +40,7 @@ pub struct Snapshot {
     pub state: State,
     pub text: String,
     pub routing_degraded: bool,
+    pub needs_followup: bool,
     pub revision: u64,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,11 +95,14 @@ impl Control {
         }
         Ok(())
     }
+    pub fn cancellation_epoch(&self) -> u64 {
+        *self.cancellation.borrow()
+    }
     pub fn cancel(&self) {
+        self.cancellation
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
         if self.busy() {
             self.update(State::Cancelling, "Cancelling the current request…", false);
-            self.cancellation
-                .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
         }
     }
     pub fn stop(&self) {
@@ -116,6 +120,7 @@ impl Control {
         snapshot.state = state;
         snapshot.text = text[..end].to_owned();
         snapshot.routing_degraded = routing_degraded;
+        snapshot.needs_followup = false;
         snapshot.revision = snapshot.revision.wrapping_add(1);
     }
 }
@@ -212,6 +217,7 @@ impl ConversationWorker {
                 state: State::Starting,
                 text: "Preparing conversation…".into(),
                 routing_degraded: false,
+                needs_followup: false,
                 revision: 0,
             }),
         });
@@ -262,7 +268,7 @@ impl ConversationWorker {
                                     if let Some(conversation) = conversation.as_mut() {
                                         conversation.record_tool_result(&request.question, &text);
                                     }
-                                    return Ok(Reply { text, routing_degraded:false });
+                                    return Ok(Reply { text, routing_degraded:false, needs_followup:false });
                                 }
                                 if let Some(actions) = &actions
                                     && (tools.is_none() || jarvis::actions::recognize(&request.question).is_some())
@@ -276,6 +282,7 @@ impl ConversationWorker {
                                     return Ok(Reply {
                                         text: result.map(|result| result.text).unwrap_or_else(|error| jarvis::actions::friendly_error(&request.question, &error)),
                                         routing_degraded: false,
+                                        needs_followup: false,
                                     });
                                 }
                                 match conversation.as_mut() {
@@ -299,7 +306,10 @@ impl ConversationWorker {
                     }; // Dropping ask on cancellation prevents successful-turn history commit.
                     match result {
                         None => worker_control.update(State::Cancelled, "Request cancelled. File awareness is unchanged.", false),
-                        Some(Ok(reply)) => worker_control.update(State::Reply, &reply.text, reply.routing_degraded),
+                        Some(Ok(reply)) => {
+                            worker_control.update(State::Reply, &reply.text, reply.routing_degraded);
+                            worker_control.snapshot.lock().unwrap_or_else(|p|p.into_inner()).needs_followup = reply.needs_followup;
+                        },
                         Some(Err(error)) => worker_control.update(State::Failed, error_message(error), false),
                     }
                     worker_control.busy.store(false, Ordering::Release);

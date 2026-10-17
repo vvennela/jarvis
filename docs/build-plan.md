@@ -4,7 +4,7 @@ Build a companion that stays present while you work: maintained context, local â
 
 ## Implemented milestones
 
-Current combined checkpoint: **379 workspace tests passed, 21 ignored**, plus 16 extension tests, formatting and all-target clippy. The configured Nano model completes real native tool-call continuation; You web search and native Spotify artist playback are verified live. Full conversational artist execution is being tuned separately. A live fictional file request passed model planning, background editing, verified publication and restart recovery in **2.098 seconds**. The current checkpoint is **22:23 UTC / 3:23 PM Pacific on October 17**, followed by two hours of product fixes.
+Current combined checkpoint: **379 workspace tests passed, 21 ignored**, plus 16 extension tests, formatting and all-target clippy. The configured Nano model completes real native tool-call continuation; You web search and native Spotify artist playback are verified live. Full conversational artist execution subsequently passed in 4.531 seconds with verified native playback. A live fictional file request passed model planning, background editing, verified publication and restart recovery in **2.098 seconds**. The current checkpoint is **22:23 UTC / 3:23 PM Pacific on October 17**, followed by two hours of product fixes.
 
 | Component | Implemented and checked | Remaining live acceptance |
 |---|---|---|

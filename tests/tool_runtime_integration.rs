@@ -736,10 +736,10 @@ async fn revoked_empty_app_allowlist_keeps_read_only_conversation_available() {
     );
     let requests = peer.requests();
     let specs = requests[0]["tools"].as_array().unwrap();
-    assert_eq!(specs.len(), 2);
+    assert_eq!(specs.len(), 3);
     assert!(specs.iter().all(|s| matches!(
         s["function"]["name"].as_str(),
-        Some("search_context" | "read_context")
+        Some("search_context" | "read_context" | "ask_user")
     )));
     assert!(!dir.join("effects").exists());
 }

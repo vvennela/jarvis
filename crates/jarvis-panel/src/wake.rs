@@ -66,6 +66,11 @@ impl WakeDetector {
         let start = audio.len().saturating_sub(WAKE_WINDOW);
         self.audio.extend_from_slice(&audio[start..]);
     }
+    /// One explicitly requested answer, with no fabricated keyword audio.
+    pub fn arm_followup(&mut self) {
+        self.reset();
+        self.phase = Phase::Command;
+    }
     pub fn reset(&mut self) {
         self.phase = Phase::Wake;
         self.clear_audio();
