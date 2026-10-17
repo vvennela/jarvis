@@ -78,6 +78,10 @@ pub struct KeywordStatus {
     pub lookback_samples: Option<usize>,
 }
 pub trait WakeBackend {
+    /// A native fallback is permitted only with explicit speech classifications.
+    fn wake_fallback_enabled(&self) -> bool {
+        false
+    }
     fn speech_activity(&mut self, _samples: &[f32]) -> Result<Option<Vec<bool>>, &'static str> {
         Ok(None)
     }
@@ -101,6 +105,13 @@ pub trait WakeBackend {
         cancelled: Arc<AtomicBool>,
     ) -> Result<String, &'static str>;
 }
+fn append_keyword_audio(buffer: &mut Vec<f32>, samples: &[f32]) {
+    let keep = samples.len().min(64_000);
+    let excess = (buffer.len() + keep).saturating_sub(64_000);
+    buffer.drain(..excess.min(buffer.len()));
+    buffer.extend_from_slice(&samples[samples.len() - keep..]);
+}
+
 pub struct Control {
     enabled: AtomicBool,
     suppressed: AtomicBool,
@@ -427,12 +438,7 @@ impl WakeWorker {
                                 Ok(Some(status)) => {
                                     // Fixed-size prerecording recovers words spoken immediately
                                     // after the keyword while the streaming model confirms it.
-                                    let keep = samples.len().min(64_000);
-                                    let excess =
-                                        (keyword_audio.len() + keep).saturating_sub(64_000);
-                                    keyword_audio.drain(..excess.min(keyword_audio.len()));
-                                    keyword_audio
-                                        .extend_from_slice(&samples[samples.len() - keep..]);
+                                    append_keyword_audio(&mut keyword_audio, &samples);
                                     if let Some(lookback) = status.lookback_samples {
                                         let start = keyword_audio
                                             .len()
@@ -440,8 +446,13 @@ impl WakeWorker {
                                         detector.arm_keyword(&keyword_audio[start..]);
                                         keyword_audio.clear();
                                         c.wake_matched();
+                                        None
+                                    } else if backend.wake_fallback_enabled() && activity.is_some()
+                                    {
+                                        detector.ingest_with_activity(&samples, activity.as_deref())
+                                    } else {
+                                        None
                                     }
-                                    None
                                 }
                                 Ok(None) => {
                                     detector.ingest_with_activity(&samples, activity.as_deref())
@@ -464,14 +475,18 @@ impl WakeWorker {
                         }
                     };
                     if let Some(request) = request {
-                        c.publish(
-                            State::Decoding,
-                            if request.phase == Phase::Wake {
-                                "Checking wake phrase locally"
-                            } else {
-                                "Understanding your request locally"
-                            },
-                        );
+                        // Background speech checks do not open the interaction
+                        // card or animate a command spinner before a wake match.
+                        if request.phase != Phase::Wake || !backend.wake_fallback_enabled() {
+                            c.publish(
+                                State::Decoding,
+                                if request.phase == Phase::Wake {
+                                    "Checking wake phrase locally"
+                                } else {
+                                    "Understanding your request locally"
+                                },
+                            );
+                        }
                         c.decode_started();
                         let decode_started = Instant::now();
                         let result = backend.transcribe(&request.samples, c.cancelled.clone());
@@ -530,6 +545,38 @@ impl WakeWorker {
                                 continue;
                             }
                         };
+                        // Keep primary spotting continuous through synchronous
+                        // fallback inference. A fresh dedicated hit takes priority
+                        // over the older provisional transcription.
+                        if request.phase == Phase::Wake && backend.wake_fallback_enabled() {
+                            match backend.keyword_spot(&queued) {
+                                Ok(Some(status)) => {
+                                    append_keyword_audio(&mut keyword_audio, &queued);
+                                    if let Some(lookback) = status.lookback_samples {
+                                        let start = keyword_audio
+                                            .len()
+                                            .saturating_sub(lookback.min(64_000));
+                                        detector.arm_keyword(&keyword_audio[start..]);
+                                        keyword_audio.clear();
+                                        c.wake_matched();
+                                        continue;
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(message) => {
+                                    backend.stop();
+                                    running = false;
+                                    detector.reset();
+                                    keyword_audio.clear();
+                                    c.enabled.store(false, Ordering::Release);
+                                    c.publish(State::Failed, message);
+                                    while !c.enabled() && !c.stopped.load(Ordering::Acquire) {
+                                        thread::sleep(Duration::from_millis(20));
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
                         match result {
                             Ok(text) => {
                                 if request.phase == Phase::Wake && wake_tail(&text).is_some() {
@@ -542,7 +589,8 @@ impl WakeWorker {
                                 );
                                 next_decode = outcome.next;
                                 if detector.phase() == Phase::Wake
-                                    && request.phase == Phase::Command
+                                    && (request.phase == Phase::Command
+                                        || outcome.command.is_some())
                                 {
                                     backend.reset_keyword();
                                     keyword_audio.clear();
@@ -613,6 +661,9 @@ struct NativeBackend {
 }
 #[cfg(target_os = "macos")]
 impl WakeBackend for NativeBackend {
+    fn wake_fallback_enabled(&self) -> bool {
+        true
+    }
     fn speech_activity(&mut self, samples: &[f32]) -> Result<Option<Vec<bool>>, &'static str> {
         self.vad.classify(samples).map(Some)
     }

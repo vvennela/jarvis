@@ -713,9 +713,9 @@ pub fn run(options: Options) -> Result<(), &'static str> {
                 spinner_idle_hidden = true;
             }
         }
-        // An explicit, bounded two-minute diagnostic session, never ambient text.
+        // An explicit, bounded ten-minute diagnostic session, never ambient text.
         if options.voice_diagnostics
-            && started.elapsed() < Duration::from_secs(120)
+            && started.elapsed() < Duration::from_secs(600)
             && started.elapsed() >= next_voice_diagnostic
         {
             eprintln!("{}", voice_snapshot.diagnostic_line());

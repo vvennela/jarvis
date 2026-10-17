@@ -1,4 +1,7 @@
 //! Dedicated keyword backend simulation through the real wake worker, no microphone.
+#[cfg(target_os = "macos")]
+#[path = "../../../tests/support/mod.rs"]
+mod support;
 use jarvis_panel::wakeworker::{KeywordStatus, State, WakeBackend, WakeWorker};
 use std::{
     collections::VecDeque,
@@ -19,9 +22,25 @@ struct Probe {
     resets: AtomicUsize,
     hold: AtomicBool,
     release: AtomicBool,
+    fallback: AtomicBool,
 }
 struct Backend(Arc<Probe>);
 impl WakeBackend for Backend {
+    fn wake_fallback_enabled(&self) -> bool {
+        self.0.fallback.load(Ordering::Acquire)
+    }
+    fn speech_activity(&mut self, samples: &[f32]) -> Result<Option<Vec<bool>>, &'static str> {
+        Ok(self.wake_fallback_enabled().then(|| {
+            samples
+                .chunks(320)
+                .map(|frame| {
+                    frame
+                        .first()
+                        .is_some_and(|sample| *sample == 0.1 || *sample == 0.2)
+                })
+                .collect()
+        }))
+    }
     fn input_info(&self) -> Option<jarvis_voice::capture::InputInfo> {
         self.0.input.lock().unwrap().clone()
     }
@@ -161,8 +180,12 @@ fn opt_in_real_keyword_and_whisper_worker_preserves_same_breath_request() {
         vad: jarvis_voice::vad::LocalVoiceActivity,
         audio: VecDeque<Vec<f32>>,
         handoff: jarvis_voice::capture::AudioHandoff,
+        exhausted: Arc<AtomicBool>,
     }
     impl WakeBackend for LocalBackend {
+        fn wake_fallback_enabled(&self) -> bool {
+            true
+        }
         fn speech_activity(&mut self, samples: &[f32]) -> Result<Option<Vec<bool>>, &'static str> {
             self.vad.classify(samples).map(Some)
         }
@@ -171,6 +194,9 @@ fn opt_in_real_keyword_and_whisper_worker_preserves_same_breath_request() {
         }
         fn stop(&mut self) {}
         fn poll(&mut self) -> Result<(Vec<f32>, bool), &'static str> {
+            if self.audio.is_empty() {
+                self.exhausted.store(true, Ordering::Release);
+            }
             self.handoff
                 .push(&self.audio.pop_front().unwrap_or_default());
             Ok(self.handoff.drain())
@@ -207,6 +233,23 @@ fn opt_in_real_keyword_and_whisper_worker_preserves_same_breath_request() {
         std::env::var_os("JARVIS_TEST_WAKE_WAV").expect("set JARVIS_TEST_WAKE_WAV"),
     );
     let mut samples = jarvis_voice::load_wav(&wav).unwrap();
+    let negative = std::env::var_os("JARVIS_TEST_EXPECT_NO_WAKE").is_some();
+    let mut downstream = negative.then(NegativeDownstream::new);
+    let gain = std::env::var("JARVIS_TEST_WAKE_GAIN")
+        .ok()
+        .map(|s| s.parse::<f32>().unwrap())
+        .unwrap_or(1.0);
+    let noise = std::env::var("JARVIS_TEST_WAKE_NOISE")
+        .ok()
+        .map(|s| s.parse::<f32>().unwrap())
+        .unwrap_or(0.0);
+    let mut fixture_seed = 0x4413_u32;
+    for sample in &mut samples {
+        fixture_seed = fixture_seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        *sample = *sample * gain + ((fixture_seed >> 8) as f32 / 16777215.0 * 2.0 - 1.0) * noise;
+    }
+    let exhausted = Arc::new(AtomicBool::new(false));
+    let backend_exhausted = exhausted.clone();
     let mut noise_seed = 0x5413_u32;
     samples.extend((0..32000).map(|_| {
         noise_seed = noise_seed.wrapping_mul(1664525).wrapping_add(1013904223);
@@ -219,14 +262,33 @@ fn opt_in_real_keyword_and_whisper_worker_preserves_same_breath_request() {
             stt: jarvis_voice::Transcriber::load(&stt).map_err(|_| "local Whisper model failed")?,
             audio: samples.chunks(320).map(Vec::from).collect(),
             handoff: jarvis_voice::capture::AudioHandoff::new(),
+            exhausted: backend_exhausted,
         }))
     })
     .unwrap();
     let deadline = Instant::now() + Duration::from_secs(20);
     worker.control.set_enabled(true);
     let command = loop {
+        if let Some(downstream) = &mut downstream {
+            downstream.tick_and_assert_no_request(&worker);
+        }
         if let Some(command) = worker.control.take_command() {
+            assert!(!negative, "negative generated audio produced a command");
             break command;
+        }
+        if negative
+            && exhausted.load(Ordering::Acquire)
+            && worker.control.snapshot().state == State::WakeListening
+        {
+            let health = worker.control.snapshot().diagnostics;
+            assert_eq!(health.commands, 0);
+            assert_eq!(health.wake_matches, 0);
+            assert!(
+                health.decode_count > 0,
+                "negative speech never exercised local transcription"
+            );
+            stop(&mut worker);
+            return;
         }
         assert!(
             Instant::now() < deadline,
@@ -304,4 +366,196 @@ fn microphone_route_switch_during_decode_discards_old_command_and_refreshes_sele
     );
     assert_eq!(w.control.snapshot().diagnostics.commands, 1);
     stop(&mut w);
+}
+
+fn fallback_utterance(probe: &Probe, text: &str) {
+    probe.transcripts.lock().unwrap().push_back(text.into());
+    let mut queue = probe.audio.lock().unwrap();
+    queue.push_back((vec![0.1; 16000], false));
+    queue.push_back((vec![0.03; 17600], false));
+}
+#[test]
+fn vad_gated_fallback_ignores_background_and_only_forwards_exact_invocations() {
+    let p = Arc::new(Probe::default());
+    p.fallback.store(true, Ordering::Release);
+    let mut worker = start(&p);
+    for _ in 0..10 {
+        p.audio
+            .lock()
+            .unwrap()
+            .push_back((vec![0.03; 16000], false));
+    }
+    wait(|| p.spots.load(Ordering::Acquire) == 10);
+    assert!(p.decoded.lock().unwrap().is_empty());
+    for (index, text) in [
+        "ordinary ambient conversation",
+        "The control service is ready",
+        "Jarvises open something",
+        "Jervis filed the report",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        fallback_utterance(&p, text);
+        wait(|| p.decoded.lock().unwrap().len() == index + 1);
+        wait(|| worker.control.snapshot().state == State::WakeListening);
+        assert!(worker.control.take_command().is_none());
+    }
+    fallback_utterance(&p, "Jarvis find my project notes");
+    wait(|| worker.control.snapshot().state == State::CommandReady);
+    assert_eq!(
+        worker.control.take_command().as_deref(),
+        Some("find my project notes")
+    );
+    assert_eq!(worker.control.snapshot().diagnostics.commands, 1);
+    assert_eq!(worker.control.snapshot().diagnostics.wake_matches, 1);
+    assert!(
+        p.decoded
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|audio| audio.len() <= 64000)
+    );
+    stop(&mut worker);
+}
+#[test]
+fn fallback_decode_stays_in_background_and_cancel_or_route_change_cannot_publish_late_command() {
+    for cancellation in ["mute", "suppress", "route"] {
+        let p = Arc::new(Probe::default());
+        p.fallback.store(true, Ordering::Release);
+        p.hold.store(true, Ordering::Release);
+        let mut worker = start(&p);
+        fallback_utterance(&p, "Jarvis this old command must never escape");
+        wait(|| p.decoded.lock().unwrap().len() == 1);
+        assert_eq!(
+            worker.control.snapshot().state,
+            State::WakeListening,
+            "ambient fallback exposed active command UI"
+        );
+        match cancellation {
+            "mute" => worker.control.set_enabled(false),
+            "suppress" => worker.control.suppress(true),
+            _ => p.audio.lock().unwrap().push_back((Vec::new(), true)),
+        }
+        p.release.store(true, Ordering::Release);
+        wait(|| {
+            worker.control.snapshot().diagnostics.decode_count == 1
+                && match cancellation {
+                    "mute" => worker.control.snapshot().state == State::Muted,
+                    "suppress" => worker.control.snapshot().state == State::Suppressed,
+                    _ => worker.control.snapshot().diagnostics.discontinuities == 1,
+                }
+        });
+        assert!(worker.control.take_command().is_none());
+        assert_eq!(worker.control.snapshot().diagnostics.commands, 0);
+        stop(&mut worker);
+    }
+}
+#[test]
+fn dedicated_keyword_fast_path_does_not_duplicate_fallback_wakes_or_commands() {
+    let p = Arc::new(Probe::default());
+    p.fallback.store(true, Ordering::Release);
+    let mut worker = start(&p);
+    command(&p, "Jarvis show my notes");
+    wait(|| worker.control.snapshot().state == State::CommandReady);
+    assert_eq!(
+        worker.control.take_command().as_deref(),
+        Some("show my notes")
+    );
+    assert_eq!(worker.control.snapshot().diagnostics.wake_matches, 1);
+    assert_eq!(worker.control.snapshot().diagnostics.commands, 1);
+    assert_eq!(p.decoded.lock().unwrap().len(), 1);
+    stop(&mut worker);
+}
+
+#[test]
+fn queued_primary_keyword_supersedes_old_fallback_transcript_without_double_wake() {
+    let p = Arc::new(Probe::default());
+    p.fallback.store(true, Ordering::Release);
+    p.hold.store(true, Ordering::Release);
+    let mut worker = start(&p);
+    fallback_utterance(&p, "Jarvis old provisional request");
+    wait(|| p.decoded.lock().unwrap().len() == 1);
+    command(&p, "Jarvis fresh request from primary wake");
+    p.release.store(true, Ordering::Release);
+    wait(|| worker.control.snapshot().state == State::CommandReady);
+    assert_eq!(
+        worker.control.take_command().as_deref(),
+        Some("fresh request from primary wake")
+    );
+    assert_eq!(worker.control.snapshot().diagnostics.wake_matches, 1);
+    assert_eq!(worker.control.snapshot().diagnostics.commands, 1);
+    let decoded = p.decoded.lock().unwrap();
+    assert_eq!(decoded.len(), 2);
+    assert!(decoded[1].contains(&0.2), "queued wake audio was lost");
+    assert!(decoded[1].len() <= 64000 + 17600);
+    drop(decoded);
+    stop(&mut worker);
+}
+
+/// The same production handoff used by AppKit, with a listening loopback socket
+/// and real conversation/speech workers. Any ambient forwarding reaches this
+/// socket or changes worker state; no external provider can be contacted.
+#[cfg(target_os = "macos")]
+struct NegativeDownstream {
+    _directory: support::TempDir,
+    listener: std::net::TcpListener,
+    chat: jarvis_panel::chat::ConversationWorker,
+    speech: jarvis_panel::speech::SpeechWorker,
+    handoff: jarvis_panel::voicehandoff::VoiceHandoff,
+}
+#[cfg(target_os = "macos")]
+impl NegativeDownstream {
+    fn new() -> Self {
+        use jarvis::{
+            context::{ContextStore, Limits},
+            conversation::Conversation,
+            providers::{CrusoeClient, NEMOTRON_MODEL, ProviderConfig},
+        };
+        let directory = support::TempDir::new();
+        assert!(directory.path().is_dir());
+        let database = directory.join("context.db");
+        drop(ContextStore::open(&database, Limits::default()).unwrap());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let client = CrusoeClient::new(
+            "synthetic-fixture-key",
+            NEMOTRON_MODEL,
+            ProviderConfig::loopback_for_tests(&endpoint, Duration::from_secs(1)).unwrap(),
+        )
+        .unwrap();
+        let chat = jarvis_panel::chat::ConversationWorker::with_factory(move || {
+            Ok(Conversation::new(database, None, client))
+        })
+        .unwrap();
+        let speech =
+            jarvis_panel::speech::SpeechWorker::with_executable("/usr/bin/true".into()).unwrap();
+        wait(|| chat.control.available() && speech.control.available());
+        Self {
+            _directory: directory,
+            listener,
+            chat,
+            speech,
+            handoff: Default::default(),
+        }
+    }
+    fn tick_and_assert_no_request(&mut self, wake: &WakeWorker) {
+        assert!(
+            self.handoff
+                .tick(&wake.control, &self.chat.control, &self.speech.control)
+                .is_none(),
+            "ambient audio reached production handoff"
+        );
+        assert_eq!(
+            self.chat.control.snapshot().state,
+            jarvis_panel::chat::State::Ready
+        );
+        assert!(!self.chat.control.busy());
+        assert!(!self.speech.control.busy());
+        assert!(
+            matches!(self.listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "ambient audio opened a provider connection"
+        );
+    }
 }
