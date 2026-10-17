@@ -20,6 +20,7 @@ impl TempDir {
         fs::create_dir(&path).unwrap();
         Self(path)
     }
+    #[cfg(target_os = "macos")]
     fn join(&self, name: &str) -> PathBuf {
         self.0.join(name)
     }
