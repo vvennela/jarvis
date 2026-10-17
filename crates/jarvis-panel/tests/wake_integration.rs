@@ -409,3 +409,77 @@ fn microphone_start_failure_stays_visible_without_automatic_retry() {
     wait_until(|| starts.load(Ordering::Relaxed) == 2);
     stop(&mut worker);
 }
+
+#[test]
+fn long_idle_silence_does_not_spend_the_next_utterance_decode_budget() {
+    for amplitude in [0.015, 0.1] {
+        let mut detector = WakeDetector::new();
+        for _ in 0..3000 {
+            assert!(
+                detector.ingest(&[0.0; 320]).is_none(),
+                "idle silence must never request inference"
+            );
+        }
+        for _ in 0..50 {
+            assert!(
+                detector.ingest(&[amplitude; 320]).is_none(),
+                "long-idle counter caused decoding before one second of new speech"
+            );
+        }
+        let mut endpoint = None;
+        for _ in 0..40 {
+            if let Some(request) = detector.ingest(&[0.0; 320]) {
+                endpoint = Some(request);
+                break;
+            }
+        }
+        let request =
+            endpoint.expect("quiet or normal speech must reach silence endpoint after idle");
+        assert!(request.endpoint);
+        assert!(
+            request.samples.len() >= 16000,
+            "beginning of utterance must survive"
+        );
+        assert_eq!(
+            detector.accept_transcript("Jarvis where was I?").as_deref(),
+            Some("where was I?")
+        );
+    }
+}
+
+#[test]
+fn worker_ignores_extended_silence_and_ambient_speech_then_accepts_wake() {
+    let probe = Arc::new(Probe::default());
+    let mut worker = worker(&probe);
+    worker.control.set_enabled(true);
+    wait_until(|| worker.control.snapshot().state == State::WakeListening);
+    for _ in 0..6 {
+        probe
+            .chunks
+            .lock()
+            .unwrap()
+            .push_back((vec![0.0; 160000], false));
+    }
+    wait_until(|| probe.chunks.lock().unwrap().is_empty());
+    assert_eq!(
+        probe.decodes.load(Ordering::Relaxed),
+        0,
+        "silence requested local inference"
+    );
+    assert!(worker.control.take_command().is_none());
+    feed(&probe, "ordinary ambient conversation");
+    wait_until(|| probe.decodes.load(Ordering::Relaxed) > 0);
+    assert!(
+        worker.control.take_command().is_none(),
+        "ambient words must never reach remote chat"
+    );
+    // Any remaining silent frame from the ambient utterance is consumed before wake.
+    wait_until(|| probe.chunks.lock().unwrap().is_empty());
+    feed(&probe, "Jarvis resume my work");
+    wait_until(|| worker.control.snapshot().state == State::CommandReady);
+    assert_eq!(
+        worker.control.take_command().as_deref(),
+        Some("resume my work")
+    );
+    stop(&mut worker);
+}

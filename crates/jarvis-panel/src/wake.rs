@@ -70,6 +70,9 @@ impl WakeDetector {
             let voiced = energy >= 0.012_f64.powi(2);
             self.waiting += frame.len();
             if voiced {
+                if !self.active {
+                    self.since_decode = 0;
+                }
                 self.active = true;
                 self.silence = 0;
             } else {

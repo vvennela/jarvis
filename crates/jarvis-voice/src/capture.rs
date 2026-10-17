@@ -32,6 +32,42 @@ impl fmt::Display for CaptureError {
 }
 impl std::error::Error for CaptureError {}
 
+/// Error state shared by the realtime callback and its bounded consumer.
+#[derive(Default)]
+pub struct CaptureHealth {
+    failed: std::sync::atomic::AtomicBool,
+    discontinuity: std::sync::atomic::AtomicBool,
+}
+impl CaptureHealth {
+    pub fn failed(&self) -> bool {
+        self.failed.load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub fn take_discontinuity(&self) -> bool {
+        self.discontinuity
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+    #[cfg(target_os = "macos")]
+    fn fail(&self) {
+        self.failed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    #[cfg(target_os = "macos")]
+    fn discontinuity(&self) {
+        self.discontinuity
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    /// CPAL's Xrun and device-route notifications leave the stream alive.
+    /// Preserve that stream and invalidate only the interrupted utterance.
+    #[cfg(target_os = "macos")]
+    pub fn record_stream_error(&self, kind: cpal::ErrorKind) {
+        match kind {
+            cpal::ErrorKind::Xrun | cpal::ErrorKind::DeviceChanged => self.discontinuity(),
+            cpal::ErrorKind::RealtimeDenied => {}
+            _ => self.fail(),
+        }
+    }
+}
+
 pub struct CaptureBuffer {
     source_rate: u32,
     channels: u16,
@@ -175,7 +211,7 @@ mod native {
     pub struct CaptureSession {
         stream: Option<cpal::Stream>,
         buffer: Arc<Mutex<Option<CaptureBuffer>>>,
-        failed: Arc<AtomicBool>,
+        health: Arc<CaptureHealth>,
         full: Arc<AtomicBool>,
     }
     impl CaptureSession {
@@ -195,37 +231,37 @@ mod native {
             } else {
                 CaptureBuffer::new(config.sample_rate, config.channels)?
             })));
-            let failed = Arc::new(AtomicBool::new(false));
+            let health = Arc::new(CaptureHealth::default());
             let full = Arc::new(AtomicBool::new(false));
             macro_rules! stream {
                 ($sample:ty, $push:ident) => {{
                     let data_buffer = Arc::clone(&buffer);
-                    let data_failed = Arc::clone(&failed);
+                    let data_health = Arc::clone(&health);
                     let data_full = Arc::clone(&full);
-                    let error_flag = Arc::clone(&failed);
+                    let error_health = Arc::clone(&health);
                     device.build_input_stream(
                         config.clone(),
                         move |data: &[$sample], _: &cpal::InputCallbackInfo| {
-                            if data_failed.load(Ordering::Acquire)
-                                || data_full.load(Ordering::Acquire)
-                            {
+                            if data_health.failed() || data_full.load(Ordering::Acquire) {
                                 return;
                             }
                             if let Ok(mut guard) = data_buffer.try_lock() {
                                 if let Some(buffer) = guard.as_mut() {
                                     if buffer.$push(data).is_err() {
-                                        data_failed.store(true, Ordering::Release);
+                                        data_health.fail();
                                     }
                                     if buffer.is_full() {
                                         data_full.store(true, Ordering::Release);
                                     }
                                 }
-                            } else if !continuous {
-                                data_failed.store(true, Ordering::Release);
+                            } else if continuous {
+                                data_health.discontinuity();
+                            } else {
+                                data_health.fail();
                             }
                         },
-                        move |_| {
-                            error_flag.store(true, Ordering::Release);
+                        move |error| {
+                            error_health.record_stream_error(error.kind());
                         },
                         None,
                     )
@@ -242,7 +278,7 @@ mod native {
             Ok(Self {
                 stream: Some(stream),
                 buffer,
-                failed,
+                health,
                 full,
             })
         }
@@ -250,12 +286,12 @@ mod native {
             self.full.load(Ordering::Acquire)
         }
         pub fn failed(&self) -> bool {
-            self.failed.load(Ordering::Acquire)
+            self.health.failed()
         }
         pub fn stop(mut self) -> Result<Vec<f32>, CaptureError> {
             // Close the owned stream before taking its bounded sample buffer.
             self.stream.take();
-            if self.failed() {
+            if self.failed() || self.health.take_discontinuity() {
                 return Err(CaptureError::StreamFailed);
             }
             self.buffer
@@ -281,7 +317,9 @@ mod native {
                 .buffer
                 .lock()
                 .map_err(|_| CaptureError::StreamFailed)?;
-            Ok(guard.as_mut().ok_or(CaptureError::Empty)?.drain_samples())
+            let (samples, overflow) = guard.as_mut().ok_or(CaptureError::Empty)?.drain_samples();
+            let discontinuity = self.0.health.take_discontinuity();
+            Ok((samples, overflow || discontinuity))
         }
     }
 }

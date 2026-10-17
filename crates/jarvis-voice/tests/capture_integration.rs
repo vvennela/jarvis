@@ -131,3 +131,65 @@ fn continuous_capture_drains_without_losing_resampler_position_and_marks_overrun
     assert!(!overflow);
     assert_eq!(samples, vec![0.25; 320]);
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn callback_xrun_and_route_change_invalidate_one_utterance_without_disabling_capture() {
+    use jarvis_voice::capture::CaptureHealth;
+    use std::sync::Arc;
+    let health = Arc::new(CaptureHealth::default());
+    assert!(!health.failed());
+    assert!(!health.take_discontinuity());
+    // The actual CPAL callback calls this same health API. No device is opened.
+    let callback = health.clone();
+    std::thread::spawn(move || {
+        callback.record_stream_error(cpal::ErrorKind::Xrun);
+        callback.record_stream_error(cpal::ErrorKind::DeviceChanged);
+    })
+    .join()
+    .unwrap();
+    assert!(
+        !health.failed(),
+        "recoverable callback notification must not permanently stop the stream"
+    );
+    assert!(
+        health.take_discontinuity(),
+        "consumer must discard interrupted utterance"
+    );
+    assert!(
+        !health.take_discontinuity(),
+        "one interruption cannot poison every future utterance"
+    );
+    health.record_stream_error(cpal::ErrorKind::RealtimeDenied);
+    assert!(!health.failed());
+    assert!(!health.take_discontinuity());
+    health.record_stream_error(cpal::ErrorKind::Xrun);
+    assert!(health.take_discontinuity());
+    assert!(!health.failed());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn fatal_capture_errors_remain_failed_after_later_recoverable_notifications() {
+    use jarvis_voice::capture::CaptureHealth;
+    for fatal in [
+        cpal::ErrorKind::DeviceNotAvailable,
+        cpal::ErrorKind::PermissionDenied,
+        cpal::ErrorKind::StreamInvalidated,
+        cpal::ErrorKind::BackendError,
+        cpal::ErrorKind::Other,
+    ] {
+        let health = CaptureHealth::default();
+        health.record_stream_error(fatal);
+        assert!(health.failed());
+        health.record_stream_error(cpal::ErrorKind::Xrun);
+        health.record_stream_error(cpal::ErrorKind::DeviceChanged);
+        health.record_stream_error(cpal::ErrorKind::RealtimeDenied);
+        assert!(
+            health.failed(),
+            "recoverable notification resurrected fatal stream: {fatal:?}"
+        );
+        assert!(health.take_discontinuity());
+        assert!(health.failed());
+    }
+}
