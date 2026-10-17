@@ -347,3 +347,57 @@ fn capture_diagnostics_separate_os_xruns_from_route_changes_and_queue_pressure()
         "consuming reset signal erased diagnostic evidence"
     );
 }
+
+#[test]
+fn default_input_following_is_rate_limited_and_commits_only_successful_switches() {
+    use jarvis_voice::capture::DefaultInputFollower;
+    use std::time::Duration;
+    let mut follower =
+        DefaultInputFollower::new(false, "builtin-device-id".into(), Duration::from_secs(10));
+    for now in [
+        Duration::from_secs(9),
+        Duration::from_secs(10),
+        Duration::from_millis(10999),
+    ] {
+        assert!(!follower.poll_due(now));
+    }
+    assert!(follower.poll_due(Duration::from_secs(11)));
+    assert!(
+        !follower.poll_due(Duration::from_secs(11)),
+        "repeated UI polls enumerated input repeatedly"
+    );
+    assert!(!follower.changed(""));
+    assert!(!follower.changed("builtin-device-id"));
+    assert!(follower.changed("headset-device-id"));
+    // Observing a new device is not proof that opening its stream succeeded.
+    assert_eq!(follower.selected(), "builtin-device-id");
+    assert!(follower.changed("headset-device-id"));
+    follower.commit("headset-device-id".into());
+    assert_eq!(follower.selected(), "headset-device-id");
+    assert!(!follower.changed("headset-device-id"));
+    assert!(!follower.poll_due(Duration::from_millis(11999)));
+    assert!(follower.poll_due(Duration::from_secs(12)));
+    assert!(
+        follower.changed("builtin-device-id"),
+        "switching back must be observed"
+    );
+}
+
+#[test]
+fn explicitly_pinned_input_never_follows_default_device_even_after_long_elapsed_time() {
+    use jarvis_voice::capture::DefaultInputFollower;
+    use std::time::Duration;
+    let mut follower = DefaultInputFollower::new(true, "user-chosen-device".into(), Duration::ZERO);
+    for now in [
+        Duration::ZERO,
+        Duration::from_secs(1),
+        Duration::from_secs(86400),
+        Duration::MAX,
+    ] {
+        assert!(!follower.poll_due(now));
+    }
+    for changed in ["", "builtin-device", "new-headset", "user-chosen-device"] {
+        assert!(!follower.changed(changed));
+    }
+    assert_eq!(follower.selected(), "user-chosen-device");
+}

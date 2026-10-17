@@ -66,6 +66,39 @@ pub fn select_input_index(names: &[String], requested: &str) -> Result<usize, Ca
     Ok(index)
 }
 
+/// Tracks the selected input separately from output routing. Failed candidate
+/// switches are not committed; an explicit user pin never follows the default.
+pub struct DefaultInputFollower {
+    pinned: bool,
+    selected: String,
+    last_check: std::time::Duration,
+}
+impl DefaultInputFollower {
+    pub fn new(pinned: bool, selected: String, now: std::time::Duration) -> Self {
+        Self {
+            pinned,
+            selected,
+            last_check: now,
+        }
+    }
+    pub fn poll_due(&mut self, now: std::time::Duration) -> bool {
+        if self.pinned || now.saturating_sub(self.last_check) < std::time::Duration::from_secs(1) {
+            return false;
+        }
+        self.last_check = now;
+        true
+    }
+    pub fn changed(&self, candidate: &str) -> bool {
+        !self.pinned && !candidate.is_empty() && candidate != self.selected
+    }
+    pub fn selected(&self) -> &str {
+        &self.selected
+    }
+    pub fn commit(&mut self, selected: String) {
+        self.selected = selected;
+    }
+}
+
 /// Preallocated lock-free callback handoff. Producer pushes never allocate or
 /// wait for the consumer; only actual capacity exhaustion loses samples.
 pub struct AudioHandoff {
@@ -328,6 +361,7 @@ mod native {
         handoff: Option<Arc<AudioHandoff>>,
         full: Arc<AtomicBool>,
         info: InputInfo,
+        device_id: String,
     }
     impl CaptureSession {
         pub fn start() -> Result<Self, CaptureError> {
@@ -356,6 +390,10 @@ mod native {
                 host.default_input_device()
                     .ok_or(CaptureError::DeviceUnavailable)?
             };
+            let device_id = device
+                .id()
+                .map_err(|_| CaptureError::DeviceUnavailable)?
+                .to_string();
             let name = device
                 .description()
                 .map_err(|_| CaptureError::DeviceUnavailable)?
@@ -454,6 +492,7 @@ mod native {
                 handoff,
                 full,
                 info,
+                device_id,
             })
         }
         pub fn is_full(&self) -> bool {
@@ -475,6 +514,15 @@ mod native {
                 .ok_or(CaptureError::Empty)?
                 .finish()
         }
+    }
+    /// Reads routing metadata only; this does not open a microphone stream.
+    pub fn default_input_id() -> Result<String, CaptureError> {
+        cpal::default_host()
+            .default_input_device()
+            .ok_or(CaptureError::DeviceUnavailable)?
+            .id()
+            .map(|id| id.to_string())
+            .map_err(|_| CaptureError::DeviceUnavailable)
     }
     pub fn input_devices() -> Result<Vec<InputInfo>, CaptureError> {
         let devices = cpal::default_host()
@@ -515,6 +563,12 @@ mod native {
         pub fn info(&self) -> InputInfo {
             self.0.info.clone()
         }
+        pub fn device_id(&self) -> &str {
+            &self.0.device_id
+        }
+        pub fn failed(&self) -> bool {
+            self.0.failed()
+        }
         pub fn diagnostics(&self) -> CaptureDiagnostics {
             let mut diagnostics = self.0.health.diagnostics();
             diagnostics.queue_overruns = self
@@ -540,4 +594,4 @@ mod native {
     }
 }
 #[cfg(target_os = "macos")]
-pub use native::{CaptureSession, ContinuousCapture, input_devices};
+pub use native::{CaptureSession, ContinuousCapture, default_input_id, input_devices};

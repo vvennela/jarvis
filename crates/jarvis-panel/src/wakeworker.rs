@@ -267,6 +267,9 @@ impl WakeWorker {
                 keyword,
                 vad,
                 capture: None,
+                input_follower: None,
+                route_clock: Instant::now(),
+                followed_routes: 0,
                 device_name: settings.get("JARVIS_MICROPHONE_NAME").cloned(),
             }))
         })
@@ -402,6 +405,7 @@ impl WakeWorker {
                             detector.reset();
                             backend.reset_keyword();
                             keyword_audio.clear();
+                            c.input(backend.input_info());
                             continue;
                         }
                         let activity = match backend.speech_activity(&samples) {
@@ -509,6 +513,7 @@ impl WakeWorker {
                             detector.reset();
                             backend.reset_keyword();
                             keyword_audio.clear();
+                            c.input(backend.input_info());
                             continue;
                         }
                         let activity = match backend.speech_activity(&queued) {
@@ -601,6 +606,9 @@ struct NativeBackend {
     keyword: jarvis_voice::kws::LocalKeywordSpotter,
     vad: jarvis_voice::vad::LocalVoiceActivity,
     capture: Option<jarvis_voice::capture::ContinuousCapture>,
+    input_follower: Option<jarvis_voice::capture::DefaultInputFollower>,
+    route_clock: Instant,
+    followed_routes: u64,
     device_name: Option<String>,
 }
 #[cfg(target_os = "macos")]
@@ -609,9 +617,14 @@ impl WakeBackend for NativeBackend {
         self.vad.classify(samples).map(Some)
     }
     fn capture_diagnostics(&self) -> CaptureDiagnostics {
-        self.capture
+        let mut diagnostics = self
+            .capture
             .as_ref()
-            .map_or_else(CaptureDiagnostics::default, |capture| capture.diagnostics())
+            .map_or_else(CaptureDiagnostics::default, |capture| capture.diagnostics());
+        diagnostics.route_changes = diagnostics
+            .route_changes
+            .saturating_add(self.followed_routes);
+        diagnostics
     }
     fn keyword_spot(&mut self, samples: &[f32]) -> Result<Option<KeywordStatus>, &'static str> {
         self.keyword.accept(samples).map(|result| {
@@ -647,9 +660,52 @@ impl WakeBackend for NativeBackend {
                 _ => "Allow microphone access in macOS Privacy & Security",
             })?,
         );
+        if let Some(capture) = &self.capture {
+            if let Some(follower) = &mut self.input_follower {
+                follower.commit(capture.device_id().to_owned());
+            } else {
+                self.input_follower = Some(jarvis_voice::capture::DefaultInputFollower::new(
+                    self.device_name.is_some(),
+                    capture.device_id().to_owned(),
+                    self.route_clock.elapsed(),
+                ));
+            }
+        }
         Ok(())
     }
     fn poll(&mut self) -> Result<(Vec<f32>, bool), &'static str> {
+        let failed = self
+            .capture
+            .as_ref()
+            .is_some_and(|capture| capture.failed());
+        let due = self
+            .input_follower
+            .as_mut()
+            .is_some_and(|follower| follower.poll_due(self.route_clock.elapsed()));
+        if self.device_name.is_none() && (due || failed) {
+            let candidate = match jarvis_voice::capture::default_input_id() {
+                Ok(candidate) => Some(candidate),
+                Err(_) if failed => {
+                    return Err("Choose an input microphone in macOS Sound settings");
+                }
+                // A temporary routing-metadata failure should not interrupt a
+                // healthy owned stream. Retry at the next bounded poll.
+                Err(_) => None,
+            };
+            if candidate.as_deref().is_some_and(|candidate| {
+                self.input_follower
+                    .as_ref()
+                    .is_some_and(|follower| follower.changed(candidate))
+            }) {
+                // Dispose old samples/stream before opening the newly selected
+                // input. A route switch can never complete an old utterance.
+                self.capture.take();
+                self.start()?;
+                self.reset_keyword();
+                self.followed_routes = self.followed_routes.saturating_add(1);
+                return Ok((Vec::new(), true));
+            }
+        }
         self.capture
             .as_mut()
             .ok_or("Microphone unavailable")?

@@ -14,6 +14,7 @@ struct Probe {
     audio: Mutex<VecDeque<(Vec<f32>, bool)>>,
     transcripts: Mutex<VecDeque<String>>,
     decoded: Mutex<Vec<Vec<f32>>>,
+    input: Mutex<Option<jarvis_voice::capture::InputInfo>>,
     spots: AtomicUsize,
     resets: AtomicUsize,
     hold: AtomicBool,
@@ -21,6 +22,9 @@ struct Probe {
 }
 struct Backend(Arc<Probe>);
 impl WakeBackend for Backend {
+    fn input_info(&self) -> Option<jarvis_voice::capture::InputInfo> {
+        self.0.input.lock().unwrap().clone()
+    }
     fn start(&mut self) -> Result<(), &'static str> {
         Ok(())
     }
@@ -249,4 +253,55 @@ fn opt_in_real_keyword_and_whisper_worker_preserves_same_breath_request() {
         "ambient speech unexpectedly invoked Whisper repeatedly"
     );
     stop(&mut worker);
+}
+
+#[test]
+fn microphone_route_switch_during_decode_discards_old_command_and_refreshes_selected_input() {
+    let p = Arc::new(Probe::default());
+    *p.input.lock().unwrap() = Some(jarvis_voice::capture::InputInfo {
+        name: "Original microphone".into(),
+        sample_rate: 48000,
+        channels: 1,
+    });
+    let mut w = start(&p);
+    assert_eq!(
+        w.control.snapshot().diagnostics.input.unwrap().name,
+        "Original microphone"
+    );
+    p.hold.store(true, Ordering::Release);
+    command(&p, "Jarvis stale request from original microphone");
+    wait(|| p.decoded.lock().unwrap().len() == 1);
+    let resets = p.resets.load(Ordering::Acquire);
+    *p.input.lock().unwrap() = Some(jarvis_voice::capture::InputInfo {
+        name: "New headset input".into(),
+        sample_rate: 24000,
+        channels: 1,
+    });
+    // Native default-device replacement uses this same discontinuity boundary.
+    p.audio.lock().unwrap().push_back((Vec::new(), true));
+    p.release.store(true, Ordering::Release);
+    wait(|| {
+        w.control.snapshot().state == State::WakeListening
+            && w.control
+                .snapshot()
+                .diagnostics
+                .input
+                .as_ref()
+                .is_some_and(|i| i.name == "New headset input")
+    });
+    assert!(p.resets.load(Ordering::Acquire) > resets);
+    assert!(w.control.take_command().is_none());
+    assert_eq!(w.control.snapshot().diagnostics.commands, 0);
+    command(&p, "Jarvis fresh request on new microphone");
+    wait(|| w.control.snapshot().state == State::CommandReady);
+    assert_eq!(
+        w.control.take_command().as_deref(),
+        Some("fresh request on new microphone")
+    );
+    assert_eq!(
+        w.control.snapshot().diagnostics.input.unwrap().sample_rate,
+        24000
+    );
+    assert_eq!(w.control.snapshot().diagnostics.commands, 1);
+    stop(&mut w);
 }
