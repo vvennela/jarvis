@@ -326,13 +326,24 @@ fn capture_overflow_discards_pending_wake_and_command_mailbox_has_backpressure()
     assert!(worker.control.take_command().is_none());
     feed(&probe, "Jarvis first request");
     wait_until(|| worker.control.snapshot().state == State::CommandReady);
-    feed(&probe, "Jarvis queued request");
-    thread::sleep(Duration::from_millis(80));
+    // Audio arriving while the one-command mailbox is full is drained, not replayed.
+    probe
+        .chunks
+        .lock()
+        .unwrap()
+        .push_back((vec![0.1; 16000], false));
+    probe
+        .chunks
+        .lock()
+        .unwrap()
+        .push_back((vec![0.0; 17600], false));
+    wait_until(|| probe.chunks.lock().unwrap().is_empty());
     assert_eq!(probe.decodes.load(Ordering::Relaxed), 3);
     assert_eq!(
         worker.control.take_command().as_deref(),
         Some("first request")
     );
+    feed(&probe, "Jarvis fresh request");
     wait_until(|| probe.decodes.load(Ordering::Relaxed) == 4);
     wait_until(|| worker.control.snapshot().state == State::CommandReady);
     worker.control.set_enabled(false);

@@ -127,6 +127,7 @@ fn append_keyword_audio(buffer: &mut Vec<f32>, samples: &[f32]) {
 pub struct Control {
     enabled: AtomicBool,
     suppressed: AtomicBool,
+    playback_active: AtomicBool,
     stopped: AtomicBool,
     generation: AtomicU64,
     cancelled: Arc<AtomicBool>,
@@ -189,6 +190,13 @@ impl Control {
     }
     pub fn suppress(&self, value: bool) {
         if self.suppressed.swap(value, Ordering::AcqRel) != value {
+            self.invalidate();
+        }
+    }
+    /// Audible output keeps dedicated keyword detection active. Beginning a
+    /// reply clears old audio; ending it preserves a newly detected interruption.
+    pub fn set_playback_active(&self, value: bool) {
+        if !self.playback_active.swap(value, Ordering::AcqRel) && value {
             self.invalidate();
         }
     }
@@ -366,6 +374,7 @@ impl WakeWorker {
         let control = Arc::new(Control {
             enabled: AtomicBool::new(false),
             suppressed: AtomicBool::new(false),
+            playback_active: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -396,6 +405,8 @@ impl WakeWorker {
                 let mut seen_generation = c.generation.load(Ordering::Acquire);
                 let mut followup_armed = false;
                 let mut discard_audio = false;
+                let mut barge_wait = false;
+                let mut echo_deadline: Option<Instant> = None;
                 loop {
                     if c.stopped.load(Ordering::Acquire) {
                         break;
@@ -411,6 +422,8 @@ impl WakeWorker {
                         next_decode = None;
                         seen_generation = generation;
                         followup_armed = false;
+                        barge_wait = false;
+                        echo_deadline = None;
                     }
                     let suppressed = c.suppressed.load(Ordering::Acquire);
                     if !c.enabled() {
@@ -534,6 +547,53 @@ impl WakeWorker {
                         thread::sleep(Duration::from_millis(20));
                         continue;
                     }
+                    if barge_wait {
+                        // Never retain TTS-era capture. Continue draining until the
+                        // owned player is reaped, then quarantine its acoustic tail.
+                        match backend.poll() {
+                            Ok((samples, overflow)) => {
+                                c.capture_diagnostics(backend.capture_diagnostics());
+                                c.audio(&samples, overflow);
+                                if overflow {
+                                    c.invalidate();
+                                    c.input(backend.input_info(), backend.listening_message());
+                                    continue;
+                                }
+                            }
+                            Err(message) => {
+                                backend.stop();
+                                running = false;
+                                barge_wait = false;
+                                echo_deadline = None;
+                                c.capture_error();
+                                c.enabled.store(false, Ordering::Release);
+                                c.publish(State::Failed, message);
+                                while !c.enabled() && !c.stopped.load(Ordering::Acquire) {
+                                    thread::sleep(Duration::from_millis(20));
+                                }
+                                continue;
+                            }
+                        }
+                        if c.playback_active.load(Ordering::Acquire) {
+                            echo_deadline = None;
+                        } else {
+                            let deadline = echo_deadline
+                                .get_or_insert_with(|| Instant::now() + Duration::from_millis(250));
+                            if Instant::now() >= *deadline {
+                                detector.reset();
+                                detector.arm_followup();
+                                backend.reset_keyword();
+                                keyword_audio.clear();
+                                barge_wait = false;
+                                echo_deadline = None;
+                                c.publish(State::CommandListening, "Ready for your request…");
+                                continue;
+                            }
+                        }
+                        c.publish(State::Suppressed, "Stopping spoken reply…");
+                        thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
                     c.publish(
                         if detector.phase() == Phase::Wake {
                             State::WakeListening
@@ -577,6 +637,33 @@ impl WakeWorker {
                             backend.reset_keyword();
                             keyword_audio.clear();
                             c.input(backend.input_info(), backend.listening_message());
+                            continue;
+                        }
+                        if c.playback_active.load(Ordering::Acquire) {
+                            // During TTS only the dedicated spotter sees audio.
+                            // Never run ambient ASR or carry reply-era pre-roll
+                            // into the interrupted user's command.
+                            match backend.keyword_spot(&samples) {
+                                Ok(Some(KeywordStatus {
+                                    lookback_samples: Some(_),
+                                })) => {
+                                    detector.reset();
+                                    next_decode = None;
+                                    keyword_audio.clear();
+                                    barge_wait = true;
+                                    echo_deadline = None;
+                                    c.wake_matched();
+                                    c.publish(State::Suppressed, "Stopping spoken reply…");
+                                }
+                                Ok(_) => {}
+                                Err(message) => {
+                                    backend.stop();
+                                    running = false;
+                                    c.enabled.store(false, Ordering::Release);
+                                    c.publish(State::Failed, message);
+                                }
+                            }
+                            thread::sleep(Duration::from_millis(20));
                             continue;
                         }
                         let activity = match backend.speech_activity(&samples) {

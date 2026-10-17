@@ -16,7 +16,7 @@ use std::{
     net::TcpListener,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -404,6 +404,7 @@ fn voice_delegates_background_draft_stays_conversational_and_opens_only_after_re
     struct Audio {
         chunks: Mutex<VecDeque<Vec<f32>>>,
         text: Mutex<VecDeque<String>>,
+        polls: AtomicUsize,
     }
     impl Audio {
         fn say(&self, text: &str) {
@@ -420,6 +421,7 @@ fn voice_delegates_background_draft_stays_conversational_and_opens_only_after_re
         }
         fn stop(&mut self) {}
         fn poll(&mut self) -> Result<(Vec<f32>, bool), &'static str> {
+            self.0.polls.fetch_add(1, Ordering::Release);
             Ok((
                 self.0
                     .chunks
@@ -472,6 +474,7 @@ fn voice_delegates_background_draft_stays_conversational_and_opens_only_after_re
     wait(|| chat.control.available() && speech.control.available());
     wake.control.set_enabled(true);
     let mut handoff = VoiceHandoff::new();
+    wait(|| audio.polls.load(Ordering::Acquire) >= 2);
     audio.say("Jarvis draft a handoff for Brian about Beacon");
     wait(|| {
         handoff.tick_with_tasks(&wake.control, &chat.control, &speech.control, &task.control);
@@ -512,6 +515,11 @@ fn voice_delegates_background_draft_stays_conversational_and_opens_only_after_re
     wait(|| {
         handoff.tick_with_tasks(&wake.control, &chat.control, &speech.control, &task.control);
         wake.control.snapshot().state == WakeState::WakeListening
+    });
+    let polls = audio.polls.load(Ordering::Acquire);
+    wait(|| {
+        handoff.tick_with_tasks(&wake.control, &chat.control, &speech.control, &task.control);
+        audio.polls.load(Ordering::Acquire) >= polls + 2
     });
     audio.say("Jarvis open the draft");
     wait(|| {

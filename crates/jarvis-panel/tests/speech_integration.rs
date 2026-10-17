@@ -17,7 +17,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
-            "jarvis-speech-test-{}-{}",
+            "speech-fixture-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));

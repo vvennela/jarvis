@@ -70,6 +70,12 @@ impl Control {
         if text.trim().is_empty() || text.len() > MAX_TEXT_BYTES || text.contains('\0') {
             return Err(SpeechError::InvalidText);
         }
+        // Do not acoustically emit our own wake token while the spotter is on.
+        // This is deterministic text substitution, not echo cancellation.
+        let text = speech_without_wake_word(&text);
+        if text.len() > MAX_TEXT_BYTES {
+            return Err(SpeechError::InvalidText);
+        }
         if !self.available() {
             return Err(SpeechError::Unavailable);
         }
@@ -104,6 +110,20 @@ impl Control {
         snapshot.state = state;
         snapshot.revision = snapshot.revision.wrapping_add(1);
     }
+}
+
+/// Replace standalone wake tokens, preserving ordinary words and punctuation.
+pub fn speech_without_wake_word(text: &str) -> String {
+    text.split_inclusive(|c: char| !c.is_alphanumeric())
+        .map(|part| {
+            let word = part.trim_end_matches(|c: char| !c.is_alphanumeric());
+            if word.eq_ignore_ascii_case("jarvis") {
+                format!("the assistant{}", &part[word.len()..])
+            } else {
+                part.to_owned()
+            }
+        })
+        .collect()
 }
 
 pub struct SpeechWorker {

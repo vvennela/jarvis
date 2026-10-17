@@ -105,7 +105,7 @@ define_class!(
         }
         #[unsafe(method(cancelQuestion:))]
         fn cancel_question(&self, _sender: Option<&AnyObject>) {
-            self.ivars().voice.suppress(true);
+            self.ivars().voice.cancel_followup();
             self.ivars().speech.stop_speaking();
             self.ivars().chat.cancel();
             self.ivars().tasks.cancel();
@@ -749,7 +749,9 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             wake_idle_since = None;
         }
         let voice_snapshot = voice.control.snapshot();
-        if voice_snapshot.diagnostics.wake_matches > audible_wake_count {
+        if voice_snapshot.diagnostics.wake_matches > audible_wake_count
+            && voice_snapshot.state == wakeworker::State::CommandListening
+        {
             audible_wake_count = voice_snapshot.diagnostics.wake_matches;
             if !options.smoke_test
                 && let Some(chime) = NSSound::soundNamed(&NSString::from_str("Tink"))

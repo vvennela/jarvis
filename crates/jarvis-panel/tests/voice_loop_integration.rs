@@ -122,6 +122,8 @@ struct AudioFixture {
     texts: Mutex<VecDeque<String>>,
     decodes: AtomicUsize,
     polls: AtomicUsize,
+    keyword_mode: AtomicBool,
+    decoded_audio: Mutex<Vec<Vec<f32>>>,
 }
 impl AudioFixture {
     fn utterance(&self, text: &str) {
@@ -149,7 +151,19 @@ impl WakeBackend for Backend {
             false,
         ))
     }
-    fn transcribe(&mut self, _: &[f32], _: Arc<AtomicBool>) -> Result<String, &'static str> {
+    fn keyword_spot(
+        &mut self,
+        samples: &[f32],
+    ) -> Result<Option<jarvis_panel::wakeworker::KeywordStatus>, &'static str> {
+        if !self.0.keyword_mode.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        Ok(Some(jarvis_panel::wakeworker::KeywordStatus {
+            lookback_samples: (samples.first() == Some(&0.2)).then_some(samples.len()),
+        }))
+    }
+    fn transcribe(&mut self, samples: &[f32], _: Arc<AtomicBool>) -> Result<String, &'static str> {
+        self.0.decoded_audio.lock().unwrap().push(samples.to_vec());
         self.0.decodes.fetch_add(1, Ordering::Release);
         Ok(self.0.texts.lock().unwrap().pop_front().unwrap())
     }
@@ -350,7 +364,7 @@ fn voice_provider_auth_failure_is_spoken_once_and_wake_resumes_after_playback() 
     assert_eq!(spoken, fixture.chat.control.snapshot().text);
     wait(|| {
         fixture.tick();
-        fixture.wake.control.snapshot().state == jarvis_panel::wakeworker::State::Suppressed
+        fixture.wake.control.snapshot().state == jarvis_panel::wakeworker::State::WakeListening
     });
     assert_eq!(
         fixture.chat.control.snapshot().state,
@@ -617,4 +631,131 @@ fn slow_model_keeps_wake_available_and_holds_exactly_one_following_command() {
         "unexpected synthetic request: {wire}"
     );
     assert!(!wire.contains("stale third question"));
+}
+
+#[test]
+fn explicit_wake_interrupts_owned_speech_and_preserves_the_next_request_once() {
+    let peer = Peer::new("A long synthetic answer.");
+    let mut fixture = FailureLoop::new(&peer);
+    fixture.audio.utterance("Jarvis first question");
+    wait(|| {
+        fixture.tick();
+        fixture.dir.join("plays").exists() && fixture.speech.control.busy()
+    });
+    fixture.audio.keyword_mode.store(true, Ordering::Release);
+    let decoded_before_echo = fixture.audio.decodes.load(Ordering::Acquire);
+    let polls = fixture.audio.polls.load(Ordering::Acquire);
+    fixture
+        .audio
+        .chunks
+        .lock()
+        .unwrap()
+        .push_back(vec![0.1; 16000]);
+    wait(|| {
+        fixture.tick();
+        fixture.audio.polls.load(Ordering::Acquire) > polls + 3
+    });
+    assert!(
+        fixture.speech.control.busy(),
+        "ordinary playback audio interrupted speech"
+    );
+    assert_eq!(
+        fixture.audio.decodes.load(Ordering::Acquire),
+        decoded_before_echo,
+        "playback echo reached ASR"
+    );
+    assert_eq!(peer.requests.lock().unwrap().len(), 1);
+    let epoch = fixture.speech.control.cancellation_epoch();
+    let wake_count = fixture.wake.control.snapshot().diagnostics.wake_matches;
+    fixture
+        .audio
+        .texts
+        .lock()
+        .unwrap()
+        .push_back("Jarvis second question".into());
+    fixture
+        .audio
+        .chunks
+        .lock()
+        .unwrap()
+        .push_back(vec![0.2; 8000]);
+    // Hold the host tick briefly after wake detection: the player still owns
+    // speech, so any captured tail must be actively drained by the worker.
+    wait(|| fixture.wake.control.snapshot().diagnostics.wake_matches > wake_count);
+    fixture
+        .audio
+        .chunks
+        .lock()
+        .unwrap()
+        .push_back(vec![0.75; 6400]);
+    let polls_before_stop = fixture.audio.polls.load(Ordering::Acquire);
+    wait(|| fixture.audio.polls.load(Ordering::Acquire) >= polls_before_stop + 2);
+    wait(|| {
+        fixture.tick();
+        fixture.speech.control.cancellation_epoch() > epoch && !fixture.speech.control.busy()
+    });
+    // Additional old output arrives after process exit, during acoustic tail quarantine.
+    fixture
+        .audio
+        .chunks
+        .lock()
+        .unwrap()
+        .push_back(vec![0.75; 3200]);
+    wait(|| {
+        fixture.tick();
+        fixture.wake.control.snapshot().state == jarvis_panel::wakeworker::State::CommandListening
+    });
+    assert!(
+        !fixture.speech.control.busy(),
+        "wake did not stop the owned player"
+    );
+    fixture
+        .audio
+        .chunks
+        .lock()
+        .unwrap()
+        .push_back(vec![0.1; 8000]);
+    fixture
+        .audio
+        .chunks
+        .lock()
+        .unwrap()
+        .push_back(vec![0.; 17600]);
+    wait(|| {
+        fixture.tick();
+        peer.requests.lock().unwrap().len() == 2
+    });
+    let requests = peer.requests.lock().unwrap();
+    assert!(requests[1].to_string().contains("second question"));
+    let decoded = fixture.audio.decoded_audio.lock().unwrap();
+    assert!(
+        !decoded.last().unwrap().contains(&0.75),
+        "old spoken-reply samples reached ASR"
+    );
+    assert!(
+        !decoded.last().unwrap().contains(&0.2),
+        "wake-era playback pre-roll reached ASR"
+    );
+    drop(decoded);
+    drop(requests);
+    fs::write(fixture.dir.join("release"), b"done").unwrap();
+    wait(|| {
+        fixture.tick();
+        !fixture.chat.control.busy() && !fixture.speech.control.busy()
+    });
+    fixture.settle();
+    assert_eq!(peer.requests.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn spoken_copy_cannot_repeat_its_own_standalone_wake_word() {
+    use jarvis_panel::speech::speech_without_wake_word;
+    assert_eq!(
+        speech_without_wake_word("Hey Jarvis, ask JARVIS. Jarvisian Jarvises."),
+        "Hey the assistant, ask the assistant. Jarvisian Jarvises."
+    );
+    assert_eq!(
+        speech_without_wake_word("A literal $(touch nope) reply."),
+        "A literal $(touch nope) reply."
+    );
 }

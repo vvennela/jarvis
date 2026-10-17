@@ -95,6 +95,7 @@ pub struct VoiceHandoff {
     pending_microphone_notice: Option<String>,
     visible_microphone_notice: Option<(String, Instant)>,
     microphone_reveal: bool,
+    last_wake_matches: Option<u64>,
 }
 
 impl VoiceHandoff {
@@ -188,11 +189,24 @@ impl VoiceHandoff {
     ) -> Option<String> {
         let reply = conversation.snapshot();
         let wake_snapshot = wake.snapshot();
+        let matches = wake_snapshot.diagnostics.wake_matches;
+        let interrupted = self
+            .last_wake_matches
+            .is_some_and(|previous| matches > previous)
+            && playback.busy();
+        self.last_wake_matches = Some(matches);
+        if interrupted {
+            playback.stop_speaking();
+            self.spoken_question = None;
+            self.active_followup = None;
+            self.pending_reply_after = None;
+        }
         self.observe_microphone(&wake_snapshot);
         if conversation.busy()
             || matches!(
                 wake_snapshot.state,
-                wakeworker::State::CommandReady
+                wakeworker::State::Suppressed
+                    | wakeworker::State::CommandReady
                     | wakeworker::State::CommandListening
                     | wakeworker::State::Decoding
             )
@@ -272,7 +286,7 @@ impl VoiceHandoff {
                 {
                     // Only successful completion of this owned clarification may
                     // reopen capture. Suppression's generation reset clears TTS echo.
-                    wake.suppress(false);
+                    wake.set_playback_active(false);
                     if wake.arm_followup() {
                         self.active_followup = Some((question.chat_epoch, question.speech_epoch));
                     }
@@ -304,7 +318,7 @@ impl VoiceHandoff {
                         && reply.state == chat::State::Reply
                         && reply.needs_followup
                     {
-                        wake.suppress(true);
+                        wake.set_playback_active(true);
                         self.spoken_question = Some(SpokenQuestion {
                             speech_revision,
                             speech_epoch: playback.cancellation_epoch(),
@@ -326,7 +340,8 @@ impl VoiceHandoff {
             && self.active_followup.is_none()
             && !matches!(
                 wake.snapshot().state,
-                wakeworker::State::CommandReady
+                wakeworker::State::Suppressed
+                    | wakeworker::State::CommandReady
                     | wakeworker::State::CommandListening
                     | wakeworker::State::Decoding
             )
@@ -351,7 +366,8 @@ impl VoiceHandoff {
             && self.active_followup.is_none()
             && !matches!(
                 wake.snapshot().state,
-                wakeworker::State::CommandReady
+                wakeworker::State::Suppressed
+                    | wakeworker::State::CommandReady
                     | wakeworker::State::CommandListening
                     | wakeworker::State::Decoding
             )
@@ -427,9 +443,9 @@ impl VoiceHandoff {
                     Some((reply.revision, conversation.cancellation_epoch()));
             }
         }
-        // Keep wake recognition responsive while the provider is thinking.
-        // Owned audible output still suppresses recognition and discards echo.
-        wake.suppress(playback.busy());
+        // Keep the dedicated keyword spotter active during owned playback.
+        // Stopping playback must not invalidate the interruption it just heard.
+        wake.set_playback_active(playback.busy());
         command
     }
 }
