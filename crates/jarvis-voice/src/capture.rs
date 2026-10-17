@@ -66,6 +66,43 @@ pub fn select_input_index(names: &[String], requested: &str) -> Result<usize, Ca
     Ok(index)
 }
 
+/// Select a built-in input without opening it. The boolean is trusted native
+/// BuiltIn transport metadata; exact Apple names are a conservative fallback
+/// where CoreAudio's CPAL description currently leaves transport unknown.
+pub fn select_builtin_input_name(candidates: &[(String, bool)]) -> Result<String, CaptureError> {
+    if candidates.len() > MAX_INPUT_DEVICES
+        || candidates.iter().any(|(name, _)| {
+            name.is_empty()
+                || name.len() > MAX_INPUT_NAME_BYTES
+                || name.chars().any(char::is_control)
+        })
+    {
+        return Err(CaptureError::InvalidDeviceSelection);
+    }
+    let known = [
+        "MacBook Pro Microphone",
+        "MacBook Air Microphone",
+        "MacBook Microphone",
+        "iMac Microphone",
+        "Built-in Microphone",
+        "Internal Microphone",
+    ];
+    let has_native_builtin = candidates.iter().any(|(_, built_in)| *built_in);
+    let mut matches = candidates.iter().filter(|(name, built_in)| {
+        if has_native_builtin {
+            *built_in
+        } else {
+            known.iter().any(|known| name.eq_ignore_ascii_case(known))
+        }
+    });
+    let (name, _) = matches.next().ok_or(CaptureError::DeviceUnavailable)?;
+    if matches.next().is_some() || candidates.iter().filter(|(other, _)| other == name).count() != 1
+    {
+        return Err(CaptureError::InvalidDeviceSelection);
+    }
+    Ok(name.clone())
+}
+
 /// Tracks the selected input separately from output routing. Failed candidate
 /// switches are not committed; an explicit user pin never follows the default.
 pub struct DefaultInputFollower {
@@ -97,6 +134,247 @@ impl DefaultInputFollower {
     pub fn commit(&mut self, selected: String) {
         self.selected = selected;
     }
+}
+
+/// Runtime liveness and sustained healthy PCM, measured without retaining audio.
+/// Empty callbacks/polls cannot make an opened-but-dead stream appear healthy.
+#[derive(Default)]
+pub struct CaptureProgress {
+    last_arrival: Option<std::time::Duration>,
+    normal_since: Option<std::time::Duration>,
+    normal_samples: usize,
+}
+impl CaptureProgress {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn on_start(&mut self, now: std::time::Duration) {
+        self.last_arrival = Some(now);
+        self.normal_since = None;
+        self.normal_samples = 0;
+    }
+    pub fn observe(&mut self, samples: &[f32], now: std::time::Duration) -> bool {
+        if samples.is_empty() {
+            return false;
+        }
+        self.last_arrival = Some(now);
+        let normal = samples.iter().filter(|sample| sample.is_normal()).count();
+        if normal == 0 || samples.iter().any(|sample| !sample.is_finite()) {
+            self.normal_since = None;
+            self.normal_samples = 0;
+            return false;
+        }
+        let started = *self.normal_since.get_or_insert(now);
+        if now < started {
+            self.normal_since = None;
+            self.normal_samples = 0;
+            return false;
+        }
+        self.normal_samples = self.normal_samples.saturating_add(normal).min(32_000);
+        self.normal_samples >= 32_000
+            && now.saturating_sub(started) >= std::time::Duration::from_secs(2)
+    }
+    pub fn no_arrivals(&self, now: std::time::Duration) -> bool {
+        self.last_arrival
+            .is_some_and(|last| now.saturating_sub(last) >= std::time::Duration::from_secs(3))
+    }
+}
+
+/// A bounded runtime-only reconnection episode. Initial permission/setup errors
+/// are not retried by this helper; the stream owner chooses when an episode starts.
+/// Deadlines allow CoreAudio to release the previous stream before recreating it.
+#[derive(Default)]
+pub struct ReconnectBackoff {
+    next_attempt: Option<std::time::Duration>,
+    failures: u8,
+}
+impl ReconnectBackoff {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Begin after disposing the old stream. Repeated calls cannot postpone an
+    /// existing deadline or reopen an exhausted episode.
+    pub fn begin(&mut self, now: std::time::Duration) -> bool {
+        if self.failures >= 3 {
+            return false;
+        }
+        self.next_attempt
+            .get_or_insert_with(|| now.saturating_add(std::time::Duration::from_millis(250)));
+        true
+    }
+    pub fn due(&self, now: std::time::Duration) -> bool {
+        self.next_attempt.is_some_and(|deadline| now >= deadline) && self.failures < 3
+    }
+    /// Record a failed due attempt. Three attempts total, then fail closed until
+    /// the owner explicitly resets after a successful or manually renewed session.
+    pub fn failed(&mut self, now: std::time::Duration) -> bool {
+        if self.next_attempt.is_none() || self.failures >= 3 {
+            return false;
+        }
+        if !self.due(now) {
+            return true;
+        }
+        self.failures += 1;
+        if self.failures >= 3 {
+            self.next_attempt = None;
+            return false;
+        }
+        let delay = if self.failures == 1 { 500 } else { 1000 };
+        self.next_attempt = Some(now.saturating_add(std::time::Duration::from_millis(delay)));
+        true
+    }
+    /// A confirmed successful/manual session starts a fresh recovery budget.
+    pub fn success(&mut self) {
+        self.next_attempt = None;
+        self.failures = 0;
+    }
+}
+
+/// Detect a stream delivering only zeros/subnormals rather than ordinary quiet audio.
+/// The callback is never restarted here: the owner decides how to reopen and
+/// discard the interrupted utterance. No audio content or device names are logged.
+#[derive(Default)]
+pub struct SilentStreamWatchdog {
+    zero_since: Option<std::time::Duration>,
+    zero_samples: usize,
+    last_restart: Option<std::time::Duration>,
+    recent_restarts: [Option<std::time::Duration>; 3],
+}
+impl SilentStreamWatchdog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Input is the bounded 16 kHz mono capture output. Empty polls do not count
+    /// as digital silence. Any finite normal sample, however quiet, resets this
+    /// detector; nonfinite input belongs to the capture error path instead.
+    pub fn observe(&mut self, samples: &[f32], now: std::time::Duration) -> bool {
+        if samples.is_empty() {
+            return false;
+        }
+        if samples
+            .iter()
+            .any(|sample| !sample.is_finite() || sample.is_normal())
+        {
+            self.reset();
+            return false;
+        }
+        let started = *self.zero_since.get_or_insert(now);
+        if now < started {
+            self.reset();
+            return false;
+        }
+        self.zero_samples = self.zero_samples.saturating_add(samples.len()).min(48_000);
+        if self.zero_samples < 48_000
+            || now.saturating_sub(started) < std::time::Duration::from_secs(3)
+            || self
+                .last_restart
+                .is_some_and(|last| now.saturating_sub(last) < std::time::Duration::from_secs(10))
+        {
+            return false;
+        }
+        // Preserve this budget through resets and ordinary audio: brief noise
+        // between Bluetooth failures must not cause a reconnection storm.
+        let Some(slot) = self.recent_restarts.iter_mut().find(|entry| {
+            entry.is_none_or(|last| now.saturating_sub(last) >= std::time::Duration::from_secs(60))
+        }) else {
+            return false;
+        };
+        *slot = Some(now);
+        self.last_restart = Some(now);
+        self.reset();
+        true
+    }
+    /// Clear a stream/utterance boundary without removing the retry cooldown.
+    pub fn reset(&mut self) {
+        self.zero_since = None;
+        self.zero_samples = 0;
+    }
+}
+
+/// Opaque route identity includes format because Bluetooth profile changes can
+/// retain a physical UID while replacing its stream format. This contains no audio.
+pub fn input_route_token(
+    id: &str,
+    sample_rate: u32,
+    channels: u16,
+) -> Result<String, CaptureError> {
+    if id.is_empty()
+        || id.len() > 1024
+        || id.chars().any(char::is_control)
+        || sample_rate == 0
+        || channels == 0
+    {
+        return Err(CaptureError::DeviceUnavailable);
+    }
+    Ok(format!("{}:{}:{sample_rate}:{channels}", id.len(), id))
+}
+
+/// Read physical identity independently of a route's current sample format.
+/// Fallback holds use this identity so releasing a Bluetooth microphone and
+/// renegotiating its profile cannot be mistaken for a new user-selected device.
+pub fn input_route_device_id(token: &str) -> Result<&str, CaptureError> {
+    if token.len() > 1200 {
+        return Err(CaptureError::DeviceUnavailable);
+    }
+    let (length, remainder) = token
+        .split_once(':')
+        .ok_or(CaptureError::DeviceUnavailable)?;
+    let length: usize = length
+        .parse()
+        .map_err(|_| CaptureError::DeviceUnavailable)?;
+    if length == 0 || length > 1024 {
+        return Err(CaptureError::DeviceUnavailable);
+    }
+    let id = remainder
+        .get(..length)
+        .ok_or(CaptureError::DeviceUnavailable)?;
+    let format = remainder
+        .get(length..)
+        .and_then(|rest| rest.strip_prefix(':'))
+        .ok_or(CaptureError::DeviceUnavailable)?;
+    let mut parts = format.split(':');
+    let rate: u32 = parts
+        .next()
+        .ok_or(CaptureError::DeviceUnavailable)?
+        .parse()
+        .map_err(|_| CaptureError::DeviceUnavailable)?;
+    let channels: u16 = parts
+        .next()
+        .ok_or(CaptureError::DeviceUnavailable)?
+        .parse()
+        .map_err(|_| CaptureError::DeviceUnavailable)?;
+    if rate == 0 || channels == 0 || id.chars().any(char::is_control) {
+        return Err(CaptureError::DeviceUnavailable);
+    }
+    if let Some(sample_format) = parts.next()
+        && (sample_format.is_empty()
+            || sample_format.len() > 32
+            || !sample_format.bytes().all(|b| b.is_ascii_alphanumeric()))
+    {
+        return Err(CaptureError::DeviceUnavailable);
+    }
+    if parts.next().is_some() {
+        return Err(CaptureError::DeviceUnavailable);
+    }
+    Ok(id)
+}
+
+/// Add the negotiated sample representation to the physical route token.
+/// This detects same-UID Bluetooth profile changes beyond rate/channel changes.
+pub fn input_route_token_with_format(
+    id: &str,
+    sample_rate: u32,
+    channels: u16,
+    format: &str,
+) -> Result<String, CaptureError> {
+    if format.is_empty() || format.len() > 32 || !format.bytes().all(|b| b.is_ascii_alphanumeric())
+    {
+        return Err(CaptureError::DeviceUnavailable);
+    }
+    Ok(format!(
+        "{}:{format}",
+        input_route_token(id, sample_rate, channels)?
+    ))
 }
 
 /// Preallocated lock-free callback handoff. Producer pushes never allocate or
@@ -495,6 +773,12 @@ mod native {
                 .default_input_config()
                 .map_err(|_| CaptureError::StreamUnavailable)?;
             let config: cpal::StreamConfig = supported.into();
+            let device_id = input_route_token_with_format(
+                &device_id,
+                config.sample_rate,
+                config.channels,
+                &supported.sample_format().to_string(),
+            )?;
             let info = InputInfo {
                 name,
                 sample_rate: config.sample_rate,
@@ -606,12 +890,46 @@ mod native {
     }
     /// Reads routing metadata only; this does not open a microphone stream.
     pub fn default_input_id() -> Result<String, CaptureError> {
-        cpal::default_host()
+        let device = cpal::default_host()
             .default_input_device()
-            .ok_or(CaptureError::DeviceUnavailable)?
-            .id()
-            .map(|id| id.to_string())
-            .map_err(|_| CaptureError::DeviceUnavailable)
+            .ok_or(CaptureError::DeviceUnavailable)?;
+        let id = device.id().map_err(|_| CaptureError::DeviceUnavailable)?;
+        let format = device
+            .default_input_config()
+            .map_err(|_| CaptureError::DeviceUnavailable)?;
+        input_route_token_with_format(
+            &id.to_string(),
+            format.sample_rate(),
+            format.channels(),
+            &format.sample_format().to_string(),
+        )
+    }
+    /// Enumerates input metadata only. Selection applies exclusively to Jarvis's
+    /// next owned capture stream; macOS defaults and output devices stay untouched.
+    pub fn builtin_input_name() -> Result<String, CaptureError> {
+        let devices = cpal::default_host()
+            .input_devices()
+            .map_err(|_| CaptureError::DeviceUnavailable)?;
+        let mut candidates = Vec::new();
+        for device in devices.take(MAX_INPUT_DEVICES + 1) {
+            let Ok(description) = device.description() else {
+                continue;
+            };
+            if !matches!(
+                description.interface_type(),
+                cpal::InterfaceType::BuiltIn | cpal::InterfaceType::Unknown
+            ) {
+                continue;
+            }
+            if device.default_input_config().is_err() {
+                continue;
+            }
+            candidates.push((
+                description.name().to_owned(),
+                description.interface_type() == cpal::InterfaceType::BuiltIn,
+            ));
+        }
+        select_builtin_input_name(&candidates)
     }
     pub fn input_devices() -> Result<Vec<InputInfo>, CaptureError> {
         let devices = cpal::default_host()
@@ -683,4 +1001,6 @@ mod native {
     }
 }
 #[cfg(target_os = "macos")]
-pub use native::{CaptureSession, ContinuousCapture, default_input_id, input_devices};
+pub use native::{
+    CaptureSession, ContinuousCapture, builtin_input_name, default_input_id, input_devices,
+};

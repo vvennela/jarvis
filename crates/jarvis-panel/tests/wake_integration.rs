@@ -914,7 +914,7 @@ fn opt_in_diagnostic_line_contains_only_fixed_state_and_numeric_health() {
     assert_eq!(line.lines().count(), 1);
     assert_eq!(
         line,
-        "jarvis_voice state=WakeListening samples=32000 rms=0.02500 peak=0.50000 max_rms=0.25000 decodes=7 decode_ms=350 wakes=2 commands=1 discontinuities=3 capture_errors=4 decode_errors=5 xruns=6 route_changes=7 queue_overruns=8"
+        "jarvis_voice state=WakeListening samples=32000 rms=2.500e-2 peak=5.000e-1 max_rms=2.500e-1 decodes=7 decode_ms=350 wakes=2 commands=1 discontinuities=3 capture_errors=4 decode_errors=5 xruns=6 route_changes=7 queue_overruns=8 input_rate=48000 input_channels=2"
     );
 }
 

@@ -742,6 +742,10 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             }
             interaction_revealed = true;
         }
+        if voice_handoff.take_microphone_reveal() {
+            actions.reveal_for_wake();
+            wake_idle_since = None;
+        }
         let voice_snapshot = voice.control.snapshot();
         let working = conversation.control.busy()
             || tasks.control.busy()
@@ -915,7 +919,16 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             NSColor::tertiaryLabelColor()
         };
         activity.setTextColor(Some(&activity_color));
-        let preview_text = if let Some(error) = actions.ivars().action_error.get() {
+        let preview_text = if let Some(notice) = voice_handoff.microphone_notice()
+            && !conversation.control.busy()
+            && !matches!(
+                voice_snapshot.state,
+                wakeworker::State::CommandReady
+                    | wakeworker::State::CommandListening
+                    | wakeworker::State::Decoding
+            ) {
+            notice.to_owned()
+        } else if let Some(error) = actions.ivars().action_error.get() {
             error.to_owned()
         } else if coding_notice && !conversation.control.busy() {
             coding_snapshot

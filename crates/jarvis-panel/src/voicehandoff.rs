@@ -1,5 +1,6 @@
 //! Shared voice-to-conversation-to-speech handoff used by the native panel.
 use crate::{chat, codingworker, speech, tasks, wakeworker};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dispatch {
@@ -90,11 +91,61 @@ pub struct VoiceHandoff {
     task_revision: Option<u64>,
     coding_revision: Option<u64>,
     pending_coding_notice: bool,
+    last_microphone: Option<String>,
+    pending_microphone_notice: Option<String>,
+    visible_microphone_notice: Option<(String, Instant)>,
+    microphone_reveal: bool,
 }
 
 impl VoiceHandoff {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The native card displays the same bounded notice that speech announces.
+    pub fn microphone_notice(&self) -> Option<&str> {
+        self.visible_microphone_notice
+            .as_ref()
+            .and_then(|(text, until)| (Instant::now() < *until).then_some(text.as_str()))
+    }
+    pub fn take_microphone_reveal(&mut self) -> bool {
+        std::mem::take(&mut self.microphone_reveal)
+    }
+    fn observe_microphone(&mut self, snapshot: &wakeworker::Snapshot) {
+        let Some(input) = &snapshot.diagnostics.input else {
+            return;
+        };
+        if input.name.is_empty()
+            || input.name.len() > jarvis_voice::capture::MAX_INPUT_NAME_BYTES
+            || input.name.chars().any(char::is_control)
+        {
+            return;
+        }
+        if self.last_microphone.as_deref() == Some(input.name.as_str()) {
+            return;
+        }
+        let Some(previous) = self.last_microphone.replace(input.name.clone()) else {
+            return;
+        };
+        let name = input.name.to_ascii_lowercase();
+        let old = previous.to_ascii_lowercase();
+        // Fixed copy keeps arbitrary device labels out of spoken/provider text.
+        let notice = if old.contains("airpods") && name.contains("macbook") {
+            if snapshot.message
+                == "AirPods microphone stopped responding. Using the MacBook microphone."
+            {
+                "AirPods microphone stopped responding. Using the MacBook microphone."
+            } else {
+                "I switched from AirPods to the MacBook microphone."
+            }
+        } else if name.contains("airpods") {
+            "I'm now using the AirPods microphone."
+        } else if name.contains("macbook") {
+            "I'm now using the MacBook microphone."
+        } else {
+            "Microphone changed. I'm now using the selected microphone."
+        };
+        self.pending_microphone_notice = Some(notice.to_owned());
     }
 
     /// Advance without blocking. Returns the heard command for the transcript UI.
@@ -136,6 +187,19 @@ impl VoiceHandoff {
         coding: Option<&codingworker::Control>,
     ) -> Option<String> {
         let reply = conversation.snapshot();
+        let wake_snapshot = wake.snapshot();
+        self.observe_microphone(&wake_snapshot);
+        if conversation.busy()
+            || matches!(
+                wake_snapshot.state,
+                wakeworker::State::CommandReady
+                    | wakeworker::State::CommandListening
+                    | wakeworker::State::Decoding
+            )
+        {
+            self.visible_microphone_notice = None;
+            self.microphone_reveal = false;
+        }
         if self
             .active_followup
             .is_some_and(|(chat_epoch, speech_epoch)| {
@@ -301,6 +365,32 @@ impl VoiceHandoff {
                 }
                 _ => {}
             }
+        }
+        if self.pending_microphone_notice.is_some()
+            && self.active_followup.is_none()
+            && self.spoken_question.is_none()
+            && self.pending_reply_after.is_none()
+            && wake.enabled()
+            && wake.snapshot().state == wakeworker::State::WakeListening
+            && !conversation.busy()
+            && !playback.busy()
+            && let Some(mut notice) = self.pending_microphone_notice.take()
+        {
+            // A queued route change may wait behind speech. Read its fixed
+            // recovery reason at delivery rather than freezing older UI copy.
+            if notice == "I switched from AirPods to the MacBook microphone."
+                && wake.snapshot().message
+                    == "AirPods microphone stopped responding. Using the MacBook microphone."
+            {
+                notice =
+                    "AirPods microphone stopped responding. Using the MacBook microphone.".into();
+            }
+            // Visible delivery remains available if the configured speech service
+            // is unavailable. Never repeat or interrupt an active user request.
+            let _ = playback.speak(notice.clone());
+            self.visible_microphone_notice =
+                Some((notice, Instant::now() + Duration::from_secs(8)));
+            self.microphone_reveal = true;
         }
         let command = if !conversation.busy() && !playback.busy() {
             wake.take_command()

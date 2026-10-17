@@ -52,7 +52,7 @@ impl Snapshot {
     pub fn diagnostic_line(&self) -> String {
         let d = &self.diagnostics;
         format!(
-            "jarvis_voice state={:?} samples={} rms={:.5} peak={:.5} max_rms={:.5} decodes={} decode_ms={} wakes={} commands={} discontinuities={} capture_errors={} decode_errors={} xruns={} route_changes={} queue_overruns={}",
+            "jarvis_voice state={:?} samples={} rms={:.3e} peak={:.3e} max_rms={:.3e} decodes={} decode_ms={} wakes={} commands={} discontinuities={} capture_errors={} decode_errors={} xruns={} route_changes={} queue_overruns={} input_rate={} input_channels={}",
             self.state,
             d.captured_samples,
             d.last_rms,
@@ -68,6 +68,8 @@ impl Snapshot {
             d.capture.xruns,
             d.capture.route_changes,
             d.capture.queue_overruns,
+            d.input.as_ref().map_or(0, |input| input.sample_rate),
+            d.input.as_ref().map_or(0, |input| input.channels),
         )
     }
 }
@@ -94,6 +96,9 @@ pub trait WakeBackend {
     fn reset_keyword(&mut self) {}
 
     fn input_info(&self) -> Option<InputInfo> {
+        None
+    }
+    fn listening_message(&self) -> Option<&'static str> {
         None
     }
     fn start(&mut self) -> Result<(), &'static str>;
@@ -212,17 +217,25 @@ impl Control {
         self.stopped.store(true, Ordering::Release);
         self.invalidate();
     }
-    fn input(&self, input: Option<InputInfo>) {
+    fn input(&self, input: Option<InputInfo>, listening_message: Option<&'static str>) {
         let input = input.filter(|info| {
             !info.name.is_empty()
                 && info.name.len() <= jarvis_voice::capture::MAX_INPUT_NAME_BYTES
                 && !info.name.chars().any(char::is_control)
         });
-        self.snapshot
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .diagnostics
-            .input = input;
+        let mut snapshot = self.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+        let message = listening_message.unwrap_or("Wake listening · say Jarvis");
+        let changed =
+            snapshot.diagnostics.input != input || (input.is_some() && snapshot.message != message);
+        // Publish the selected input and its fixed recovery reason atomically.
+        // A handoff must never see a new microphone with the previous route's copy.
+        if input.is_some() {
+            snapshot.message = message;
+        }
+        snapshot.diagnostics.input = input;
+        if changed {
+            snapshot.revision = snapshot.revision.wrapping_add(1);
+        }
     }
     fn capture_diagnostics(&self, diagnostics: CaptureDiagnostics) {
         self.snapshot
@@ -280,7 +293,7 @@ impl Control {
     }
     fn publish(&self, state: State, message: &'static str) {
         let mut s = self.snapshot.lock().unwrap_or_else(|p| p.into_inner());
-        if s.state != state {
+        if s.state != state || s.message != message {
             s.state = state;
             s.message = message;
             s.revision = s.revision.wrapping_add(1);
@@ -327,6 +340,13 @@ impl WakeWorker {
                 input_follower: None,
                 route_clock: Instant::now(),
                 followed_routes: 0,
+                silent_stream: jarvis_voice::capture::SilentStreamWatchdog::default(),
+                reconnect: jarvis_voice::capture::ReconnectBackoff::default(),
+                healthy_since: None,
+                progress: jarvis_voice::capture::CaptureProgress::default(),
+                fallback_name: None,
+                fallback_default: None,
+                last_input_name: None,
                 device_name: settings.get("JARVIS_MICROPHONE_NAME").cloned(),
             }))
         })
@@ -422,7 +442,7 @@ impl WakeWorker {
                         if previous_input.is_some() && previous_input != input {
                             c.clear_followup();
                         }
-                        c.input(input);
+                        c.input(input, backend.listening_message());
                         c.cancelled.store(false, Ordering::Release);
                     }
                     let followup = c.followup_deadline(generation);
@@ -457,7 +477,9 @@ impl WakeWorker {
                             State::CommandListening
                         },
                         if detector.phase() == Phase::Wake {
-                            "Wake listening · say Jarvis"
+                            backend
+                                .listening_message()
+                                .unwrap_or("Wake listening · say Jarvis")
                         } else {
                             "Listening to your request…"
                         },
@@ -490,7 +512,7 @@ impl WakeWorker {
                             next_decode = None;
                             backend.reset_keyword();
                             keyword_audio.clear();
-                            c.input(backend.input_info());
+                            c.input(backend.input_info(), backend.listening_message());
                             continue;
                         }
                         let activity = match backend.speech_activity(&samples) {
@@ -620,7 +642,7 @@ impl WakeWorker {
                             next_decode = None;
                             backend.reset_keyword();
                             keyword_audio.clear();
-                            c.input(backend.input_info());
+                            c.input(backend.input_info(), backend.listening_message());
                             continue;
                         }
                         let activity = match backend.speech_activity(&queued) {
@@ -748,6 +770,19 @@ impl Drop for WakeWorker {
         }
     }
 }
+/// Compare physical microphones independently of Bluetooth format renegotiation.
+/// Active capture still uses the full route token; only an automatic fallback
+/// hold uses this narrower identity.
+pub fn same_input_device(left: &str, right: &str) -> bool {
+    match (
+        jarvis_voice::capture::input_route_device_id(left),
+        jarvis_voice::capture::input_route_device_id(right),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
 #[cfg(target_os = "macos")]
 struct NativeBackend {
     transcriber: jarvis_voice::Transcriber,
@@ -757,7 +792,56 @@ struct NativeBackend {
     input_follower: Option<jarvis_voice::capture::DefaultInputFollower>,
     route_clock: Instant,
     followed_routes: u64,
+    silent_stream: jarvis_voice::capture::SilentStreamWatchdog,
+    reconnect: jarvis_voice::capture::ReconnectBackoff,
+    healthy_since: Option<Instant>,
+    progress: jarvis_voice::capture::CaptureProgress,
+    fallback_name: Option<String>,
+    fallback_default: Option<String>,
+    last_input_name: Option<String>,
     device_name: Option<String>,
+}
+#[cfg(target_os = "macos")]
+impl NativeBackend {
+    fn try_builtin_fallback(&mut self) {
+        if self.device_name.is_none()
+            && self.fallback_name.is_none()
+            && self
+                .last_input_name
+                .as_ref()
+                .is_some_and(|name| name.to_ascii_lowercase().contains("airpods"))
+            && let Ok(name) = jarvis_voice::capture::builtin_input_name()
+        {
+            self.fallback_default = jarvis_voice::capture::default_input_id().ok().or_else(|| {
+                self.input_follower
+                    .as_ref()
+                    .map(|follower| follower.selected().to_owned())
+            });
+            self.fallback_name = Some(name);
+        }
+    }
+    fn reconnect_capture(
+        &mut self,
+        allow_fallback: bool,
+    ) -> Result<(Vec<f32>, bool), &'static str> {
+        if allow_fallback {
+            self.try_builtin_fallback();
+        }
+        self.capture.take();
+        self.reset_keyword();
+        self.silent_stream.reset();
+        let now = self.route_clock.elapsed();
+        let allowed = if self.healthy_since.take().is_some() {
+            self.reconnect.failed(now)
+        } else {
+            self.reconnect.begin(now)
+        };
+        if !allowed {
+            return Err("Microphone disconnected. Reconnect it, then tap Retry microphone.");
+        }
+        self.followed_routes = self.followed_routes.saturating_add(1);
+        Ok((Vec::new(), true))
+    }
 }
 #[cfg(target_os = "macos")]
 impl WakeBackend for NativeBackend {
@@ -791,10 +875,19 @@ impl WakeBackend for NativeBackend {
     fn input_info(&self) -> Option<InputInfo> {
         self.capture.as_ref().map(|capture| capture.info())
     }
+    fn listening_message(&self) -> Option<&'static str> {
+        self.fallback_name
+            .as_ref()
+            .map(|_| "AirPods microphone stopped responding. Using the MacBook microphone.")
+    }
     fn start(&mut self) -> Result<(), &'static str> {
+        self.silent_stream.reset();
+        self.progress.on_start(self.route_clock.elapsed());
         self.capture = Some(
             jarvis_voice::capture::ContinuousCapture::start_with_device_name(
-                self.device_name.as_deref(),
+                self.fallback_name
+                    .as_deref()
+                    .or(self.device_name.as_deref()),
             )
             .map_err(|error| match error {
                 jarvis_voice::capture::CaptureError::DeviceUnavailable
@@ -812,6 +905,7 @@ impl WakeBackend for NativeBackend {
             })?,
         );
         if let Some(capture) = &self.capture {
+            self.last_input_name = Some(capture.info().name);
             if let Some(follower) = &mut self.input_follower {
                 follower.commit(capture.device_id().to_owned());
             } else {
@@ -825,10 +919,34 @@ impl WakeBackend for NativeBackend {
         Ok(())
     }
     fn poll(&mut self) -> Result<(Vec<f32>, bool), &'static str> {
+        if self.capture.is_none() {
+            let now = self.route_clock.elapsed();
+            if !self.reconnect.due(now) {
+                return Ok((Vec::new(), false));
+            }
+            match self.start() {
+                Ok(()) => {
+                    self.healthy_since = Some(Instant::now());
+                    return Ok((Vec::new(), true));
+                }
+                Err(_) => {
+                    self.try_builtin_fallback();
+                    if self.reconnect.failed(now) {
+                        return Ok((Vec::new(), false));
+                    }
+                    return Err(
+                        "Microphone disconnected. Reconnect it, then tap Retry microphone.",
+                    );
+                }
+            }
+        }
         let failed = self
             .capture
             .as_ref()
             .is_some_and(|capture| capture.failed());
+        if failed {
+            return self.reconnect_capture(true);
+        }
         let due = self
             .input_follower
             .as_mut()
@@ -843,28 +961,59 @@ impl WakeBackend for NativeBackend {
                 // healthy owned stream. Retry at the next bounded poll.
                 Err(_) => None,
             };
-            if candidate.as_deref().is_some_and(|candidate| {
-                self.input_follower
-                    .as_ref()
-                    .is_some_and(|follower| follower.changed(candidate))
-            }) {
+            let holding_fallback = self.fallback_name.is_some()
+                && (candidate.is_none()
+                    || candidate
+                        .as_deref()
+                        .zip(self.fallback_default.as_deref())
+                        .is_some_and(|(candidate, saved)| same_input_device(candidate, saved)));
+            if !holding_fallback
+                && candidate.as_deref().is_some_and(|candidate| {
+                    self.input_follower
+                        .as_ref()
+                        .is_some_and(|follower| follower.changed(candidate))
+                })
+            {
                 // Dispose old samples/stream before opening the newly selected
                 // input. A route switch can never complete an old utterance.
-                self.capture.take();
-                self.start()?;
-                self.reset_keyword();
-                self.followed_routes = self.followed_routes.saturating_add(1);
-                return Ok((Vec::new(), true));
+                self.fallback_name = None;
+                self.fallback_default = None;
+                return self.reconnect_capture(false);
             }
         }
-        self.capture
+        let result = match self
+            .capture
             .as_mut()
             .ok_or("Microphone unavailable")?
             .poll()
-            .map_err(|_| "Check microphone settings")
+        {
+            Ok(result) => result,
+            Err(_) => return self.reconnect_capture(true),
+        };
+        if self
+            .silent_stream
+            .observe(&result.0, self.route_clock.elapsed())
+        {
+            // Digital silence alone cannot exhaust the actual-failure budget.
+            // The independent three-per-minute watchdog budget still applies.
+            self.reconnect.success();
+            self.healthy_since = None;
+            return self.reconnect_capture(false);
+        }
+        if self.progress.observe(&result.0, self.route_clock.elapsed()) {
+            self.reconnect.success();
+            self.healthy_since = None;
+        }
+        if self.progress.no_arrivals(self.route_clock.elapsed()) {
+            return self.reconnect_capture(true);
+        }
+        Ok(result)
     }
     fn stop(&mut self) {
         self.capture.take();
+        self.silent_stream.reset();
+        self.reconnect.success();
+        self.healthy_since = None;
     }
     fn transcribe(
         &mut self,
