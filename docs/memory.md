@@ -28,6 +28,8 @@ Rust gives explicit ownership and bounded lifetimes, but it does not automatical
 | Local Whisper | Model file at most 256 MiB; 4 CPU threads | Load model once per voice worker; reuse native state |
 | Wake audio | 4-second rolling wake window; 15-second command cap at mono 16 kHz | Energy gate avoids decoding silence; endpoint or cap finishes command |
 | Voice handoff | One pending command | Backpressure; mute and suppression invalidate pending/late results |
+| Music discovery | 5 search candidates; 512 KiB search, 64 KiB metadata, 256 KiB canonical embed per response; 2 concurrent lookups | Exact verified identities; parallel candidate checks share a 10-second deadline |
+| Artist playback | 35-second whole tool deadline; 20-second native process deadline; 4 KiB stdout/stderr | Only matching playing artist and consistent track identity produce success |
 | Speech request | 8 KiB text; ElevenLabs audio at most 8 MiB | Bounded response validation before playback |
 
 SQLite uses WAL mode, a requested 2 MiB page cache, a 32,768-page main-database cap, automatic checkpoint threshold of 128 pages, and a 4 MiB retained-journal target. With 4 KiB database pages the main-file cap is approximately 128 MiB. Page size, indexes, other connections, transient WAL growth, TLS buffers and allocator overhead affect actual memory/storage use; the journal target is not a hard instantaneous WAL cap.
@@ -41,7 +43,7 @@ The library permits explicitly configured inventory/history/ledger limits within
 - History records resource ID, version, kind, actor and timestamp. Previous full content versions are not an application-level archive.
 - Separate page and tab records prevent a metadata-only browser update from replacing full page text. Multi-record observations use one atomic batch.
 - Attribution is `Unknown` or `AgentCandidate`, never proof of human intent. Candidate matching is one-use and invalidated by intervening target changes.
-- Provider outputs are plain text/typed routes. No generated tool execution or unlimited worker spawning is connected.
+- Provider outputs are text or registered typed proposals. The runtime validates arguments and caller intent before bounded tool execution. One background draft worker owns its job state.
 - The Native Messaging host is a bounded observation process, not a general command server.
 
 ## Freshness and privacy limits

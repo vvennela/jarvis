@@ -1,6 +1,6 @@
 # Jarvis — current work
 
-Verified checkpoint: October 17, 2026, artist-selection increment after `8de69c2`. Maintained from Vishnu's requests and repository/test results; this note is not a complete desktop activity log.
+Verified checkpoint: October 17, 2026, canonical artist-selection increment after `7343960`. Maintained from Vishnu's requests and repository/test results; this note is not a complete desktop activity log.
 
 ## Objective and deadline
 
@@ -8,14 +8,14 @@ Prepare a useful, always-on Mac companion for judging by approximately **3:41 PM
 
 ## Current priorities
 
-1. **Connect You search and rehearse artist selection by voice.** The typed artist tool uses the artist extracted by Nemotron, verifies Spotify metadata, plays that artist URI, then checks the playing artist and track. The actual native adapter successfully selected Metallica. Generic You search still needs `YOU_API_KEY` in `.env`; the full model → search → native path has passed integration fixtures but not a live spoken rehearsal. Exact approved app requests continue to bypass hosted inference.
+1. **Rehearse artist selection by voice once Crusoe tool calling is available.** The You key is configured and live search → canonical Spotify identity → native Metallica playback passed in **3.276 seconds** (lookup: 2.470 seconds). Spotify aliases are resolved from its own structured embed identity. The full model → search → native path has passed integration fixtures, but the live model planning call still receives HTTP 429. Exact approved app requests continue to bypass hosted inference.
 2. **Verify the complete Nemotron tool-call protocol against Crusoe.** Typed tools and their bounded runner are implemented and fixture-tested. Recent full-protocol probes received HTTP 429, identified as `max_requests_limit (orchestrator)`; a minimal 16-token text request returned HTTP 200. This is not evidence of missing API keys. Respect provider cooldown; do not describe full live tool calling as verified yet.
 3. **Check the current voice build with ordinary human speech.** A previous human wake worked on the first attempt, but the current quiet-audio/preroll increment still needs acceptance. The current app reports loaded wake listening with healthy numeric capture counters and zero reported capture errors; that does not prove a human command succeeded. AirPods input and output were previously verified at 24 kHz mono, but the current device name has not been confirmed.
 4. **Rehearse shared context and background review.** Ask what to do next, save a truthful priority change, ask again, and delegate a handoff. Confirm the new draft reflects the changed note and opens only after explicit verified review. Then time the three-minute walkthrough in `docs/demo.md`.
 
 ## Verified implementation
 
-- Artist-selection validation: **334 workspace tests passed, 15 ignored**; formatting and all-target clippy passed. Independent tests cover arbitrary artist identities, unsafe proposals, ambiguity, credential boundaries, cancellation and wrong playback. The actual native Spotify artist adapter passed a live component check. The live hosted tool protocol still returned HTTP 429. Ignored live/hardware tests are not included as successes.
+- Artist-selection validation: **334 workspace tests passed, 15 ignored**; formatting and all-target clippy passed. Independent tests cover arbitrary artist identities, unsafe proposals, ambiguity, credential boundaries, cancellation and wrong playback. Production You search and native Spotify playback passed a live combined check; model planning and human voice were outside that measurement. The live hosted tool protocol still returned HTTP 429. Ignored live/hardware tests are not included as successes.
 - Native menu-bar companion with compact glass card, real busy spinner, local keyword detection and Whisper transcription, microphone controls and spoken responses. Awareness and draft work run independently.
 - Explicit-root file notifications, hashes, SQLite history/FTS, foreground app metadata, source-balanced retrieval and next-work ranking. The current demo scope is this project's docs, not all Documents/Downloads.
 - Jev routing overlaps context retrieval. Jev can propose typed Spotify actions; the original caller request still passes the policy gate. Ordinary exact app actions need no model.

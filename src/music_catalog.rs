@@ -11,6 +11,7 @@ pub const SEARCH_ENDPOINT: &str = "https://ydc-index.io/v1/search";
 pub const OEMBED_ENDPOINT: &str = "https://open.spotify.com/oembed";
 pub const MAX_SEARCH_BYTES: usize = 512 * 1024;
 pub const MAX_OEMBED_BYTES: usize = 64 * 1024;
+pub const MAX_EMBED_BYTES: usize = 256 * 1024;
 pub const MAX_CANDIDATES: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +71,7 @@ impl ResolvedArtist {
 pub struct CatalogConfig {
     search: Url,
     oembed: Url,
+    embed: Option<Url>,
     timeout: Duration,
 }
 impl CatalogConfig {
@@ -77,6 +79,9 @@ impl CatalogConfig {
         Self {
             search: Url::parse(SEARCH_ENDPOINT).expect("constant URL"),
             oembed: Url::parse(OEMBED_ENDPOINT).expect("constant URL"),
+            embed: Some(
+                Url::parse("https://open.spotify.com/embed/artist/").expect("constant URL"),
+            ),
             timeout: Duration::from_secs(10),
         }
     }
@@ -109,8 +114,23 @@ impl CatalogConfig {
         Ok(Self {
             search: endpoint(search)?,
             oembed: endpoint(oembed)?,
+            embed: None,
             timeout,
         })
+    }
+    pub fn loopback_with_embed_for_tests(
+        search: &str,
+        oembed: &str,
+        embed_base: &str,
+        timeout: Duration,
+    ) -> Result<Self, CatalogError> {
+        let mut config = Self::loopback_for_tests(search, oembed, timeout)?;
+        let validated = Self::loopback_for_tests(search, embed_base, timeout)?;
+        if !validated.oembed.path().ends_with('/') {
+            return Err(CatalogError::InvalidConfiguration);
+        }
+        config.embed = Some(validated.oembed);
+        Ok(config)
     }
 }
 
@@ -206,6 +226,26 @@ impl MusicCatalog {
             while let Some(result) = checks.join_next().await {
                 if let Some(artist) = result.map_err(|_| CatalogError::Unavailable)?? {
                     matches.push(artist);
+                }
+            }
+            if matches.len() > 1 && let Some(base) = &self.config.embed {
+                let mut canonical = tokio::task::JoinSet::new();
+                for artist in matches {
+                    let client = self.client.clone();
+                    let mut endpoint = base.clone();
+                    endpoint.set_path(&format!("{}{}", base.path(), artist.id));
+                    let requested = requested.to_owned();
+                    canonical.spawn(async move {
+                        let response = client.get(endpoint).send().await.map_err(http_error)?;
+                        let body = bounded(response, MAX_EMBED_BYTES).await?;
+                        verify_embed_artist(&requested, &body)
+                    });
+                }
+                matches = Vec::new();
+                let mut canonical_ids = HashSet::new();
+                while let Some(result) = canonical.join_next().await {
+                    let artist = result.map_err(|_| CatalogError::Unavailable)??;
+                    if canonical_ids.insert(artist.id.clone()) { matches.push(artist); }
                 }
             }
             matches.sort_by(|left, right| left.id.cmp(&right.id));
@@ -338,4 +378,63 @@ struct Oembed {
     #[serde(rename = "type")]
     kind: String,
     title: String,
+}
+
+// Spotify's public embed bootstrap carries canonical entity identity for artist
+// aliases. Read only the inert JSON data; never evaluate scripts or render HTML.
+fn verify_embed_artist(requested: &str, body: &[u8]) -> Result<ResolvedArtist, CatalogError> {
+    let html = std::str::from_utf8(body).map_err(|_| CatalogError::InvalidResponse)?;
+    let mut remaining = html;
+    let mut bootstrap = None;
+    while let Some(start) = remaining.find("<script") {
+        remaining = &remaining[start + "<script".len()..];
+        let end = remaining.find('>').ok_or(CatalogError::InvalidResponse)?;
+        let attributes = &remaining[..end];
+        let body_start = &remaining[end + 1..];
+        let close = body_start
+            .find("</script>")
+            .ok_or(CatalogError::InvalidResponse)?;
+        if attributes
+            .split_ascii_whitespace()
+            .any(|attribute| matches!(attribute, "id=\"__NEXT_DATA__\"" | "id='__NEXT_DATA__'"))
+        {
+            if bootstrap.is_some() {
+                return Err(CatalogError::InvalidResponse);
+            }
+            bootstrap = Some(&body_start[..close]);
+        }
+        remaining = &body_start[close + "</script>".len()..];
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(bootstrap.ok_or(CatalogError::InvalidResponse)?)
+            .map_err(|_| CatalogError::InvalidResponse)?;
+    let entity: EmbedArtist = serde_json::from_value(
+        value
+            .pointer("/props/pageProps/state/data/entity")
+            .ok_or(CatalogError::InvalidResponse)?
+            .clone(),
+    )
+    .map_err(|_| CatalogError::InvalidResponse)?;
+    if entity.kind != "artist"
+        || !valid_name(&entity.name)
+        || normalized(requested) != normalized(&entity.name)
+        || entity.id.len() != 22
+        || !entity.id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        || entity.uri != format!("spotify:artist:{}", entity.id)
+    {
+        return Err(CatalogError::InvalidResponse);
+    }
+    Ok(ResolvedArtist {
+        name: entity.name.trim().to_owned(),
+        id: entity.id,
+        uri: entity.uri,
+    })
+}
+#[derive(Deserialize)]
+struct EmbedArtist {
+    name: String,
+    id: String,
+    uri: String,
+    #[serde(rename = "type")]
+    kind: String,
 }
