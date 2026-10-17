@@ -193,3 +193,58 @@ fn fatal_capture_errors_remain_failed_after_later_recoverable_notifications() {
         assert!(health.failed());
     }
 }
+
+#[test]
+fn explicit_microphone_selection_is_exact_unique_and_never_falls_back_silently() {
+    use jarvis_voice::capture::select_input_index;
+    let names = vec![
+        "MacBook Pro Microphone".to_owned(),
+        "AirPods Pro".to_owned(),
+        "USB Audio".to_owned(),
+    ];
+    assert_eq!(select_input_index(&names, "AirPods Pro").unwrap(), 1);
+    assert_eq!(
+        select_input_index(&names, "MacBook Pro Microphone").unwrap(),
+        0
+    );
+    for requested in [
+        "AirPods",
+        "airpods pro",
+        "Unknown device",
+        "",
+        " ",
+        "AirPods Pro\0",
+    ] {
+        assert!(
+            select_input_index(&names, requested).is_err(),
+            "invalidorambiguousselection silently chose a device: {requested:?}"
+        );
+    }
+    assert!(select_input_index(&[], "AirPods Pro").is_err());
+    let duplicate = vec!["AirPods Pro".to_owned(), "AirPods Pro".to_owned()];
+    assert!(
+        select_input_index(&duplicate, "AirPods Pro").is_err(),
+        "duplicate exactnames require clarification"
+    );
+}
+
+#[test]
+fn microphone_inventory_and_utf8_names_have_explicit_resource_bounds() {
+    use jarvis_voice::capture::select_input_index;
+    let names: Vec<_> = (0..32).map(|i| format!("Fixture microphone {i}")).collect();
+    assert_eq!(
+        select_input_index(&names, "Fixture microphone 31").unwrap(),
+        31
+    );
+    let mut overflow = names;
+    overflow.push("extra microphone".into());
+    assert!(select_input_index(&overflow, "Fixture microphone 0").is_err());
+    let allowed = "🎤".repeat(32);
+    assert_eq!(allowed.len(), 128);
+    assert_eq!(
+        select_input_index(std::slice::from_ref(&allowed), &allowed).unwrap(),
+        0
+    );
+    let oversized = "🎤".repeat(33);
+    assert!(select_input_index(std::slice::from_ref(&oversized), &oversized).is_err());
+}

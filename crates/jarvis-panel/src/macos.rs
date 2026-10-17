@@ -591,13 +591,29 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             actions.reveal_for_wake();
             interaction_revealed = true;
         }
-        menu_button.setToolTip(Some(&NSString::from_str(voice_snapshot.message)));
+        let voice_diagnostics = &voice_snapshot.diagnostics;
+        let microphone_name = voice_diagnostics
+            .input
+            .as_ref()
+            .map(|input| input.name.as_str())
+            .unwrap_or("Starting microphone");
+        let microphone_details = format!(
+            "{}\nInput: {}\nLevel: {:.4} · Peak: {:.4}\nDecodes: {} · Wake matches: {} · Last decode: {} ms",
+            voice_snapshot.message,
+            microphone_name,
+            voice_diagnostics.last_rms,
+            voice_diagnostics.last_peak,
+            voice_diagnostics.decode_count,
+            voice_diagnostics.wake_matches,
+            voice_diagnostics.last_decode_ms,
+        );
+        menu_button.setToolTip(Some(&NSString::from_str(&microphone_details)));
         record_button.setTitle(&NSString::from_str(if voice.control.enabled() {
             "Mute"
         } else {
             "Listen"
         }));
-        record_button.setToolTip(Some(&NSString::from_str(voice_snapshot.message)));
+        record_button.setToolTip(Some(&NSString::from_str(&microphone_details)));
         record_button.setEnabled(voice_snapshot.state != wakeworker::State::Stopped);
         input.setEnabled(!conversation.control.busy());
         send_button.setEnabled(conversation.control.available() && !conversation.control.busy());
@@ -660,6 +676,10 @@ pub fn run(options: Options) -> Result<(), &'static str> {
                 .take(180)
                 .collect::<String>()
                 .replace('\n', " ")
+        } else if voice_snapshot.state == wakeworker::State::Failed {
+            voice_snapshot.message.to_owned()
+        } else if voice.control.enabled() && voice_diagnostics.input.is_some() {
+            format!("Listening with {microphone_name}.")
         } else {
             "Here when you need me.".to_owned()
         };

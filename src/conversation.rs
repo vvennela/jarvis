@@ -322,6 +322,7 @@ pub fn load_provider_settings() -> Result<HashMap<String, String>, ConversationE
         "JARVIS_CONVERSATION_MODEL",
         "JARVIS_WORKER_MODEL",
         "JARVIS_WHISPER_MODEL_PATH",
+        "JARVIS_MICROPHONE_NAME",
         "ELEVENLABS_API_KEY",
         "ELEVENLABS_VOICE_ID",
     ];

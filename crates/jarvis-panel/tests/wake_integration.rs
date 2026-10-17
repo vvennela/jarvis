@@ -116,6 +116,8 @@ fn continuous_audio_and_command_windows_remain_bounded() {
 struct Probe {
     chunks: Mutex<VecDeque<(Vec<f32>, bool)>>,
     texts: Mutex<VecDeque<String>>,
+    input: Mutex<Option<jarvis_voice::capture::InputInfo>>,
+    poll_failure: AtomicBool,
     starts: AtomicUsize,
     stops: AtomicUsize,
     decodes: AtomicUsize,
@@ -124,11 +126,17 @@ struct Probe {
 }
 struct Backend(Arc<Probe>);
 impl WakeBackend for Backend {
+    fn input_info(&self) -> Option<jarvis_voice::capture::InputInfo> {
+        self.0.input.lock().unwrap().clone()
+    }
     fn start(&mut self) -> Result<(), &'static str> {
         self.0.starts.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
     fn poll(&mut self) -> Result<(Vec<f32>, bool), &'static str> {
+        if self.0.poll_failure.load(Ordering::Acquire) {
+            return Err("Synthetic capture failure");
+        }
         Ok(self
             .0
             .chunks
@@ -420,12 +428,17 @@ fn long_idle_silence_does_not_spend_the_next_utterance_decode_budget() {
                 "idle silence must never request inference"
             );
         }
-        for _ in 0..50 {
+        for _ in 0..59 {
             assert!(
                 detector.ingest(&[amplitude; 320]).is_none(),
-                "long-idle counter caused decoding before one second of new speech"
+                "long-idle counter consumed the fresh 1.2-second probe budget"
             );
         }
+        let probe = detector
+            .ingest(&[amplitude; 320])
+            .expect("first probe at 1.2 seconds");
+        assert!(!probe.endpoint);
+        assert!(detector.accept_transcript("Jarvis where was I?").is_none());
         let mut endpoint = None;
         for _ in 0..60 {
             if let Some(request) = detector.ingest(&[0.0; 320]) {
@@ -687,4 +700,177 @@ fn low_energy_idle_audio_does_not_start_decode_but_active_quiet_tail_is_retained
             .accept_transcript("ambient conversation without the wake word")
             .is_none()
     );
+}
+
+#[test]
+fn repeating_the_wake_word_waits_for_a_request_instead_of_sending_it_as_a_command() {
+    for wake_only in ["Jarvis Jarvis", "Jarvis, Jarvis.", "JARVIS! Jarvis? Jarvis"] {
+        let mut detector = WakeDetector::new();
+        utterance(&mut detector);
+        assert!(
+            detector.accept_transcript(wake_only).is_none(),
+            "repeated wake words became a remote command: {wake_only}"
+        );
+        assert_eq!(detector.phase(), Phase::Command);
+        utterance(&mut detector);
+        assert_eq!(
+            detector.accept_transcript("find my notes").as_deref(),
+            Some("find my notes")
+        );
+    }
+    let mut detector = WakeDetector::new();
+    utterance(&mut detector);
+    assert_eq!(
+        detector
+            .accept_transcript("Jarvis, Jarvis, find my notes")
+            .as_deref(),
+        Some("find my notes")
+    );
+    utterance(&mut detector);
+    assert_eq!(
+        detector
+            .accept_transcript("Jarvis tell me about Jarvis")
+            .as_deref(),
+        Some("tell me about Jarvis"),
+        "normalizer must preserve wake token inside actual request"
+    );
+}
+
+#[test]
+fn explicit_wake_accepts_a_quiet_followup_without_requiring_louder_speech_again() {
+    let mut detector = WakeDetector::new();
+    utterance(&mut detector);
+    assert!(detector.accept_transcript("Jarvis").is_none());
+    assert_eq!(detector.phase(), Phase::Command);
+    assert!(detector.ingest(&vec![0.007; 16000]).is_none());
+    let request = detector
+        .ingest(&vec![0.0; 17600])
+        .expect("armed followup should retain quietspeech and endpoint");
+    assert_eq!(request.phase, Phase::Command);
+    assert!(request.endpoint);
+    assert!(request.samples.len() >= 16000);
+    assert_eq!(
+        detector.accept_transcript("where was I?").as_deref(),
+        Some("where was I?")
+    );
+    assert_eq!(detector.phase(), Phase::Wake);
+}
+
+#[test]
+fn repeated_wake_during_followup_rearms_instead_of_sending_a_wake_token_or_disarming() {
+    let mut detector = WakeDetector::new();
+    utterance(&mut detector);
+    detector.accept_transcript("Jarvis");
+    for repeated in ["Jarvis", "Jarvis Jarvis", "Jarvis, Jarvis!"] {
+        utterance(&mut detector);
+        assert!(detector.accept_transcript(repeated).is_none());
+        assert_eq!(
+            detector.phase(),
+            Phase::Command,
+            "repeatwake lostthefollowupwindow"
+        );
+    }
+    utterance(&mut detector);
+    assert_eq!(
+        detector.accept_transcript("summarize my notes").as_deref(),
+        Some("summarize my notes")
+    );
+}
+
+#[test]
+fn first_wake_probe_is_prompt_but_repeat_probes_remain_bounded() {
+    let mut detector = WakeDetector::new();
+    for _ in 0..59 {
+        assert!(detector.ingest(&[0.1; 320]).is_none());
+    }
+    let first = detector.ingest(&[0.1; 320]).unwrap();
+    assert!(!first.endpoint);
+    assert!(detector.accept_transcript("ambient words").is_none());
+    for _ in 0..124 {
+        assert!(detector.ingest(&[0.1; 320]).is_none());
+    }
+    let repeat = detector
+        .ingest(&[0.1; 320])
+        .expect("repeat after 2.5 seconds");
+    assert!(!repeat.endpoint);
+    assert!(repeat.samples.len() <= 4 * 16000);
+    assert!(detector.accept_transcript("Jarvis find my notes").is_none());
+    assert_eq!(detector.phase(), Phase::Command);
+    let endpoint = detector.ingest(&[0.0; 17600]).unwrap();
+    assert!(endpoint.endpoint);
+    assert_eq!(
+        detector
+            .accept_transcript("Jarvis find my notes")
+            .as_deref(),
+        Some("find my notes")
+    );
+}
+
+#[test]
+fn diagnostics_distinguish_capture_decode_and_wake_without_storing_transcript() {
+    let probe = Arc::new(Probe::default());
+    *probe.input.lock().unwrap() = Some(jarvis_voice::capture::InputInfo {
+        name: "Synthetic microphone".into(),
+        sample_rate: 48000,
+        channels: 2,
+    });
+    let mut worker = worker(&probe);
+    assert!(worker.control.snapshot().diagnostics.input.is_none());
+    worker.control.set_enabled(true);
+    wait_until(|| worker.control.snapshot().state == State::WakeListening);
+    let input = worker.control.snapshot().diagnostics.input.unwrap();
+    assert_eq!(
+        (input.name.as_str(), input.sample_rate, input.channels),
+        ("Synthetic microphone", 48000, 2)
+    );
+    probe
+        .chunks
+        .lock()
+        .unwrap()
+        .push_back((vec![0.007; 320], false));
+    wait_until(|| worker.control.snapshot().diagnostics.captured_samples == 320);
+    let d = worker.control.snapshot().diagnostics;
+    assert!((d.last_rms - 0.007).abs() < 0.00001);
+    assert!((d.last_peak - 0.007).abs() < 0.00001);
+    assert_eq!(d.decode_count, 0);
+    feed(&probe, "ambient secret fixture words");
+    wait_until(|| worker.control.snapshot().diagnostics.decode_count == 1);
+    assert_eq!(worker.control.snapshot().diagnostics.commands, 0);
+    feed(&probe, "Jarvis synthetic private command");
+    wait_until(|| worker.control.snapshot().state == State::CommandReady);
+    let snapshot = worker.control.snapshot();
+    assert_eq!(snapshot.diagnostics.decode_count, 2);
+    assert_eq!(snapshot.diagnostics.wake_matches, 1);
+    assert_eq!(snapshot.diagnostics.commands, 1);
+    assert!(snapshot.diagnostics.max_rms >= 0.099);
+    assert!(!format!("{snapshot:?}").contains("secret fixture"));
+    assert!(!format!("{snapshot:?}").contains("synthetic private command"));
+    worker.control.suppress(true);
+    assert!(worker.control.take_command().is_none());
+    stop(&mut worker);
+}
+
+#[test]
+fn fatal_capture_error_remains_visible_and_requires_explicit_retry() {
+    let probe = Arc::new(Probe::default());
+    let mut worker = worker(&probe);
+    worker.control.set_enabled(true);
+    wait_until(|| worker.control.snapshot().state == State::WakeListening);
+    probe.poll_failure.store(true, Ordering::Release);
+    wait_until(|| worker.control.snapshot().state == State::Failed);
+    thread::sleep(Duration::from_millis(60));
+    assert_eq!(worker.control.snapshot().state, State::Failed);
+    assert_eq!(worker.control.snapshot().diagnostics.capture_errors, 1);
+    assert_eq!(probe.starts.load(Ordering::Acquire), 1);
+    assert!(!worker.control.enabled());
+    probe.poll_failure.store(false, Ordering::Release);
+    worker.control.set_enabled(true);
+    wait_until(|| probe.starts.load(Ordering::Acquire) == 2);
+    feed(&probe, "Jarvis retry succeeds");
+    wait_until(|| worker.control.snapshot().state == State::CommandReady);
+    assert_eq!(
+        worker.control.take_command().as_deref(),
+        Some("retry succeeds")
+    );
+    stop(&mut worker);
 }

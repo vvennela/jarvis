@@ -5,6 +5,7 @@ const SILENCE: usize = RATE * 11 / 10;
 const START_RMS: f64 = 0.012;
 const CONTINUE_RMS: f64 = 0.006;
 const WAKE_WINDOW: usize = RATE * 4;
+const FIRST_DECODE_INTERVAL: usize = RATE * 6 / 5;
 const DECODE_INTERVAL: usize = RATE * 5 / 2;
 const COMMAND_CAP: usize = RATE * 15;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,6 +28,7 @@ pub struct WakeDetector {
     active: bool,
     silence: usize,
     since_decode: usize,
+    probed: bool,
     waiting: usize,
     pending: Option<(Phase, bool)>,
 }
@@ -43,6 +45,7 @@ impl WakeDetector {
             active: false,
             silence: 0,
             since_decode: 0,
+            probed: false,
             waiting: 0,
             pending: None,
         }
@@ -60,6 +63,7 @@ impl WakeDetector {
         self.active = false;
         self.silence = 0;
         self.since_decode = 0;
+        self.probed = false;
         self.waiting = 0;
     }
     pub fn ingest(&mut self, samples: &[f32]) -> Option<DecodeRequest> {
@@ -72,8 +76,9 @@ impl WakeDetector {
         }
         for frame in samples.chunks(320) {
             // Once speech starts, quieter trailing words still keep the turn
-            // open. Idle background sound must cross the higher start gate.
-            let voiced = voiced_frame(frame, self.active);
+            // open. An explicit wake also arms quiet followup speech; idle
+            // background sound must still cross the higher start gate.
+            let voiced = voiced_frame(frame, self.active || self.phase == Phase::Command);
             self.waiting += frame.len();
             if voiced {
                 if !self.active {
@@ -113,10 +118,17 @@ impl WakeDetector {
         let endpoint = self.active
             && (self.silence >= SILENCE
                 || (self.phase == Phase::Command && self.audio.len() >= COMMAND_CAP));
-        if self.active
-            && (endpoint || (self.phase == Phase::Wake && self.since_decode >= DECODE_INTERVAL))
+        // Probe a new utterance promptly, but retain the slower repeat cadence
+        // for ongoing ambient speech so local inference stays bounded.
+        let interval = if self.probed {
+            DECODE_INTERVAL
+        } else {
+            FIRST_DECODE_INTERVAL
+        };
+        if self.active && (endpoint || (self.phase == Phase::Wake && self.since_decode >= interval))
         {
             self.pending = Some((self.phase, endpoint));
+            self.probed = true;
             self.since_decode = 0;
             return Some(DecodeRequest {
                 samples: self.audio.clone(),
@@ -187,7 +199,14 @@ impl WakeDetector {
                 None
             }
             Phase::Command => {
-                let command = wake_tail(text).unwrap_or(text).trim();
+                // Only strip invocation prefixes here. A substantive command
+                // such as "tell me about Jarvis" must remain intact.
+                let invocation = leading_wake_tail(text).map(strip_repeated_wakes);
+                let command = invocation.unwrap_or(text).trim();
+                if invocation.is_some() && command.is_empty() {
+                    self.clear_audio();
+                    return None;
+                }
                 let result = (!command.is_empty()).then(|| command.to_owned());
                 self.reset();
                 result
@@ -205,18 +224,42 @@ fn voiced_frame(frame: &[f32], active: bool) -> bool {
 }
 /// Word boundaries prevent accidental matches such as "Jarvises" or "Jarvis123".
 pub fn wake_tail(text: &str) -> Option<&str> {
-    let words: Vec<_> = text
+    let words = text
         .split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty())
-        .collect();
+        .filter(|s| !s.is_empty());
     for word in words {
         if word.eq_ignore_ascii_case("jarvis") {
             let end = word.as_ptr() as usize - text.as_ptr() as usize + word.len();
-            return Some(
-                text[end..]
-                    .trim_start_matches(|c: char| c.is_whitespace() || c.is_ascii_punctuation()),
-            );
+            return Some(strip_repeated_wakes(trim_invocation_separator(
+                &text[end..],
+            )));
         }
     }
     None
+}
+
+fn trim_invocation_separator(text: &str) -> &str {
+    text.trim_start_matches(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
+}
+
+fn leading_wake_tail(text: &str) -> Option<&str> {
+    let mut words = text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty());
+    let mut word = words.next()?;
+    if word.eq_ignore_ascii_case("hey") {
+        word = words.next()?;
+    }
+    if !word.eq_ignore_ascii_case("jarvis") {
+        return None;
+    }
+    let end = word.as_ptr() as usize - text.as_ptr() as usize + word.len();
+    Some(trim_invocation_separator(&text[end..]))
+}
+
+fn strip_repeated_wakes(mut tail: &str) -> &str {
+    while let Some(rest) = leading_wake_tail(tail) {
+        tail = rest;
+    }
+    tail
 }

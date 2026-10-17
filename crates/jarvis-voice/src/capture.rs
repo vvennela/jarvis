@@ -10,6 +10,7 @@ pub const OUTPUT_RATE: u32 = 16_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureError {
     InvalidFormat,
+    InvalidDeviceSelection,
     InvalidAudio,
     Empty,
     DeviceUnavailable,
@@ -20,6 +21,7 @@ impl fmt::Display for CaptureError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::InvalidFormat => "Choose a supported microphone format",
+            Self::InvalidDeviceSelection => "Choose one exact available microphone name",
             Self::InvalidAudio => "Microphone audio contains invalid samples",
             Self::Empty => "No speech audio was captured",
             Self::DeviceUnavailable => "Choose a microphone in macOS Sound settings",
@@ -31,6 +33,38 @@ impl fmt::Display for CaptureError {
     }
 }
 impl std::error::Error for CaptureError {}
+
+pub const MAX_INPUT_DEVICES: usize = 32;
+pub const MAX_INPUT_NAME_BYTES: usize = 128;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputInfo {
+    pub name: String,
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+/// Exact names avoid silently switching to a different microphone. This pure
+/// selector is also used by native capture; enumeration never starts a stream.
+pub fn select_input_index(names: &[String], requested: &str) -> Result<usize, CaptureError> {
+    if requested.is_empty()
+        || requested.len() > MAX_INPUT_NAME_BYTES
+        || requested.chars().any(char::is_control)
+        || names.len() > MAX_INPUT_DEVICES
+    {
+        return Err(CaptureError::InvalidDeviceSelection);
+    }
+    let mut matches = names
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| name.as_str() == requested);
+    let index = matches
+        .next()
+        .map(|(index, _)| index)
+        .ok_or(CaptureError::DeviceUnavailable)?;
+    if matches.next().is_some() {
+        return Err(CaptureError::InvalidDeviceSelection);
+    }
+    Ok(index)
+}
 
 /// Error state shared by the realtime callback and its bounded consumer.
 #[derive(Default)]
@@ -213,19 +247,52 @@ mod native {
         buffer: Arc<Mutex<Option<CaptureBuffer>>>,
         health: Arc<CaptureHealth>,
         full: Arc<AtomicBool>,
+        info: InputInfo,
     }
     impl CaptureSession {
         pub fn start() -> Result<Self, CaptureError> {
-            Self::start_mode(false)
+            Self::start_mode(false, None)
         }
-        fn start_mode(continuous: bool) -> Result<Self, CaptureError> {
-            let device = cpal::default_host()
-                .default_input_device()
-                .ok_or(CaptureError::DeviceUnavailable)?;
+        fn start_mode(continuous: bool, requested: Option<&str>) -> Result<Self, CaptureError> {
+            let host = cpal::default_host();
+            let device = if let Some(requested) = requested {
+                let mut devices: Vec<_> = host
+                    .input_devices()
+                    .map_err(|_| CaptureError::DeviceUnavailable)?
+                    .take(MAX_INPUT_DEVICES + 1)
+                    .collect();
+                let names = devices
+                    .iter()
+                    .map(|device| {
+                        device
+                            .description()
+                            .map(|d| d.name().to_owned())
+                            .unwrap_or_default()
+                    })
+                    .collect::<Vec<_>>();
+                let index = select_input_index(&names, requested)?;
+                devices.swap_remove(index)
+            } else {
+                host.default_input_device()
+                    .ok_or(CaptureError::DeviceUnavailable)?
+            };
+            let name = device
+                .description()
+                .map_err(|_| CaptureError::DeviceUnavailable)?
+                .name()
+                .to_owned();
+            if name.len() > MAX_INPUT_NAME_BYTES || name.chars().any(char::is_control) {
+                return Err(CaptureError::InvalidDeviceSelection);
+            }
             let supported = device
                 .default_input_config()
                 .map_err(|_| CaptureError::StreamUnavailable)?;
             let config: cpal::StreamConfig = supported.into();
+            let info = InputInfo {
+                name,
+                sample_rate: config.sample_rate,
+                channels: config.channels,
+            };
             let buffer = Arc::new(Mutex::new(Some(if continuous {
                 CaptureBuffer::continuous(config.sample_rate, config.channels)?
             } else {
@@ -280,6 +347,7 @@ mod native {
                 buffer,
                 health,
                 full,
+                info,
             })
         }
         pub fn is_full(&self) -> bool {
@@ -302,11 +370,44 @@ mod native {
                 .finish()
         }
     }
+    pub fn input_devices() -> Result<Vec<InputInfo>, CaptureError> {
+        let devices = cpal::default_host()
+            .input_devices()
+            .map_err(|_| CaptureError::DeviceUnavailable)?;
+        let mut inputs = Vec::new();
+        for device in devices.take(MAX_INPUT_DEVICES) {
+            let Ok(description) = device.description() else {
+                continue;
+            };
+            let name = description.name();
+            if name.is_empty()
+                || name.len() > MAX_INPUT_NAME_BYTES
+                || name.chars().any(char::is_control)
+            {
+                continue;
+            }
+            let Ok(config) = device.default_input_config() else {
+                continue;
+            };
+            inputs.push(InputInfo {
+                name: name.to_owned(),
+                sample_rate: config.sample_rate(),
+                channels: config.channels(),
+            });
+        }
+        Ok(inputs)
+    }
     /// Owns a running input stream and a bounded 15-second mono rolling buffer.
     pub struct ContinuousCapture(CaptureSession);
     impl ContinuousCapture {
         pub fn start() -> Result<Self, CaptureError> {
-            CaptureSession::start_mode(true).map(Self)
+            Self::start_with_device_name(None)
+        }
+        pub fn start_with_device_name(requested: Option<&str>) -> Result<Self, CaptureError> {
+            CaptureSession::start_mode(true, requested).map(Self)
+        }
+        pub fn info(&self) -> InputInfo {
+            self.0.info.clone()
         }
         pub fn poll(&mut self) -> Result<(Vec<f32>, bool), CaptureError> {
             if self.0.failed() {
@@ -324,4 +425,4 @@ mod native {
     }
 }
 #[cfg(target_os = "macos")]
-pub use native::{CaptureSession, ContinuousCapture};
+pub use native::{CaptureSession, ContinuousCapture, input_devices};

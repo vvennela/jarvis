@@ -1,12 +1,13 @@
 //! Continuous local wake recognition; the native audio handle stays on one thread.
-use crate::wake::{DecodeRequest, Phase, WakeDetector};
+use crate::wake::{DecodeRequest, Phase, WakeDetector, wake_tail};
+use jarvis_voice::capture::InputInfo;
 use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -21,13 +22,34 @@ pub enum State {
     Failed,
     Stopped,
 }
+/// In-memory levels and lifecycle counters; never contains audio or transcript text.
+#[derive(Clone, Debug, Default)]
+pub struct Diagnostics {
+    pub input: Option<InputInfo>,
+    pub captured_batches: u64,
+    pub captured_samples: u64,
+    pub last_rms: f32,
+    pub last_peak: f32,
+    pub max_rms: f32,
+    pub decode_count: u64,
+    pub last_decode_ms: u64,
+    pub wake_matches: u64,
+    pub commands: u64,
+    pub discontinuities: u64,
+    pub capture_errors: u64,
+    pub decode_errors: u64,
+}
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub state: State,
     pub message: &'static str,
     pub revision: u64,
+    pub diagnostics: Diagnostics,
 }
 pub trait WakeBackend {
+    fn input_info(&self) -> Option<InputInfo> {
+        None
+    }
     fn start(&mut self) -> Result<(), &'static str>;
     fn poll(&mut self) -> Result<(Vec<f32>, bool), &'static str>;
     fn stop(&mut self);
@@ -91,6 +113,65 @@ impl Control {
         self.stopped.store(true, Ordering::Release);
         self.invalidate();
     }
+    fn input(&self, input: Option<InputInfo>) {
+        let input = input.filter(|info| {
+            !info.name.is_empty()
+                && info.name.len() <= jarvis_voice::capture::MAX_INPUT_NAME_BYTES
+                && !info.name.chars().any(char::is_control)
+        });
+        self.snapshot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .diagnostics
+            .input = input;
+    }
+    fn audio(&self, samples: &[f32], overflow: bool) {
+        let mut snapshot = self.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+        let d = &mut snapshot.diagnostics;
+        if overflow {
+            d.discontinuities = d.discontinuities.saturating_add(1);
+        }
+        if samples.is_empty() || samples.len() > jarvis_voice::capture::MAX_RECORDING_SAMPLES {
+            return;
+        }
+        d.captured_batches = d.captured_batches.saturating_add(1);
+        d.captured_samples = d.captured_samples.saturating_add(samples.len() as u64);
+        let mut sum = 0.0_f64;
+        let mut peak = 0.0_f32;
+        for &sample in samples {
+            if sample.is_finite() {
+                let magnitude = sample.abs().min(1.0);
+                sum += f64::from(magnitude).powi(2);
+                peak = peak.max(magnitude);
+            }
+        }
+        d.last_rms = (sum / samples.len() as f64).sqrt() as f32;
+        d.last_peak = peak;
+        d.max_rms = d.max_rms.max(d.last_rms);
+    }
+    fn capture_error(&self) {
+        let mut s = self.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+        s.diagnostics.capture_errors = s.diagnostics.capture_errors.saturating_add(1);
+    }
+    fn decode_started(&self) {
+        let mut s = self.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+        s.diagnostics.decode_count = s.diagnostics.decode_count.saturating_add(1);
+    }
+    fn decode_finished(&self, elapsed: Duration, failed: bool) {
+        let mut s = self.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+        s.diagnostics.last_decode_ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
+        if failed {
+            s.diagnostics.decode_errors = s.diagnostics.decode_errors.saturating_add(1);
+        }
+    }
+    fn wake_matched(&self) {
+        let mut s = self.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+        s.diagnostics.wake_matches = s.diagnostics.wake_matches.saturating_add(1);
+    }
+    fn command_ready(&self) {
+        let mut s = self.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+        s.diagnostics.commands = s.diagnostics.commands.saturating_add(1);
+    }
     fn publish(&self, state: State, message: &'static str) {
         let mut s = self.snapshot.lock().unwrap_or_else(|p| p.into_inner());
         if s.state != state {
@@ -123,6 +204,7 @@ impl WakeWorker {
             Ok(Box::new(NativeBackend {
                 transcriber,
                 capture: None,
+                device_name: settings.get("JARVIS_MICROPHONE_NAME").cloned(),
             }))
         })
     }
@@ -139,6 +221,7 @@ impl WakeWorker {
                 state: State::Loading,
                 message: "Loading local wake recognition",
                 revision: 0,
+                diagnostics: Diagnostics::default(),
             }),
             command: Mutex::new(None),
         });
@@ -195,6 +278,7 @@ impl WakeWorker {
                     if !running {
                         c.publish(State::Starting, "Starting microphone");
                         if let Err(message) = backend.start() {
+                            c.capture_error();
                             c.enabled.store(false, Ordering::Release);
                             c.publish(State::Failed, message);
                             // Keep permission errors visible until explicit retry.
@@ -204,6 +288,7 @@ impl WakeWorker {
                             continue;
                         }
                         running = true;
+                        c.input(backend.input_info());
                         c.cancelled.store(false, Ordering::Release);
                     }
                     if c.command
@@ -235,11 +320,16 @@ impl WakeWorker {
                                 backend.stop();
                                 running = false;
                                 detector.reset();
+                                c.capture_error();
                                 c.enabled.store(false, Ordering::Release);
                                 c.publish(State::Failed, message);
+                                while !c.enabled() && !c.stopped.load(Ordering::Acquire) {
+                                    thread::sleep(Duration::from_millis(20));
+                                }
                                 continue;
                             }
                         };
+                        c.audio(&samples, overflow);
                         if overflow || samples.len() > jarvis_voice::capture::MAX_RECORDING_SAMPLES
                         {
                             detector.reset();
@@ -256,7 +346,10 @@ impl WakeWorker {
                                 "Understanding your request locally"
                             },
                         );
+                        c.decode_started();
+                        let decode_started = Instant::now();
                         let result = backend.transcribe(&request.samples, c.cancelled.clone());
+                        c.decode_finished(decode_started.elapsed(), result.is_err());
                         if generation != c.generation.load(Ordering::Acquire)
                             || c.stopped.load(Ordering::Acquire)
                         {
@@ -279,17 +372,25 @@ impl WakeWorker {
                                 backend.stop();
                                 running = false;
                                 detector.reset();
+                                c.capture_error();
                                 c.enabled.store(false, Ordering::Release);
                                 c.publish(State::Failed, message);
+                                while !c.enabled() && !c.stopped.load(Ordering::Acquire) {
+                                    thread::sleep(Duration::from_millis(20));
+                                }
                                 continue;
                             }
                         };
+                        c.audio(&queued, overflow);
                         if overflow || queued.len() > jarvis_voice::capture::MAX_RECORDING_SAMPLES {
                             detector.reset();
                             continue;
                         }
                         match result {
                             Ok(text) => {
+                                if request.phase == Phase::Wake && wake_tail(&text).is_some() {
+                                    c.wake_matched();
+                                }
                                 let outcome = detector.accept_transcript_with_audio(&text, &queued);
                                 next_decode = outcome.next;
                                 if let Some(command) = outcome.command {
@@ -301,6 +402,7 @@ impl WakeWorker {
                                         && !c.stopped.load(Ordering::Acquire)
                                     {
                                         *slot = Some((generation, command));
+                                        c.command_ready();
                                         c.publish(State::CommandReady, "Request heard");
                                     }
                                 }
@@ -347,13 +449,32 @@ impl Drop for WakeWorker {
 struct NativeBackend {
     transcriber: jarvis_voice::Transcriber,
     capture: Option<jarvis_voice::capture::ContinuousCapture>,
+    device_name: Option<String>,
 }
 #[cfg(target_os = "macos")]
 impl WakeBackend for NativeBackend {
+    fn input_info(&self) -> Option<InputInfo> {
+        self.capture.as_ref().map(|capture| capture.info())
+    }
     fn start(&mut self) -> Result<(), &'static str> {
         self.capture = Some(
-            jarvis_voice::capture::ContinuousCapture::start()
-                .map_err(|_| "Allow microphone access in macOS Privacy & Security")?,
+            jarvis_voice::capture::ContinuousCapture::start_with_device_name(
+                self.device_name.as_deref(),
+            )
+            .map_err(|error| match error {
+                jarvis_voice::capture::CaptureError::DeviceUnavailable
+                    if self.device_name.is_some() =>
+                {
+                    "Configured microphone unavailable; check JARVIS_MICROPHONE_NAME"
+                }
+                jarvis_voice::capture::CaptureError::InvalidDeviceSelection => {
+                    "Choose one exact available microphone name"
+                }
+                jarvis_voice::capture::CaptureError::InvalidFormat => {
+                    "Microphone format is unsupported"
+                }
+                _ => "Allow microphone access in macOS Privacy & Security",
+            })?,
         );
         Ok(())
     }
