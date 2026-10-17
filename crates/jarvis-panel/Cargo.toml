@@ -6,6 +6,9 @@ edition = "2024"
 [features]
 metal = ["jarvis-voice/metal"]
 
+[dev-dependencies]
+serde_json = "1"
+
 [dependencies]
 jarvis-awareness = { path = "../jarvis-awareness" }
 jarvis-voice = { path = "../jarvis-voice" }

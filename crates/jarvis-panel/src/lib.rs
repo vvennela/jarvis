@@ -14,3 +14,4 @@ pub mod wake;
 pub mod wakeworker;
 
 pub mod osworker;
+pub mod voicehandoff;

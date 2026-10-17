@@ -142,3 +142,62 @@ fn disabled_path_has_no_worker_and_initialization_failure_is_redacted() {
     assert!(!temp.join("os.db").exists());
     worker.join().unwrap();
 }
+
+#[test]
+fn fresh_database_startup_keeps_file_and_os_workers_active_together() {
+    use jarvis::context::Source;
+    use jarvis_panel::worker::{State as FileState, Worker};
+    struct Available;
+    impl Collector for Available {
+        fn capture(&mut self) -> Result<Observation, &'static str> {
+            Ok(Observation {
+                app: Some(AppInfo {
+                    pid: 42,
+                    bundle_id: Some("dev.fixture.Editor".into()),
+                    name: Some("Fixture editor".into()),
+                }),
+                window: Some(jarvis_awareness::WindowInfo {
+                    id: Some("fixture-id".into()),
+                    title: Some("Fixture notes".into()),
+                }),
+                status: Status::Available,
+            })
+        }
+    }
+    for _ in 0..5 {
+        let temp = TempDir::new();
+        let root = temp.join("approved");
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("notes.md");
+        std::fs::write(&file, "shared fresh database fixture").unwrap();
+        let database = temp.join("context.db");
+        // Same startup order as the native panel, with no sleeps between constructors.
+        let mut files = Worker::start(root, database.clone()).unwrap();
+        let mut os =
+            OsWorker::with_collector(database.clone(), || Ok(Box::new(Available))).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while files.control.snapshot().state != FileState::Active
+            || os.control.snapshot().state != State::Active
+        {
+            assert!(
+                Instant::now() < deadline,
+                "fresh DB startup failed: files={:?}; os={:?}",
+                files.control.snapshot(),
+                os.control.snapshot()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let db = ContextStore::open(&database, Limits::default()).unwrap();
+        let file_id = format!("file:{}", std::fs::canonicalize(&file).unwrap().display());
+        assert_eq!(db.get(&file_id).unwrap().unwrap().source, Source::File);
+        assert_eq!(
+            db.get(RESOURCE_ID).unwrap().unwrap().source,
+            Source::Accessibility
+        );
+        files.control.stop();
+        os.control.stop();
+        wait(|| files.is_finished() && os.is_finished());
+        files.join().unwrap();
+        os.join().unwrap();
+    }
+}

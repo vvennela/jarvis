@@ -12,6 +12,15 @@ A native Rust panel that stays beside your work. Ask questions about your approv
 
 ## Run
 
+From the project, launch the bundled app against the included demo workspace:
+
+```sh
+./scripts/launch-jarvis.command
+```
+
+Say **“Jarvis, where was I?”** to hear a contextual answer about Project Beacon. Allow Jarvis microphone access when macOS asks. To use your own files, pass `--root /absolute/path/to/folder`. The launcher builds a signed app in `~/Library/Application Support/Jarvis/Development`, links it at `runtime/Jarvis.app`, and reads the project’s `.env`.
+
+
 Add `CRUSOE_API_KEY` to the project's `.env`. Set `TYPESAFE_API_KEY` to enable Jev routing.
 
 ```sh
@@ -26,6 +35,8 @@ Set `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID` for ElevenLabs speech. The Ma
 
 ```sh
 cargo test -p jarvis-panel
+./scripts/launch-jarvis.command --build-only
+./scripts/launch-jarvis.command --smoke-test
 cargo run -p jarvis-panel -- --root /absolute/path/to/demo-fixtures --db /absolute/path/to/demo.sqlite --smoke-test
 ```
 

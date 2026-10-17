@@ -5,6 +5,7 @@ use jarvis_panel::{
     chat::{self, ConversationWorker},
     osworker::{self, OsWorker},
     speech::{self, SpeechWorker},
+    voicehandoff::VoiceHandoff,
     wakeworker::{self, WakeWorker},
     worker::{Control, State, Worker},
 };
@@ -321,7 +322,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     let mut last_state = None;
     let mut had_error = false;
     let mut chat_revision = None;
-    let mut voice_reply_revision = None;
+    let mut voice_handoff = VoiceHandoff::new();
     loop {
         let snapshot = worker.control.snapshot();
         let os_snapshot = os.control.snapshot();
@@ -381,35 +382,11 @@ pub fn run(options: Options) -> Result<(), &'static str> {
             chat_status.setStringValue(&NSString::from_str(message));
             chat_revision = Some(chat_snapshot.revision);
         }
-        if voice_reply_revision.is_some_and(|revision| revision != chat_snapshot.revision)
-            && chat_snapshot.state == chat::State::Reply
-            && !conversation.control.busy()
+        if let Some(command) =
+            voice_handoff.tick(&voice.control, &conversation.control, &speech.control)
         {
-            let mut end = chat_snapshot.text.len().min(speech::MAX_TEXT_BYTES);
-            while !chat_snapshot.text.is_char_boundary(end) {
-                end -= 1;
-            }
-            let _ = speech.control.speak(chat_snapshot.text[..end].to_owned());
-            voice_reply_revision = None;
-        }
-        if voice_reply_revision.is_some_and(|revision| revision != chat_snapshot.revision)
-            && matches!(
-                chat_snapshot.state,
-                chat::State::Failed | chat::State::Cancelled | chat::State::Unavailable
-            )
-        {
-            voice_reply_revision = None;
-        }
-        // A voice command owns the next response. Ambient decode text never reaches chat.
-        if let Some(command) = voice.control.take_command() {
             input.setStringValue(&NSString::from_str(&command));
-            if conversation.control.submit(command).is_ok() {
-                voice_reply_revision = Some(chat_snapshot.revision);
-            }
         }
-        voice
-            .control
-            .suppress(speech.control.busy() || conversation.control.busy());
         let voice_snapshot = voice.control.snapshot();
         record_button.setTitle(&NSString::from_str(if voice.control.enabled() {
             "Mute microphone"
@@ -436,6 +413,8 @@ pub fn run(options: Options) -> Result<(), &'static str> {
         if snapshot.state != State::Blocked {
             let message = if speech.control.busy() {
                 "Speaking…"
+            } else if speech.control.snapshot().state == speech::State::Failed {
+                "Speech unavailable · your reply is shown above"
             } else if conversation.control.busy() {
                 "Thinking…"
             } else {

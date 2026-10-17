@@ -71,7 +71,10 @@ impl CaptureBuffer {
         Ok(buffer)
     }
     pub fn drain_samples(&mut self) -> (Vec<f32>, bool) {
-        let samples = self.output.drain(..).collect();
+        // Copy on the consumer thread and retain the callback's preallocated
+        // storage. Moving this Vec out would force allocation on later input.
+        let samples = self.output.to_vec();
+        self.output.clear();
         let overrun = std::mem::take(&mut self.overrun);
         (samples, overrun)
     }

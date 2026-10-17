@@ -106,6 +106,9 @@ impl Worker {
             return Err("Choose a real directory, not a symlink");
         }
         let root = std::fs::canonicalize(root).map_err(|_| "Awareness root is unavailable")?;
+        // Initialize the shared schema before sibling collectors can open it.
+        // The connection then belongs exclusively to the file worker thread.
+        let opened_store = ContextStore::open(&database, Limits::default());
         let control = Arc::new(Control {
             desired: AtomicU8::new(RUN),
             snapshot: Mutex::new(Snapshot {
@@ -120,7 +123,7 @@ impl Worker {
         let handle = thread::Builder::new()
             .name("jarvis-file-awareness".into())
             .spawn(move || {
-                let mut store = match ContextStore::open(&database, Limits::default()) {
+                let mut store = match opened_store {
                     Ok(store) => store,
                     Err(_) => {
                         worker_control.state(State::Blocked, "Cannot open context database");
