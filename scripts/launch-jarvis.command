@@ -56,7 +56,7 @@ cp -X "$repo_dir/crates/jarvis-panel/Info.plist" "$staging_app/Contents/Info.pli
 chmod 755 "$staging_app/Contents/MacOS/jarvis-panel"
 /usr/bin/plutil -lint "$staging_app/Contents/Info.plist" >/dev/null
 /usr/bin/xattr -cr "$staging_app"
-/usr/bin/codesign --force --sign - --identifier com.jarvis.panel "$staging_app"
+/bin/bash "$repo_dir/scripts/sign-development-app.sh" "$staging_app"
 /usr/bin/codesign --verify --strict "$staging_app"
 
 bundle_path="$app_dir/Jarvis.app"
