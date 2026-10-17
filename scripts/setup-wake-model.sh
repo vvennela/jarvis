@@ -34,3 +34,19 @@ else
   mv "$temporary/$name" "$destination"
 fi
 printf 'JARVIS_KWS_MODEL_DIR=%s\n' "$destination"
+vad_path="$repo_dir/models/silero_vad.onnx"
+vad_hash=9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6
+if [[ ! -e "$vad_path" ]]; then
+  vad_temporary="$(mktemp "$repo_dir/models/vad-download.XXXXXX")"
+  trap 'rm -f -- "$vad_temporary"; if [[ -n "${temporary:-}" ]]; then rm -rf -- "$temporary"; fi' EXIT
+  curl --fail --location --retry 2 --connect-timeout 10 --max-time 180 \
+    'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx' \
+    -o "$vad_temporary"
+  actual="$(shasum -a 256 "$vad_temporary" | cut -d ' ' -f 1)"
+  [[ "$actual" == "$vad_hash" ]] || { printf '%s\n' 'Speech activity model checksum mismatch.' >&2; exit 1; }
+  mv -- "$vad_temporary" "$vad_path"
+fi
+[[ -f "$vad_path" && ! -L "$vad_path" ]] || exit 1
+actual="$(shasum -a 256 "$vad_path" | cut -d ' ' -f 1)"
+[[ "$actual" == "$vad_hash" ]] || { printf '%s\n' 'Speech activity model checksum mismatch.' >&2; exit 1; }
+printf 'JARVIS_VAD_MODEL_PATH=%s\n' "$vad_path"

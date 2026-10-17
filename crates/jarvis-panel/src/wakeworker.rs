@@ -78,6 +78,9 @@ pub struct KeywordStatus {
     pub lookback_samples: Option<usize>,
 }
 pub trait WakeBackend {
+    fn speech_activity(&mut self, _samples: &[f32]) -> Result<Option<Vec<bool>>, &'static str> {
+        Ok(None)
+    }
     fn capture_diagnostics(&self) -> CaptureDiagnostics {
         CaptureDiagnostics::default()
     }
@@ -253,9 +256,16 @@ impl WakeWorker {
                     .ok_or("Set JARVIS_KWS_MODEL_DIR to the local keyword model")?,
             );
             let keyword = jarvis_voice::kws::LocalKeywordSpotter::load(&keyword_path)?;
+            let vad_path = std::path::PathBuf::from(
+                settings
+                    .get("JARVIS_VAD_MODEL_PATH")
+                    .ok_or("Set JARVIS_VAD_MODEL_PATH to the local speech detector")?,
+            );
+            let vad = jarvis_voice::vad::LocalVoiceActivity::load(&vad_path)?;
             Ok(Box::new(NativeBackend {
                 transcriber,
                 keyword,
+                vad,
                 capture: None,
                 device_name: settings.get("JARVIS_MICROPHONE_NAME").cloned(),
             }))
@@ -394,6 +404,20 @@ impl WakeWorker {
                             keyword_audio.clear();
                             continue;
                         }
+                        let activity = match backend.speech_activity(&samples) {
+                            Ok(activity) => activity,
+                            Err(message) => {
+                                backend.stop();
+                                running = false;
+                                detector.reset();
+                                c.enabled.store(false, Ordering::Release);
+                                c.publish(State::Failed, message);
+                                while !c.enabled() && !c.stopped.load(Ordering::Acquire) {
+                                    thread::sleep(Duration::from_millis(20));
+                                }
+                                continue;
+                            }
+                        };
                         if detector.phase() == Phase::Wake {
                             match backend.keyword_spot(&samples) {
                                 Ok(Some(status)) => {
@@ -415,7 +439,9 @@ impl WakeWorker {
                                     }
                                     None
                                 }
-                                Ok(None) => detector.ingest(&samples),
+                                Ok(None) => {
+                                    detector.ingest_with_activity(&samples, activity.as_deref())
+                                }
                                 Err(message) => {
                                     backend.stop();
                                     running = false;
@@ -430,7 +456,7 @@ impl WakeWorker {
                                 }
                             }
                         } else {
-                            detector.ingest(&samples)
+                            detector.ingest_with_activity(&samples, activity.as_deref())
                         }
                     };
                     if let Some(request) = request {
@@ -485,12 +511,30 @@ impl WakeWorker {
                             keyword_audio.clear();
                             continue;
                         }
+                        let activity = match backend.speech_activity(&queued) {
+                            Ok(activity) => activity,
+                            Err(message) => {
+                                backend.stop();
+                                running = false;
+                                detector.reset();
+                                c.enabled.store(false, Ordering::Release);
+                                c.publish(State::Failed, message);
+                                while !c.enabled() && !c.stopped.load(Ordering::Acquire) {
+                                    thread::sleep(Duration::from_millis(20));
+                                }
+                                continue;
+                            }
+                        };
                         match result {
                             Ok(text) => {
                                 if request.phase == Phase::Wake && wake_tail(&text).is_some() {
                                     c.wake_matched();
                                 }
-                                let outcome = detector.accept_transcript_with_audio(&text, &queued);
+                                let outcome = detector.accept_transcript_with_audio_and_activity(
+                                    &text,
+                                    &queued,
+                                    activity.as_deref(),
+                                );
                                 next_decode = outcome.next;
                                 if detector.phase() == Phase::Wake
                                     && request.phase == Phase::Command
@@ -514,7 +558,8 @@ impl WakeWorker {
                             }
                             Err(_) => {
                                 detector.reset();
-                                next_decode = detector.ingest(&queued);
+                                next_decode =
+                                    detector.ingest_with_activity(&queued, activity.as_deref());
                             }
                         }
                     }
@@ -554,11 +599,15 @@ impl Drop for WakeWorker {
 struct NativeBackend {
     transcriber: jarvis_voice::Transcriber,
     keyword: jarvis_voice::kws::LocalKeywordSpotter,
+    vad: jarvis_voice::vad::LocalVoiceActivity,
     capture: Option<jarvis_voice::capture::ContinuousCapture>,
     device_name: Option<String>,
 }
 #[cfg(target_os = "macos")]
 impl WakeBackend for NativeBackend {
+    fn speech_activity(&mut self, samples: &[f32]) -> Result<Option<Vec<bool>>, &'static str> {
+        self.vad.classify(samples).map(Some)
+    }
     fn capture_diagnostics(&self) -> CaptureDiagnostics {
         self.capture
             .as_ref()
@@ -573,6 +622,7 @@ impl WakeBackend for NativeBackend {
     }
     fn reset_keyword(&mut self) {
         self.keyword.reset();
+        self.vad.reset();
     }
     fn input_info(&self) -> Option<InputInfo> {
         self.capture.as_ref().map(|capture| capture.info())

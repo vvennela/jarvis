@@ -6,6 +6,8 @@
 pub mod capture;
 #[cfg(target_os = "macos")]
 pub mod kws;
+#[cfg(target_os = "macos")]
+pub mod vad;
 
 use std::{
     fmt,

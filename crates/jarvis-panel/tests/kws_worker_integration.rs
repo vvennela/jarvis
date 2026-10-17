@@ -154,10 +154,14 @@ fn opt_in_real_keyword_and_whisper_worker_preserves_same_breath_request() {
     struct LocalBackend {
         kws: jarvis_voice::kws::LocalKeywordSpotter,
         stt: jarvis_voice::Transcriber,
+        vad: jarvis_voice::vad::LocalVoiceActivity,
         audio: VecDeque<Vec<f32>>,
         handoff: jarvis_voice::capture::AudioHandoff,
     }
     impl WakeBackend for LocalBackend {
+        fn speech_activity(&mut self, samples: &[f32]) -> Result<Option<Vec<bool>>, &'static str> {
+            self.vad.classify(samples).map(Some)
+        }
         fn start(&mut self) -> Result<(), &'static str> {
             Ok(())
         }
@@ -174,6 +178,7 @@ fn opt_in_real_keyword_and_whisper_worker_preserves_same_breath_request() {
         }
         fn reset_keyword(&mut self) {
             self.kws.reset();
+            self.vad.reset();
         }
         fn transcribe(
             &mut self,
@@ -191,14 +196,22 @@ fn opt_in_real_keyword_and_whisper_worker_preserves_same_breath_request() {
     let stt = std::path::PathBuf::from(
         std::env::var_os("JARVIS_TEST_WHISPER_MODEL").expect("set JARVIS_TEST_WHISPER_MODEL"),
     );
+    let vad = std::path::PathBuf::from(
+        std::env::var_os("JARVIS_TEST_VAD_MODEL").expect("set JARVIS_TEST_VAD_MODEL"),
+    );
     let wav = std::path::PathBuf::from(
         std::env::var_os("JARVIS_TEST_WAKE_WAV").expect("set JARVIS_TEST_WAKE_WAV"),
     );
     let mut samples = jarvis_voice::load_wav(&wav).unwrap();
-    samples.extend(vec![0.0; 20000]);
+    let mut noise_seed = 0x5413_u32;
+    samples.extend((0..32000).map(|_| {
+        noise_seed = noise_seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        ((noise_seed >> 8) as f32 / 16777215.0 * 2.0 - 1.0) * 0.06
+    }));
     let mut worker = WakeWorker::with_backend(move || {
         Ok(Box::new(LocalBackend {
             kws: jarvis_voice::kws::LocalKeywordSpotter::load(&kws)?,
+            vad: jarvis_voice::vad::LocalVoiceActivity::load(&vad)?,
             stt: jarvis_voice::Transcriber::load(&stt).map_err(|_| "local Whisper model failed")?,
             audio: samples.chunks(320).map(Vec::from).collect(),
             handoff: jarvis_voice::capture::AudioHandoff::new(),

@@ -917,3 +917,101 @@ fn opt_in_diagnostic_line_contains_only_fixed_state_and_numeric_health() {
         "jarvis_voice state=WakeListening samples=32000 rms=0.02500 peak=0.50000 max_rms=0.25000 decodes=7 decode_ms=350 wakes=2 commands=1 discontinuities=3 capture_errors=4 decode_errors=5 xruns=6 route_changes=7 queue_overruns=8"
     );
 }
+
+#[test]
+fn acoustic_nonspeech_ends_command_even_when_background_rms_exceeds_legacy_gate() {
+    let mut detector = WakeDetector::new();
+    for _ in 0..100 {
+        assert!(
+            detector
+                .ingest_with_activity(&[0.03; 320], Some(&[false]))
+                .is_none(),
+            "classified nonspeech caused ambient decode"
+        );
+    }
+    detector.arm_keyword(&[0.1; 1600]);
+    for _ in 0..54 {
+        assert!(
+            detector
+                .ingest_with_activity(&[0.03; 320], Some(&[false]))
+                .is_none()
+        );
+    }
+    let request = detector
+        .ingest_with_activity(&[0.03; 320], Some(&[false]))
+        .expect("classified ambient noise must reach1.1second endpoint");
+    assert!(request.endpoint);
+    assert!(request.samples.len() < 15 * 16000);
+    assert_eq!(
+        detector.accept_transcript("Jarvis where was I?").as_deref(),
+        Some("where was I?")
+    );
+}
+
+#[test]
+fn acoustic_speech_flags_preserve_quiet_trailing_words_and_resume_provisional_endpoint() {
+    let mut detector = WakeDetector::new();
+    detector.arm_keyword(&[0.1; 1600]);
+    assert!(
+        detector
+            .ingest_with_activity(&[0.001; 16000], Some(&[true; 50]))
+            .is_none()
+    );
+    let endpoint = detector
+        .ingest_with_activity(&[0.03; 17600], Some(&[false; 55]))
+        .unwrap();
+    assert!(endpoint.endpoint);
+    let resumed = detector.accept_transcript_with_audio_and_activity(
+        "Jarvis find notes",
+        &[0.001; 16000],
+        Some(&[true; 50]),
+    );
+    assert!(resumed.command.is_none());
+    assert!(resumed.next.is_none());
+    let request = detector
+        .ingest_with_activity(&[0.03; 17600], Some(&[false; 55]))
+        .unwrap();
+    assert!(request.endpoint);
+    let complete = detector.accept_transcript_with_audio_and_activity(
+        "Jarvis find notes and summarize them",
+        &[0.03; 320],
+        Some(&[false]),
+    );
+    assert_eq!(
+        complete.command.as_deref(),
+        Some("find notes and summarize them")
+    );
+    assert!(complete.next.is_none());
+}
+
+#[test]
+fn invalid_activity_alignment_clears_wake_authorization_instead_of_guessing_labels() {
+    for flags in [Vec::new(), vec![false, false]] {
+        let mut detector = WakeDetector::new();
+        detector.arm_keyword(&[0.1; 1600]);
+        assert!(
+            detector
+                .ingest_with_activity(&[0.03; 320], Some(&flags))
+                .is_none()
+        );
+        assert_eq!(detector.phase(), Phase::Wake);
+        assert!(
+            detector
+                .accept_transcript("should not become a command")
+                .is_none()
+        );
+    }
+    let mut detector = WakeDetector::new();
+    detector.arm_keyword(&[0.1; 1600]);
+    detector
+        .ingest_with_activity(&[0.03; 17600], Some(&[false; 55]))
+        .unwrap();
+    let invalid = detector.accept_transcript_with_audio_and_activity(
+        "Jarvis must not escape",
+        &[0.1; 321],
+        Some(&[true]),
+    );
+    assert!(invalid.command.is_none());
+    assert!(invalid.next.is_none());
+    assert_eq!(detector.phase(), Phase::Wake);
+}

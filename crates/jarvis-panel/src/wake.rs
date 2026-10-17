@@ -76,18 +76,32 @@ impl WakeDetector {
         self.waiting = 0;
     }
     pub fn ingest(&mut self, samples: &[f32]) -> Option<DecodeRequest> {
+        self.ingest_with_activity(samples, None)
+    }
+    /// Native speech detection supplies one decision per 20 ms frame. The
+    /// optional fallback keeps deterministic energy-only adapters available.
+    pub fn ingest_with_activity(
+        &mut self,
+        samples: &[f32],
+        activity: Option<&[bool]>,
+    ) -> Option<DecodeRequest> {
         if self.pending.is_some() {
             return None;
         }
-        if samples.iter().any(|s| !s.is_finite()) {
+        if samples.iter().any(|s| !s.is_finite())
+            || activity.is_some_and(|flags| flags.len() != samples.len().div_ceil(320))
+        {
             self.reset();
             return None;
         }
-        for frame in samples.chunks(320) {
+        for (index, frame) in samples.chunks(320).enumerate() {
             // Once speech starts, quieter trailing words still keep the turn
             // open. An explicit wake also arms quiet followup speech; idle
             // background sound must still cross the higher start gate.
-            let voiced = voiced_frame(frame, self.active || self.phase == Phase::Command);
+            let voiced = activity.map_or_else(
+                || voiced_frame(frame, self.active || self.phase == Phase::Command),
+                |flags| flags[index],
+            );
             self.waiting += frame.len();
             if voiced {
                 if !self.active {
@@ -151,6 +165,14 @@ impl WakeDetector {
     /// final if that backlog contains no resumed speech. Retain both sides of
     /// a hesitation and decode them together instead of submitting the prefix.
     pub fn accept_transcript_with_audio(&mut self, text: &str, queued: &[f32]) -> DecodeOutcome {
+        self.accept_transcript_with_audio_and_activity(text, queued, None)
+    }
+    pub fn accept_transcript_with_audio_and_activity(
+        &mut self,
+        text: &str,
+        queued: &[f32],
+        activity: Option<&[bool]>,
+    ) -> DecodeOutcome {
         let empty = || DecodeOutcome {
             command: None,
             next: None,
@@ -162,11 +184,15 @@ impl WakeDetector {
             || text.contains('\0')
             || queued.len() > COMMAND_CAP
             || queued.iter().any(|sample| !sample.is_finite())
+            || activity.is_some_and(|flags| flags.len() != queued.len().div_ceil(320))
         {
             self.reset();
             return empty();
         }
-        let resumed = queued.chunks(320).any(|frame| voiced_frame(frame, true));
+        let resumed = activity.map_or_else(
+            || queued.chunks(320).any(|frame| voiced_frame(frame, true)),
+            |flags| flags.iter().any(|&voiced| voiced),
+        );
         if endpoint && resumed && (phase == Phase::Wake || self.audio.len() < COMMAND_CAP) {
             self.pending = None;
             if phase == Phase::Command || wake_tail(text).is_some() {
@@ -174,12 +200,12 @@ impl WakeDetector {
             }
             return DecodeOutcome {
                 command: None,
-                next: self.ingest(queued),
+                next: self.ingest_with_activity(queued, activity),
             };
         }
         let command = self.accept_transcript(text);
         let next = if command.is_none() {
-            self.ingest(queued)
+            self.ingest_with_activity(queued, activity)
         } else {
             None
         };

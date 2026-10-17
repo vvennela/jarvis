@@ -82,7 +82,7 @@ The current host writes directly to SQLite; the planned separate service/socket 
 
 ## Native voice panel
 
-Install the local streaming wake model with `bash scripts/setup-wake-model.sh` and add the printed `JARVIS_KWS_MODEL_DIR` value to `.env`. The pinned sherpa-onnx English keyword model listens for Jarvis continuously; “Hey Jarvis” includes the same keyword. Whisper transcribes commands after acoustic wake detection. The model archive is checksum-verified and stays in the ignored `models/` directory. No additional provider key is needed.
+Install the local streaming wake model with `bash scripts/setup-wake-model.sh` and add the printed `JARVIS_KWS_MODEL_DIR` and `JARVIS_VAD_MODEL_PATH` values to `.env`. The pinned sherpa-onnx English keyword model listens for Jarvis continuously; “Hey Jarvis” includes the same keyword. Local Silero speech detection separates speech from background noise and closes a turn after a 1.1-second speech-free grace period. Whisper transcribes commands after acoustic wake detection. The keyword archive and speech activity model are checksum-verified and stays in the ignored `models/` directory. No additional provider key is needed.
 
 ```sh
 ./scripts/launch-jarvis.command --root "$PWD/examples/demo-workspace" --db "$PWD/runtime/context.db"
