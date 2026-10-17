@@ -1,0 +1,43 @@
+# Proposed configuration contract; not yet consumed by the foundation prototype.
+[providers.jev]
+endpoint = "https://api.typesafe.ai/v1/systemone"
+model = "jev-latest"
+api_key_env = "TYPESAFE_API_KEY"
+timeout_ms = 2000
+
+[providers.crusoe]
+base_url = "https://api.inference.crusoecloud.com/v1"
+api_key_env = "CRUSOE_API_KEY"
+conversation_model_env = "JARVIS_CONVERSATION_MODEL"
+worker_model_env = "JARVIS_WORKER_MODEL"
+
+[awareness]
+# Expand ~ in the future loader. Prototype tests use temporary directories only.
+roots = ["~/Documents", "~/Downloads"]
+debounce_ms = 750
+max_text_file_bytes = 1048576
+exclude_private_windows = true
+raw_retention_hours = 24
+derived_retention_days = 7
+screenshots = false
+idle_model_calls = false
+
+[policy]
+sensitive_action_mode = "prepare_for_review"
+gate_deadline_ms = 2000
+safe_retry_limit = 2
+external_write_conflict = "pause"
+
+[audio]
+input_mode = "push_to_talk"
+transcription = "local_whisper"
+model_path_env = "JARVIS_WHISPER_MODEL_PATH"
+speech_output = "macos_native"
+
+[preferences]
+email = "browser_gmail"
+music = "desktop_spotify"
+
+[ui]
+position = "top_right"
+steal_focus = false
