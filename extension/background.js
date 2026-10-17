@@ -1,0 +1,225 @@
+import {
+  PROTOCOL_VERSION, HOST_NAME, MAX_CONTENT_BYTES, ObservationQueue,
+  cappedText, httpUrl, allowedTab, validContentSender, tabEvent,
+} from "./protocol.js";
+
+const queue = new ObservationQueue();
+const knownTabs = new Map();
+const documents = new Map();
+let port = null;
+let sessionId = null;
+let clientNonce = null;
+let sequence = 0;
+let paused = true; // Fail closed until persisted settings load.
+let generation = 0;
+let retryMs = 1000;
+let retryTimer = null;
+let handshakeTimer = null;
+let injecting = new Set();
+const ready = chrome.storage.local.get("paused").then(state => { paused = state.paused === true; });
+
+async function status(value) {
+  await chrome.storage.local.set({ bridgeStatus: value });
+  await chrome.action.setBadgeText({ text: paused ? "OFF" : value === "connected" ? "ON" : "!" });
+  await chrome.action.setBadgeBackgroundColor({ color: paused ? "#777777" : value === "connected" ? "#257d50" : "#a16400" });
+  await chrome.action.setTitle({ title: `Jarvis: ${paused ? "awareness paused" : value} — click to configure` });
+}
+
+async function permitted(tab) {
+  if (paused || !allowedTab(tab)) return false;
+  return chrome.permissions.contains({ origins: [`${httpUrl(tab.url).origin}/*`] });
+}
+
+function flush() {
+  if (!port || !sessionId || paused) return;
+  let event;
+  while ((event = queue.take())) {
+    try {
+      port.postMessage({ type: "observation", protocol_version: PROTOCOL_VERSION,
+        session_id: sessionId, sequence: ++sequence, event });
+    } catch {
+      queue.put(event);
+      disconnect();
+      return;
+    }
+  }
+}
+
+function emit(event) { queue.put(event); flush(); }
+
+function disconnect() {
+  clearTimeout(handshakeTimer);
+  handshakeTimer = null;
+  const old = port;
+  port = null;
+  sessionId = null;
+  clientNonce = null;
+  if (old) { try { old.disconnect(); } catch { /* already disconnected */ } }
+  status("disconnected");
+  if (retryTimer === null) {
+    retryTimer = setTimeout(() => { retryTimer = null; connect(); }, retryMs);
+    retryMs = Math.min(retryMs * 2, 30000);
+    // Durable fallback when Chrome suspends the service worker before setTimeout.
+    chrome.alarms.create("jarvis-reconnect", { delayInMinutes: 0.5 });
+  }
+}
+
+async function connect() {
+  await ready;
+  if (port) return;
+  try {
+    const current = chrome.runtime.connectNative(HOST_NAME);
+    port = current;
+    clientNonce = crypto.randomUUID();
+    sequence = 0;
+    status("connecting");
+    current.onMessage.addListener(message => {
+      if (port !== current) return;
+      if (sessionId !== null) return; // No inbound execution capability.
+      if (message?.type !== "hello_ack" || message.protocol_version !== PROTOCOL_VERSION
+          || message.client_nonce !== clientNonce || typeof message.session_id !== "string"
+          || message.session_id.length < 16 || message.session_id.length > 128) {
+        disconnect();
+        return;
+      }
+      clearTimeout(handshakeTimer);
+      handshakeTimer = null;
+      sessionId = message.session_id;
+      retryMs = 1000;
+      chrome.alarms.clear("jarvis-reconnect");
+      status("connected");
+      flush();
+      reconcile(); // Re-observe open permitted tabs after connection gaps.
+    });
+    current.onDisconnect.addListener(() => {
+      // Reading lastError prevents noisy logs; never log page payloads.
+      void chrome.runtime.lastError;
+      if (port === current) disconnect();
+    });
+    current.postMessage({ type: "hello", protocol_version: PROTOCOL_VERSION, client_nonce: clientNonce });
+    handshakeTimer = setTimeout(() => { if (port === current && !sessionId) disconnect(); }, 5000);
+  } catch { disconnect(); }
+}
+
+async function inject(tabId) {
+  if (injecting.has(tabId)) return;
+  const epoch = generation;
+  injecting.add(tabId);
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (!await permitted(tab) || epoch !== generation) return;
+    await chrome.scripting.executeScript({ target: { tabId, allFrames: false }, files: ["content.js"] });
+    const current = await chrome.tabs.get(tabId);
+    const resume = epoch === generation && await permitted(current);
+    await chrome.tabs.sendMessage(tabId, { type: resume ? "jarvis.resume" : "jarvis.pause" }, { frameId: 0 });
+  } catch { /* Closed, suspended, restricted, or permission changed; remain unknown. */ }
+  finally { injecting.delete(tabId); }
+}
+
+async function observe(tabId, kind, extra = {}) {
+  await ready;
+  const epoch = generation;
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (!await permitted(tab) || epoch !== generation) {
+      queue.delete(tabId);
+      knownTabs.delete(tabId);
+      return;
+    }
+    knownTabs.set(tabId, tabEvent(kind, tab, extra));
+    // Metadata cache bounded independently of the offline outbound queue.
+    if (knownTabs.size > 256) knownTabs.delete(knownTabs.keys().next().value);
+    emit(tabEvent(kind, tab, extra));
+    await inject(tabId);
+  } catch { /* Tab vanished during observation. */ }
+}
+
+async function reconcile() {
+  await ready;
+  if (paused) return;
+  const tabs = await chrome.tabs.query({});
+  // Sequential injection bounds pressure on Chrome when many tabs are open.
+  for (const tab of tabs) await observe(tab.id, "tab.updated");
+}
+
+chrome.runtime.onMessage.addListener((message, sender, reply) => {
+  if (message?.type !== "jarvis.content") return;
+  (async () => {
+    await ready;
+    const epoch = generation;
+    if (typeof message.content !== "string" || message.content.length > MAX_CONTENT_BYTES
+        || sender.tab?.id === undefined) return false;
+    const tab = await chrome.tabs.get(sender.tab.id);
+    if (!validContentSender(sender, tab, chrome.runtime.id) || !await permitted(tab)
+        || epoch !== generation) return false;
+    const latestDocument = documents.get(tab.id);
+    if (latestDocument && latestDocument !== sender.documentId) return false;
+    const content = cappedText(message.content, MAX_CONTENT_BYTES);
+    emit(tabEvent("document.changed", tab, {
+      content,
+      document_id: typeof sender.documentId === "string" ? cappedText(sender.documentId, 128) : undefined,
+      source: "browser_content_script",
+      trust: "untrusted_page",
+    }));
+    return true;
+  })().then(accepted => reply({ accepted }), () => reply({ accepted: false }));
+  return true;
+});
+
+chrome.tabs.onActivated.addListener(info => observe(info.tabId, "tab.activated"));
+chrome.tabs.onUpdated.addListener((tabId, change) => {
+  if (change.url || change.title || change.status === "complete") observe(tabId, "tab.updated");
+});
+chrome.tabs.onRemoved.addListener(tabId => {
+  const last = knownTabs.get(tabId);
+  knownTabs.delete(tabId);
+  documents.delete(tabId);
+  queue.delete(tabId);
+  if (last && !paused) emit({ ...last, kind: "tab.closed", observed_at_ms: Date.now() });
+});
+chrome.webNavigation.onCommitted.addListener(details => {
+  if (details.frameId !== 0) return;
+  if (details.documentId) documents.set(details.tabId, details.documentId);
+  else documents.delete(details.tabId);
+  if (documents.size > 256) documents.delete(documents.keys().next().value);
+  queue.delete(details.tabId);
+  observe(details.tabId, "tab.updated", {
+    document_id: details.documentId,
+    navigation_id: `${details.tabId}:${details.timeStamp}`,
+  });
+});
+chrome.webNavigation.onHistoryStateUpdated.addListener(details => {
+  if (details.frameId === 0) observe(details.tabId, "tab.updated", { document_id: details.documentId });
+});
+
+async function resetCollection() {
+  generation++;
+  queue.clear();
+  knownTabs.clear();
+  documents.clear();
+  const tabs = await chrome.tabs.query({});
+  for (const tab of tabs) {
+    // Stop previously injected scripts too. Removal alone does not unload them.
+    try { await chrome.tabs.sendMessage(tab.id, { type: "jarvis.pause" }, { frameId: 0 }); }
+    catch { /* Not injected. */ }
+  }
+  await status(sessionId ? "connected" : "disconnected");
+  await reconcile();
+}
+chrome.permissions.onAdded.addListener(resetCollection);
+chrome.permissions.onRemoved.addListener(resetCollection);
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes.paused) {
+    paused = changes.paused.newValue === true;
+    resetCollection();
+  }
+});
+chrome.alarms.onAlarm.addListener(alarm => {
+  if (alarm.name === "jarvis-reconnect") {
+    clearTimeout(retryTimer);
+    retryTimer = null;
+    connect();
+  }
+});
+chrome.action.onClicked.addListener(() => chrome.runtime.openOptionsPage());
+connect();

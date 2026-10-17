@@ -1,23 +1,68 @@
 # Jarvis
 
-A persistent Mac companion that keeps track of your work, accepts natural follow-ups, and carries tasks forward in the background. Rust owns the local service, state, policy, and native UI. Structured browser and filesystem events provide awareness without screenshots or continuous model calls.
+A Rust-first Mac companion that maintains work context before you ask for help. Structured file and browser observations feed a local evidence store; Jev routes requests while context is retrieved in parallel, and Nemotron answers from selected evidence.
 
-**Status:** foundation prototype, not a working desktop assistant yet. Policy/runner primitives and a headless review-flow fixture are implemented. Native UI, microphone, live collectors, SQLite persistence, browser control, and hosted providers are planned integrations. See the [today build plan](docs/build-plan.md) for scope and go/no-go gates; do not interpret the architecture diagram as shipped functionality.
+**Current prototype:** real bounded file indexing/watching, SQLite + FTS5 search and version history, Jev and Crusoe clients, a read-only Chrome extension with a Rust Native Messaging host, and a scripted ready-for-review fixture. The top-right native panel is being integrated separately. Provider credentials have not been exercised live, and the Chrome extension is not yet installed in the user's browser.
 
-## Product boundary
+There is no voice capture, native OS focus/selection capture, autonomous task worker, or general browser-action execution yet. `ask` is a single read-only conversation turn; the clarification/cancellation runner primitives are not yet a connected conversational job loop. The [architecture](docs/architecture.md) describes the target system, not a list of shipped features.
 
-- Maintain current evidence and an attributed activity history locally.
-- Resolve “this” against focus captured when the utterance begins.
-- Route simple supported actions through Jev while retrieving evidence in parallel.
-- Keep the conversational model available while workers run.
-- Ask when information is missing; retry only when safe; pause conflicting writes.
-- Prepare sensitive actions for human review. Jarvis never sends messages, purchases, submits bookings, or executes deletions in this version.
+## Try the working local layer
 
-“Ready for review” is a verified intermediate result, not a claim that a purchase or send completed. Every worker proposal passes through the same policy gate.
+Run from the repository at `/Users/vishnuv/Documents/projects/jarvis`:
 
-## Development
+```sh
+cargo build
+mkdir -p runtime/demo-notes
+printf 'Implement the authentication settings page. Pending: choose session duration.\n' > runtime/demo-notes/spec.md
+cargo run -- index --db runtime/context.db --root runtime/demo-notes
+cargo run -- search --db runtime/context.db authentication
+cargo run -- recent --db runtime/context.db
+cargo run -- watch --db runtime/context.db --root runtime/demo-notes --seconds 60
+```
 
-Install Rust stable with Cargo, then run:
+Edit the note while `watch` runs, then search again. File events trigger bounded reconciliation; metadata fingerprints avoid rereading unchanged files and content hashes avoid duplicate versions. Only `.txt` and `.md` files under the explicitly supplied root are collected. Hidden paths, symlinks, oversized files and invalid UTF-8 are excluded. Truncated scans are reported rather than presented as complete coverage. No model or API key is needed for this flow.
+
+## Add Jev and Nemotron
+
+Copy `.env.example` to the ignored `.env` and fill in exactly these keys:
+
+| Variable | Purpose | Obtain from |
+|---|---|---|
+| `TYPESAFE_API_KEY` | Jev routing | [TypeSafe console](https://console.typesafe.ai/) |
+| `CRUSOE_API_KEY` | Nemotron conversation | [Crusoe](https://crusoe.ai/) inference account |
+
+The selected model defaults to **Nemotron 3.5 Lightning**, `nvidia/nemotron-3.5-lightning-30b-a3b`, listed in the [Crusoe catalog](https://docs.crusoecloud.com/serverless-inference/index.html). `JARVIS_CONVERSATION_MODEL` can override it. `JARVIS_WORKER_MODEL` is reserved for the planned worker integration.
+
+```sh
+cargo run -- doctor
+cargo run -- route 'Help me resume the authentication work'
+cargo run -- ask --db runtime/context.db --question 'Where was I?'
+```
+
+`doctor` checks configuration presence, not provider authentication. `route` performs Jev inference. `ask` overlaps Jev routing and database retrieval, then calls Crusoe with bounded excerpts. If routing fails, it falls back to a conversational route; it never executes a tool. These clients currently return complete responses rather than streaming tokens. Selected evidence is sent to the configured cloud provider; collection itself remains local.
+
+`.env` loads automatically from the current working directory. Environment variables override it; an explicitly empty environment variable clears the corresponding file value. Do not commit or print secrets. See [setup](docs/setup.md) for exact configuration and browser installation requirements.
+
+## Sensitive actions stop at review
+
+```sh
+cargo run -- demo --output runtime/review-demo
+cargo run -- policy send
+cargo run -- policy pay
+cargo run -- policy delete
+```
+
+The demo creates a real local `message-review.txt` in a fresh output directory. It is explicitly marked **SCRIPTED FIXTURE**, resolves no real recipient address, creates no Gmail draft, and sends nothing. The runner verifies the exact file content, identity, and job revision before claiming `READY_FOR_REVIEW`. The policy commands intentionally exit with code 2.
+
+The product boundary is preparation for human review. There are no final send, pay, booking submission or deletion tools. “Ready for review” does not mean a sensitive operation completed. Runner primitives also support clarification, revision invalidation, cancellation and bounded recovery decisions; durable job persistence and live task execution remain future work.
+
+## Browser awareness
+
+The [Chrome extension](extension/README.md) collects approved HTTP(S) tab metadata and rendered text, with no screenshots or action API. The Rust host validates the handshake, session, sequence and payload bounds, then atomically stores separate page and tab records. Closing a tab removes its live metadata while retaining observed page evidence.
+
+Transport and simulated-browser tests pass, but loading the extension and registering its Native Messaging host are separate installation steps. The macOS `install-browser-host --extension-id <id> --db <absolute-path>` command creates a new registration; it has not been run against the user's browser. The badge indicates connection state, not microphone activity or a guarantee of durable delivery. See [setup](docs/setup.md#browser-native-host-packaging).
+
+## Development and validation
 
 ```sh
 cargo test --all-targets
@@ -25,46 +70,12 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
 
-Headless foundation tests require no credentials. Run the implemented scripted fixture with a fresh output directory:
+The default workspace member is the headless core. Native panel validation is tracked in its own crate while integration proceeds. Tests prioritize real temporary SQLite databases, filesystem events, subprocess CLI runs, and local HTTP/native-message peers. Those tests do not prove live provider authentication or installed Chrome behavior.
 
-```sh
-cargo run -- demo --output /tmp/jarvis-review-demo
-```
+Use **git only** for repository operations. Pull before starting, delegate adversarial integration/e2e tests for meaningful changes, then commit and push verified increments to `https://github.com/vvennela/jarvis.git`.
 
-It creates a real local `message-review.txt`, explicitly marked as a scripted fixture and ready for review. It does not call a model, create a Gmail draft, resolve a real recipient address, or send a message. Choose a different fresh output directory for another run.
-
-The policy probe demonstrates rejection of final sensitive actions:
-
-```sh
-cargo run -- policy send
-cargo run -- policy pay
-cargo run -- policy delete
-```
-
-Each intentionally exits with code 2. These rejection probes are not live adapters. The core also models clarification, revision invalidation, cancellation, bounded recovery decisions, and speculative transcript revision keys. Review verification checks content and Unix file identity; there is no durable SQLite job store yet.
-
-Use **git only** for repository operations. The upstream is `https://github.com/vvennela/jarvis.git`. Pull before starting, commit each meaningful tested increment, and push each meaningful commit. Delegate adversarial integration/e2e tests to a separate agent while implementation proceeds in parallel.
-
-## Required credentials for the live demo
-
-Only two API keys are required by the planned hosted-model stack:
-
-| Variable | Purpose | Obtain from |
-|---|---|---|
-| `TYPESAFE_API_KEY` | Jev intent/routing decisions | [TypeSafe console](https://console.typesafe.ai/) |
-| `CRUSOE_API_KEY` | Conversational and worker inference | [Crusoe](https://crusoe.ai/) inference account |
-
-Also configure `JARVIS_CONVERSATION_MODEL` and `JARVIS_WORKER_MODEL` with exact IDs available to that Crusoe account. These are configuration values, not keys. Select a supported Nemotron model from the authenticated model catalog; do not guess model identifiers.
-
-Local `whisper-rs` transcription needs a compatible model file and microphone permission, **not an API key**. Native macOS speech synthesis also needs no key. Accessibility permission and browser-extension installation are required for their respective adapters. Existing website sessions remain in the browser. No OpenAI, Anthropic, ElevenLabs, Gmail, or Spotify API key is mandatory for this plan.
-
-Copy `.env.example` to a local ignored `.env` when live adapters are implemented; never commit secrets or paste them into traces. Automatic `.env` loading is not yet promised. The example TOML documents planned defaults, not an implemented configuration parser.
-
-## Design and validation
-
+- [Today: build order and demo scope](docs/build-plan.md)
 - [Architecture and invariants](docs/architecture.md)
-- [Today: implementation order and scope](docs/build-plan.md)
-- [Adversarial integration and e2e acceptance matrix](docs/testing.md)
-- [Provider and local setup](docs/setup.md)
-
-The differentiation to demonstrate is evidence gathered **before** a request and corrections propagated **during** a job. No claim of being faster or more capable than another product is valid without measurement.
+- [Integration/e2e acceptance matrix](docs/testing.md)
+- [Setup and credentials](docs/setup.md)
+- [Implemented memory and resource limits](docs/memory.md)

@@ -334,3 +334,86 @@ fn speculative_context_cannot_cross_request_or_transcript_revision() {
         assert!(!speculation_is_current(&original, &current));
     }
 }
+
+#[test]
+fn oversized_review_and_answers_fail_without_writes_or_state_changes() {
+    use jarvis::{MAX_ANSWER_BYTES, MAX_REVIEW_BYTES};
+    let dir = TempDir::new();
+    let mut job = draft_job();
+    let target = dir.join("oversized.txt");
+    assert!(matches!(
+        job.prepare_review(1, &target, &vec![b'x'; MAX_REVIEW_BYTES + 1]),
+        Err(JobError::LimitExceeded)
+    ));
+    assert!(!target.exists());
+    assert_eq!(job.state(), JobState::Running);
+    assert_eq!(job.revision(), 1);
+    let question = job.ask("q", "Who?").unwrap();
+    for oversized in [
+        "x".repeat(MAX_ANSWER_BYTES + 1),
+        "🦀".repeat(MAX_ANSWER_BYTES / 4 + 1),
+    ] {
+        assert!(matches!(
+            job.answer(&question, &oversized),
+            Err(JobError::LimitExceeded)
+        ));
+        assert_eq!(job.state(), JobState::AwaitingClarification);
+        assert_eq!(job.revision(), 1);
+        assert!(job.answers().is_empty());
+    }
+    job.answer(&question, &"x".repeat(MAX_ANSWER_BYTES))
+        .unwrap();
+    job.prepare_review(2, &target, &vec![b'x'; MAX_REVIEW_BYTES])
+        .unwrap();
+    assert_eq!(
+        fs::metadata(job.review_path().unwrap()).unwrap().len(),
+        MAX_REVIEW_BYTES as u64
+    );
+}
+
+#[test]
+fn invalid_identifiers_and_questions_cannot_enter_pending_state() {
+    use jarvis::MAX_ANSWER_BYTES;
+    for id in [String::new(), "x".repeat(129), "🦀".repeat(33)] {
+        assert!(matches!(
+            Job::new(&id, "request", Operation::DraftMessage),
+            Err(JobError::InvalidInput)
+        ));
+        assert!(matches!(
+            Job::new("job", &id, Operation::DraftMessage),
+            Err(JobError::InvalidInput)
+        ));
+    }
+    let mut job = draft_job();
+    for (id, text) in [
+        ("".into(), "Question".into()),
+        ("x".repeat(129), "Question".into()),
+        ("q".into(), " \n\t".into()),
+        ("q".into(), "x".repeat(MAX_ANSWER_BYTES + 1)),
+    ] {
+        assert!(matches!(job.ask(id, text), Err(JobError::InvalidInput)));
+        assert_eq!(job.state(), JobState::Running);
+        assert_eq!(job.revision(), 1);
+    }
+    assert!(job.ask("q", "Valid question").is_ok());
+}
+
+#[test]
+fn answer_history_has_a_hard_bound_and_rejection_preserves_revision() {
+    use jarvis::MAX_ANSWERS;
+    let mut job = draft_job();
+    for index in 0..MAX_ANSWERS {
+        let question = job.ask(format!("q{index}"), "Question?").unwrap();
+        job.answer(&question, "Answer").unwrap();
+    }
+    let revision = job.revision();
+    let pending = job.ask("over-limit", "One more?").unwrap();
+    assert!(matches!(
+        job.answer(&pending, "extra"),
+        Err(JobError::LimitExceeded)
+    ));
+    assert_eq!(job.answers().len(), MAX_ANSWERS);
+    assert_eq!(job.revision(), revision);
+    assert_eq!(job.state(), JobState::AwaitingClarification);
+    job.cancel().unwrap();
+}

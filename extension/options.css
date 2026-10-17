@@ -1,0 +1,10 @@
+:root { color-scheme: light dark; font: 16px system-ui, sans-serif; }
+body { margin: 0; padding: 32px; }
+main { max-width: 680px; margin: auto; }
+p { line-height: 1.5; }
+input[type=url] { padding: 10px; width: min(65%, 400px); margin: 8px 8px 0 0; }
+button { padding: 10px; cursor: pointer; }
+li { margin: 10px 0; overflow-wrap: anywhere; }
+li button { margin-left: 12px; }
+#status { font-weight: 600; }
+#message { min-height: 1.5em; }

@@ -91,7 +91,9 @@ fn help_is_explicit_about_current_fixture_limitations() {
     let dir = TempDir::new();
     let output = cli(&dir, &["--help"]);
     assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("no live collectors or models yet"));
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("no desktop UI or autonomous workers yet")
+    );
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 

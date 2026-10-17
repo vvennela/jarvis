@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Jarvis Awareness Bridge",
+  "version": "0.1.0",
+  "description": "Explicitly permitted browser context for your local Jarvis service.",
+  "permissions": ["tabs", "webNavigation", "nativeMessaging", "scripting", "storage", "alarms"],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
+  "background": {"service_worker": "background.js", "type": "module"},
+  "action": {"default_title": "Jarvis: disconnected — click to configure"},
+  "options_ui": {"page": "options.html", "open_in_tab": true},
+  "incognito": "not_allowed",
+  "content_security_policy": {"extension_pages": "script-src 'self'; object-src 'none'"}
+}

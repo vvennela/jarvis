@@ -1,6 +1,17 @@
 //! Deterministic Jarvis policy and job lifecycle foundation.
 //! Adapters must derive evidence and operation classifications from trusted code,
 //! never from model-supplied safety labels. Desktop adapters are not built yet.
+#![forbid(unsafe_code)]
+
+pub mod awareness;
+pub mod bridge;
+pub mod context;
+pub mod install;
+pub mod providers;
+
+pub const MAX_REVIEW_BYTES: usize = 64 * 1024;
+pub const MAX_ANSWER_BYTES: usize = 8192;
+pub const MAX_ANSWERS: usize = 32;
 use std::{
     fs, io,
     io::{Read, Write},
@@ -76,6 +87,8 @@ pub struct Question {
 }
 #[derive(Debug)]
 pub enum JobError {
+    InvalidInput,
+    LimitExceeded,
     FinalCommitForbidden,
     InvalidState,
     WrongQuestion,
@@ -157,9 +170,14 @@ impl Job {
         if operation.is_commit() {
             return Err(JobError::FinalCommitForbidden);
         }
+        let id = id.into();
+        let request_id = request_id.into();
+        if id.is_empty() || id.len() > 128 || request_id.is_empty() || request_id.len() > 128 {
+            return Err(JobError::InvalidInput);
+        }
         Ok(Self {
-            id: id.into(),
-            request_id: request_id.into(),
+            id,
+            request_id,
             operation,
             revision: 1,
             state: JobState::Running,
@@ -188,11 +206,20 @@ impl Job {
         if self.state != JobState::Running {
             return Err(JobError::InvalidState);
         }
+        let id = id.into();
+        let text = text.into();
+        if id.is_empty()
+            || id.len() > 128
+            || text.trim().is_empty()
+            || text.len() > MAX_ANSWER_BYTES
+        {
+            return Err(JobError::InvalidInput);
+        }
         let question = Question {
-            id: id.into(),
+            id,
             job_id: self.id.clone(),
             revision: self.revision,
-            text: text.into(),
+            text,
         };
         self.question = Some(question.clone());
         self.state = JobState::AwaitingClarification;
@@ -210,6 +237,9 @@ impl Job {
         }
         if text.trim().is_empty() {
             return Err(JobError::EmptyAnswer);
+        }
+        if text.len() > MAX_ANSWER_BYTES || self.answers.len() >= MAX_ANSWERS {
+            return Err(JobError::LimitExceeded);
         }
         self.answers.push(text.to_owned());
         self.revision += 1;
@@ -264,6 +294,9 @@ impl Job {
         }
         if !self.operation.needs_review() {
             return Err(JobError::NotReviewable);
+        }
+        if content.len() > MAX_REVIEW_BYTES {
+            return Err(JobError::LimitExceeded);
         }
         let mut file = fs::OpenOptions::new()
             .write(true)
