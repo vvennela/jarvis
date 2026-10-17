@@ -12,3 +12,4 @@
 - The runner owns durable job state and revisions. Conflicting user writes pause jobs; ambiguous external outcomes require reconciliation rather than blind retries.
 - Keep secrets, raw private content, actual browsing histories, and model weights out of git and diagnostic output.
 - Documentation must distinguish implemented behavior, fixtures, and planned integrations. Provider model IDs must come from verified catalogs; do not invent them.
+- Keep READMEs short and positive: describe working capabilities, setup, and usage. Put limitations, failure analysis, and detailed validation in engineering docs and progress reports. Keep all capability claims factual.
