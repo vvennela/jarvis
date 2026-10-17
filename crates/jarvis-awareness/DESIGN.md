@@ -1,0 +1,13 @@
+# Foreground collector boundary
+
+The current implementation polls NSWorkspace for the foreground app, then uses AX for its focused window, optional identifier and title. Each AX element receives a 100 ms messaging timeout; the three sequential copy queries may take approximately 300 ms when an app is slow. The collector does not overlap polls. Native timeout behavior is not a hard real-time guarantee. Event-driven NSWorkspace/AX observers are a future latency/power improvement.
+
+There is no permission prompt. Missing Accessibility access produces app-only metadata and `permission_missing`. No focused window, unsupported attributes and application switches are represented without inventing content. Optional AX identifiers are not guaranteed present or globally unique. The stable database resource `os:foreground` identifies the current observation, not a permanent window. A final foreground PID check rejects a cross-application race; a same-application window change can still race, so this is not a command-time focus freeze or an execution precondition.
+
+Known browser families and password managers are excluded before querying window attributes, and the publish boundary reapplies that rule. Unknown app identity also excludes window content. Browser privacy mode cannot be inferred from AX; browser page collection belongs to the extension's origin/private-window rules. The exclusion list covers recognized families, not every possible custom browser shell. A configurable per-app grant list is a subsequent improvement.
+
+Only app identity and focused-window title/identifier are read. No screenshots, text fields, selection, window tree, keyboard events or document bodies are collected. Title data is untrusted app-provided context, never instructions. The observation declares unknown actor attribution; no focus change proves user intent.
+
+Publishing serializes bounded metadata, uses Source::Accessibility, and records the native timestamp outside the content digest. Unchanged polls refresh freshness without manufacturing resource versions. There is only one active resource, and the existing bounded metadata event history supplies revisions. Rejected input does not mutate the database. CLI diagnostics contain counts and permission state, not titles, paths or app names.
+
+The pure publish function accepts fixture observations; integration tests require no native permissions or actual user activity. A successful fixture does not verify macOS Accessibility permission or real application attribute support. Running the normal collector is an explicit collection action; help and invalid-argument tests must not invoke native capture.

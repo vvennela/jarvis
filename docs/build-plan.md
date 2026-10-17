@@ -7,7 +7,8 @@ Build a companion that stays present while you work: continuous file and browser
 | Component | Current implementation | Next verification or extension |
 |---|---|---|
 | File awareness | Explicit-root text/Markdown collection, bounded notifications and reconciliation, hashes, SQLite history and FTS search | Exercise changes while the panel stays open |
-| Browser awareness | Read-only Chrome extension and authenticated Native Messaging session, approved-origin page/tab evidence | Install and verify a real approved page; OS-wide application/focus capture is separate work |
+| Browser awareness | Read-only Chrome extension and authenticated Native Messaging session, approved-origin page/tab evidence | Install and verify a real approved page |
+| OS awareness | Native foreground app and permitted focused-window metadata; independent panel collector; shared SQLite evidence | Live Accessibility-title rehearsal and utterance-frozen anchors; app identity captured on this Mac |
 | Conversation | Jev routing and context retrieval overlap; bounded conversational history; Nemotron replies and clarification follow-ups | Rehearse a real multi-turn session using the configured provider |
 | Native panel | Top-right panel, awareness pause/resume, typed conversation, cancellation and speech controls | Rehearse the complete microphone-to-reply path on the user's Mac |
 | Local voice | Resident Whisper model, bounded microphone capture and transcription; continuous wake worker and automatic spoken-reply integration are the current increment | Validate wake recognition, endpointing, mute/resume and echo suppression together |

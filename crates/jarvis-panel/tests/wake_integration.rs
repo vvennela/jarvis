@@ -365,3 +365,47 @@ fn opt_in_real_whisper_audio_reaches_wake_command_without_microphone() {
     );
     assert_eq!(detector.phase(), Phase::Wake);
 }
+
+#[test]
+fn oversized_command_chunk_preserves_beginning_instead_of_rolling_it_away() {
+    let mut detector = WakeDetector::new();
+    utterance(&mut detector);
+    detector.accept_transcript("Jarvis");
+    let mut samples = vec![0.1; 16000];
+    samples.extend(vec![0.2; 16000 * 15]);
+    let request = detector.ingest(&samples).unwrap();
+    assert!(request.endpoint);
+    assert_eq!(request.samples.len(), 16000 * 15);
+    assert_eq!(&request.samples[..16000], &[0.1; 16000]);
+}
+
+#[test]
+fn microphone_start_failure_stays_visible_without_automatic_retry() {
+    struct FailedBackend(Arc<AtomicUsize>);
+    impl WakeBackend for FailedBackend {
+        fn start(&mut self) -> Result<(), &'static str> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Err("synthetic microphone permission denied")
+        }
+        fn poll(&mut self) -> Result<(Vec<f32>, bool), &'static str> {
+            panic!("failed microphone must not be polled")
+        }
+        fn stop(&mut self) {}
+        fn transcribe(&mut self, _: &[f32], _: Arc<AtomicBool>) -> Result<String, &'static str> {
+            panic!("failed microphone must not be transcribed")
+        }
+    }
+    let starts = Arc::new(AtomicUsize::new(0));
+    let calls = starts.clone();
+    let mut worker = WakeWorker::with_backend(move || Ok(Box::new(FailedBackend(calls)))).unwrap();
+    wait_until(|| worker.control.snapshot().state == State::Muted);
+    worker.control.set_enabled(true);
+    wait_until(|| worker.control.snapshot().state == State::Failed);
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(worker.control.snapshot().state, State::Failed);
+    assert!(!worker.control.enabled());
+    assert_eq!(starts.load(Ordering::Relaxed), 1);
+    worker.control.set_enabled(true);
+    wait_until(|| starts.load(Ordering::Relaxed) == 2);
+    stop(&mut worker);
+}

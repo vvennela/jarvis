@@ -47,12 +47,14 @@ impl Default for Limits {
 pub enum Source {
     File,
     Browser,
+    Accessibility,
 }
 impl Source {
     fn label(self) -> &'static str {
         match self {
             Self::File => "file",
             Self::Browser => "browser",
+            Self::Accessibility => "accessibility",
         }
     }
 }
@@ -381,6 +383,7 @@ fn resource_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Resource> {
     let source = match source.as_str() {
         "file" => Source::File,
         "browser" => Source::Browser,
+        "accessibility" => Source::Accessibility,
         _ => return Err(rusqlite::Error::InvalidQuery),
     };
     Ok(Resource {

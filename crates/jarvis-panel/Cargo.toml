@@ -7,6 +7,7 @@ edition = "2024"
 metal = ["jarvis-voice/metal"]
 
 [dependencies]
+jarvis-awareness = { path = "../jarvis-awareness" }
 jarvis-voice = { path = "../jarvis-voice" }
 jarvis = { path = "../.." }
 tokio = { version = "1.53.3", features = ["rt", "sync", "time", "macros", "net", "process", "io-util"] }

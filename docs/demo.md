@@ -58,7 +58,7 @@ For a failure demonstration, change the indexed source while generation runs. If
 
 The honest story is awareness → spoken question → contextual reply → clarification → verified local draft. It demonstrates maintained context and a responsive native companion. “Implement that,” autonomous coding/test repair, Gmail draft placement, browser bookings, durable background jobs and voice-triggered tool execution are subsequent milestones. Do not stage those as live behavior with scripted fixture output.
 
-The read-only browser bridge can add approved page context after extension installation and host registration. Verify ingestion into the same database before including browser evidence in a demo. File awareness alone is sufficient for the sequence above; it does not establish OS-wide window or focus awareness.
+The read-only browser bridge can add approved page context after extension installation and host registration. Verify ingestion into the same database before including browser evidence in a demo. The native panel also collects foreground app identity and permitted focused-window metadata into that database. Its status distinguishes missing Accessibility permission from collection errors. It currently stores the current foreground observation; full window inventory and utterance-frozen anchors remain separate work.
 
 ## Deterministic local speech check
 

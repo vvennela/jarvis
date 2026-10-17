@@ -2,7 +2,8 @@
 
 A native Rust panel that stays beside your work. Ask questions about your approved files, continue the conversation, and pause or resume continuous file awareness.
 
-- Top-right AppKit panel with live awareness status.
+- Top-right AppKit panel with live file, app, and window-awareness status.
+- Foreground app identity and focused-window titles through macOS Accessibility.
 - Typed questions, contextual replies, and follow-up conversation.
 - **Jarvis → question → spoken reply** with local Whisper wake recognition.
 - Independent conversation cancellation and file-awareness controls.
@@ -17,7 +18,7 @@ Add `CRUSOE_API_KEY` to the project's `.env`. Set `TYPESAFE_API_KEY` to enable J
 cargo run -p jarvis-panel -- --root /absolute/path/to/approved-folder --db /absolute/path/to/context.sqlite
 ```
 
-Set `JARVIS_WHISPER_MODEL_PATH` to your local GGML model. Launch Jarvis, allow microphone access, then say **“Jarvis, where was I?”**. Jarvis recognizes the wake phrase locally, hears your question, and speaks the reply. **Mute microphone** controls wake listening; **Pause** controls file awareness. You can also type a question and click **Ask**. Selected context goes to your configured model provider.
+Set `JARVIS_WHISPER_MODEL_PATH` to your local GGML model. Launch Jarvis, allow microphone access, then say **“Jarvis, where was I?”**. Jarvis recognizes the wake phrase locally, hears your question, and speaks the reply. **Mute microphone** controls wake listening; **Pause** controls file and app awareness. Enable Accessibility for Jarvis in macOS Settings to include eligible focused-window titles. You can also type a question and click **Ask**. Selected context goes to your configured model provider.
 
 Set `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID` for ElevenLabs speech. The Mac’s native voice is available with no speech API key. **Stop speaking** ends playback; **Quit** stops all workers.
 

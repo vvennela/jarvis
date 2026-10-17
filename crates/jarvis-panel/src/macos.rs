@@ -3,6 +3,7 @@
 use super::Options;
 use jarvis_panel::{
     chat::{self, ConversationWorker},
+    osworker::{self, OsWorker},
     speech::{self, SpeechWorker},
     wakeworker::{self, WakeWorker},
     worker::{Control, State, Worker},
@@ -29,6 +30,7 @@ use std::{
 
 struct ActionIvars {
     control: Arc<Control>,
+    os: Arc<osworker::Control>,
     chat: Arc<chat::Control>,
     speech: Arc<speech::Control>,
     voice: Arc<wakeworker::Control>,
@@ -46,11 +48,12 @@ define_class!(
     impl PanelActions {
         #[unsafe(method(togglePause:))]
         fn toggle_pause(&self, _sender: Option<&AnyObject>) {
-            if self.ivars().control.pause_requested() { self.ivars().control.resume(); }
-            else { self.ivars().control.pause(); }
+            if self.ivars().control.pause_requested() { self.ivars().control.resume(); self.ivars().os.resume(); }
+            else { self.ivars().control.pause(); self.ivars().os.pause(); }
         }
         #[unsafe(method(quitPanel:))]
         fn quit_panel(&self, _sender: Option<&AnyObject>) {
+            self.ivars().os.stop();
             self.ivars().voice.shutdown();
             self.ivars().speech.shutdown();
             self.ivars().chat.stop();
@@ -90,6 +93,7 @@ impl PanelActions {
     fn new(
         mtm: MainThreadMarker,
         control: Arc<Control>,
+        os: Arc<osworker::Control>,
         chat: Arc<chat::Control>,
         speech: Arc<speech::Control>,
         voice: Arc<wakeworker::Control>,
@@ -97,6 +101,7 @@ impl PanelActions {
     ) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(ActionIvars {
             control,
+            os,
             chat,
             speech,
             voice,
@@ -121,6 +126,11 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     let mtm = MainThreadMarker::new().ok_or("Panel must run on the main thread")?;
     // Validate explicit scope before showing the panel. No user folders inferred.
     let mut worker = Worker::start(options.root, options.database.clone())?;
+    let mut os = if options.smoke_test {
+        OsWorker::disabled()
+    } else {
+        OsWorker::start(options.database.clone())?
+    };
     let mut conversation = ConversationWorker::start(options.database)?;
     let mut speech = SpeechWorker::start()?;
     let mut voice = WakeWorker::from_env()?;
@@ -175,23 +185,29 @@ pub fn run(options: Options) -> Result<(), &'static str> {
         12.0,
     );
     detail.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    let os_status = label(
+        mtm,
+        "Starting app awareness…",
+        rect(18.0, 368.0, 444.0, 20.0),
+        12.0,
+    );
     let chat_status = label(
         mtm,
         "Preparing conversation…",
-        rect(18.0, 362.0, 444.0, 20.0),
+        rect(18.0, 344.0, 444.0, 20.0),
         12.0,
     );
     let scroll =
-        NSScrollView::initWithFrame(NSScrollView::alloc(mtm), rect(18.0, 124.0, 444.0, 230.0));
+        NSScrollView::initWithFrame(NSScrollView::alloc(mtm), rect(18.0, 124.0, 444.0, 212.0));
     scroll.setHasVerticalScroller(true);
-    let response = NSTextView::initWithFrame(NSTextView::alloc(mtm), rect(0.0, 0.0, 424.0, 230.0));
+    let response = NSTextView::initWithFrame(NSTextView::alloc(mtm), rect(0.0, 0.0, 424.0, 212.0));
     response.setEditable(false);
     response.setSelectable(true);
     response.setRichText(false);
     response.setFont(Some(&NSFont::systemFontOfSize(14.0)));
     response.setVerticallyResizable(true);
     response.setHorizontallyResizable(false);
-    response.setMinSize(NSSize::new(424.0, 230.0));
+    response.setMinSize(NSSize::new(424.0, 212.0));
     response.setMaxSize(NSSize::new(424.0, 1_000_000.0));
     scroll.setDocumentView(Some(&response));
     let input = NSTextField::initWithFrame(NSTextField::alloc(mtm), rect(18.0, 82.0, 350.0, 30.0));
@@ -200,6 +216,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     let actions = PanelActions::new(
         mtm,
         Arc::clone(&worker.control),
+        Arc::clone(&os.control),
         Arc::clone(&conversation.control),
         Arc::clone(&speech.control),
         Arc::clone(&voice.control),
@@ -285,6 +302,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     view.addSubview(&detail);
     view.addSubview(&pause_button);
     view.addSubview(&quit_button);
+    view.addSubview(&os_status);
     view.addSubview(&chat_status);
     view.addSubview(&scroll);
     view.addSubview(&input);
@@ -306,6 +324,8 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     let mut voice_reply_revision = None;
     loop {
         let snapshot = worker.control.snapshot();
+        let os_snapshot = os.control.snapshot();
+        os_status.setStringValue(&NSString::from_str(os_snapshot.message));
         if snapshot.state == State::Active {
             active_observed = true;
             if smoke_phase >= 2 {
@@ -337,10 +357,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
         } else {
             "Pause"
         }));
-        pause_button.setEnabled(!matches!(
-            snapshot.state,
-            State::Blocked | State::Stopping | State::Stopped
-        ));
+        pause_button.setEnabled(!matches!(snapshot.state, State::Stopping | State::Stopped));
         if snapshot.state == State::Blocked {
             detail.setStringValue(&NSString::from_str(snapshot.message));
         }
@@ -447,6 +464,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
                 smoke_phase = 3;
             }
             if started.elapsed() > Duration::from_secs(8) || had_error {
+                os.control.stop();
                 voice.control.shutdown();
                 speech.control.shutdown();
                 conversation.control.stop();
@@ -455,6 +473,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
         }
         if worker.control.stop_requested()
             && worker.is_finished()
+            && os.is_finished()
             && conversation.is_finished()
             && speech.is_finished()
             && voice.is_finished()
@@ -482,6 +501,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     }
     panel.orderOut(None);
     worker.join()?;
+    os.join()?;
     conversation.join()?;
     speech.join()?;
     voice.join()?;

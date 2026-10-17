@@ -1,6 +1,6 @@
 # Architecture
 
-This diagram describes the full intended architecture. Implemented pieces include bounded file/Chrome observation, SQLite search, parallel Jev routing and retrieval, Nemotron conversation, local draft verification, and a native panel with local voice recognition and speech output. OS focus anchors, persistent job recovery, browser action adapters, speculative retrieval integration, and general coding workers remain planned. Purple nodes require inference. Speech recognition and synthesis have separate compute costs.
+This diagram describes the full intended architecture. Implemented pieces include bounded file/Chrome observation, foreground macOS app/window metadata, SQLite search, parallel Jev routing and retrieval, Nemotron conversation, local draft verification, and a native panel with local voice recognition and speech output. Utterance-frozen focus anchors, persistent job recovery, browser action adapters, speculative retrieval integration, and general coding workers remain planned. Purple nodes require inference. Speech recognition and synthesis have separate compute costs.
 
 ```mermaid
 flowchart TD

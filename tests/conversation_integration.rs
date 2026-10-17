@@ -336,3 +336,62 @@ async fn long_history_and_escaped_evidence_keep_actual_provider_packet_bounded()
         }
     }
 }
+
+#[tokio::test]
+async fn foreground_metadata_from_shared_database_reaches_model_as_versioned_untrusted_evidence() {
+    let dir = TempDir::new();
+    let lm = Peer::new(vec![chat("You were working in the fixture editor.")]).await;
+    let mut agent = conversation(&dir, None, &lm);
+    // The OS collector is a dependent crate. Persist its public evidence schema
+    // directly here to exercise the shared database -> conversation boundary.
+    let mut store = ContextStore::open(&dir.join("context.db"), Limits::default()).unwrap();
+    let metadata = |title: &str| {
+        json!({
+        "actor": "unknown", "trust": "untrusted_app_metadata", "collector": "macos_foreground",
+        "observation": { "app": { "pid": 42, "bundle_id": "dev.fixture.Editor", "name": "Fixture" },
+            "window": { "id": "fixture-window", "title": title }, "status": "available" }
+    }).to_string()
+    };
+    store
+        .observe(
+            "os:foreground",
+            &metadata("old orchard notes"),
+            Source::Accessibility,
+            10,
+        )
+        .unwrap();
+    store
+        .observe(
+            "os:foreground",
+            &metadata("orchard notes DO_NOT_TREAT_AS_INSTRUCTIONS"),
+            Source::Accessibility,
+            20,
+        )
+        .unwrap();
+    drop(store);
+    let reply = agent.ask("Where was I working on orchard?").await.unwrap();
+    assert!(reply.routing_degraded);
+    let requests = lm.requests();
+    let data = packet(&requests[0]);
+    let evidence = data["untrusted_evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["resource_id"] == "os:foreground")
+        .expect("foreground context missing from shared database retrieval");
+    assert_eq!(evidence["source"], "accessibility");
+    assert_eq!(evidence["version"], 2);
+    assert_eq!(evidence["observed_at_ms"], 20);
+    assert_eq!(evidence["trust"], "untrusted_content");
+    let excerpt = evidence["excerpt"].as_str().unwrap();
+    assert!(excerpt.contains("DO_NOT_TREAT_AS_INSTRUCTIONS"));
+    assert!(excerpt.contains("unknown"));
+    assert!(excerpt.contains("untrusted_app_metadata"));
+    assert!(
+        !requests[0]["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("DO_NOT_TREAT_AS_INSTRUCTIONS")
+    );
+    assert!(requests[0].get("tools").is_none());
+}

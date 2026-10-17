@@ -24,6 +24,11 @@ Rust gives explicit ownership and bounded lifetimes, but it does not automatical
 | Browser metadata | URL 8,192 bytes; title 2,048; IDs 128 | Validate before any evidence write |
 | Extension buffers | 32 queued tabs; 256 cached tab/document entries | Latest-state coalescing and bounded eviction |
 | Local `.env` | 16 KiB | Reject oversized or invalid UTF-8 configuration |
+| Conversation history | 8 turns, 24 KiB; 4 KiB per stored reply | Drop oldest turns to fit bounded provider packet |
+| Local Whisper | Model file at most 256 MiB; 4 CPU threads | Load model once per voice worker; reuse native state |
+| Wake audio | 4-second rolling wake window; 15-second command cap at mono 16 kHz | Energy gate avoids decoding silence; endpoint or cap finishes command |
+| Voice handoff | One pending command | Backpressure; mute and suppression invalidate pending/late results |
+| Speech request | 8 KiB text; ElevenLabs audio at most 8 MiB | Bounded response validation before playback |
 
 SQLite uses WAL mode, a requested 2 MiB page cache, a 32,768-page main-database cap, automatic checkpoint threshold of 128 pages, and a 4 MiB retained-journal target. With 4 KiB database pages the main-file cap is approximately 128 MiB. Page size, indexes, other connections, transient WAL growth, TLS buffers and allocator overhead affect actual memory/storage use; the journal target is not a hard instantaneous WAL cap.
 
@@ -45,7 +50,9 @@ File change notifications identify dirty candidates; scans reconcile them. Metad
 
 Deletion tombstones remove content from current-resource lookup and the live FTS index. They are not a secure erasure guarantee for SQLite pages, WAL files or filesystem backups. Time-based retention, a complete history-delete UI, OS focus history, and semantic activity summaries are still planned. Proposed 24-hour raw/7-day derived retention in architecture documents is not implemented merely because it appears in example configuration.
 
-This version keeps observation local until `ask` deliberately sends selected evidence to Crusoe and the request/routing state to Jev. Hidden paths, private browser windows, excluded DOM inputs and non-approved origins are collection boundaries, not a claim that every remaining visible string is non-sensitive.
+Observation stays local until a typed or wake-initiated question sends selected evidence to Crusoe and request/routing state to Jev. Local draft generation also transmits its selected evidence. Optional ElevenLabs synthesis sends reply text to that provider. Hidden paths, private browser windows, excluded DOM inputs and non-approved origins are collection boundaries, not a claim that every remaining visible string is non-sensitive.
+
+The wake worker inspects ambient decoded text transiently and publishes only commands following the wake word. It retains no ambient transcript log. Muting and owned speech suppression clear pending commands and discard late decode results. Native Whisper decoding cannot currently be interrupted mid-call; its bounded call finishes before the worker releases its model, while the UI remains independent.
 
 ## What to measure next
 

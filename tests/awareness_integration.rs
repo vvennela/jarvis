@@ -3,10 +3,12 @@
 mod support;
 
 use jarvis::{
-    awareness::{AwarenessError, MAX_DEPTH, MAX_FILES, index_root, watch_root},
+    awareness::{
+        AwarenessError, MAX_DEPTH, MAX_FILES, index_root, watch_root, watch_root_with_ready,
+    },
     context::{Actor, ContextStore, Limits, MAX_CONTENT_BYTES, Source},
 };
-use std::{fs, os::unix::fs::symlink, path::Path, thread, time::Duration};
+use std::{fs, os::unix::fs::symlink, path::Path, sync::mpsc, thread, time::Duration};
 use support::TempDir;
 
 fn setup(directory: &TempDir) -> (std::path::PathBuf, ContextStore) {
@@ -191,11 +193,15 @@ fn bounded_platform_watch_observes_a_real_edit_and_keeps_version_stable_afterwar
     let path = root.join("live.md");
     fs::write(&path, "before editing").unwrap();
     let id = file_id(&path);
+    let (ready_send, ready_recv) = mpsc::channel();
     let writer = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(250));
+        ready_recv.recv_timeout(Duration::from_secs(10)).unwrap();
         fs::write(path, "after live edit").unwrap();
     });
-    let report = watch_root(&mut context, &root, Duration::from_secs(2)).unwrap();
+    let report = watch_root_with_ready(&mut context, &root, Duration::from_secs(2), || {
+        ready_send.send(()).unwrap();
+    })
+    .unwrap();
     writer.join().unwrap();
     assert_eq!(
         context.get(&id).unwrap().unwrap().content,
@@ -214,8 +220,9 @@ fn changed_root_identity_stops_collection_without_following_replacement() {
     fs::write(root.join("initial.md"), "initial allowed evidence").unwrap();
     let replacement_root = root.clone();
     let old_root = directory.join("moved-root");
+    let (ready_send, ready_recv) = mpsc::channel();
     let writer = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(250));
+        ready_recv.recv_timeout(Duration::from_secs(10)).unwrap();
         fs::rename(&replacement_root, old_root).unwrap();
         fs::create_dir(&replacement_root).unwrap();
         fs::write(
@@ -224,7 +231,9 @@ fn changed_root_identity_stops_collection_without_following_replacement() {
         )
         .unwrap();
     });
-    let result = watch_root(&mut context, &root, Duration::from_secs(2));
+    let result = watch_root_with_ready(&mut context, &root, Duration::from_secs(2), || {
+        ready_send.send(()).unwrap();
+    });
     writer.join().unwrap();
     assert!(matches!(result, Err(AwarenessError::RootChanged)));
     assert!(context.search("replacement", 10).unwrap().is_empty());
