@@ -41,7 +41,7 @@ fi
 # Finder's shell environment may omit Homebrew and rustup's binary directories.
 export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.cargo/bin:$PATH"
 cd -- "$repo_dir"
-cargo build --manifest-path "$repo_dir/Cargo.toml" --target-dir "$repo_dir/target" -p jarvis-panel
+cargo build --release --features metal --manifest-path "$repo_dir/Cargo.toml" --target-dir "$repo_dir/target" -p jarvis-panel
 mkdir -p "$repo_dir/runtime"
 # Documents can be managed by a file provider that adds Finder/resource metadata
 # after signing. Keep the native executable in local Application Support instead.
@@ -51,7 +51,7 @@ staging_dir="$(mktemp -d "$app_dir/jarvis-package.XXXXXX")"
 trap 'rm -rf -- "$staging_dir"' EXIT
 staging_app="$staging_dir/Jarvis.app"
 mkdir -p "$staging_app/Contents/MacOS"
-cp -X "$repo_dir/target/debug/jarvis-panel" "$staging_app/Contents/MacOS/jarvis-panel"
+cp -X "$repo_dir/target/release/jarvis-panel" "$staging_app/Contents/MacOS/jarvis-panel"
 cp -X "$repo_dir/crates/jarvis-panel/Info.plist" "$staging_app/Contents/Info.plist"
 chmod 755 "$staging_app/Contents/MacOS/jarvis-panel"
 /usr/bin/plutil -lint "$staging_app/Contents/Info.plist" >/dev/null

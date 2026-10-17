@@ -89,6 +89,23 @@ impl Transcriber {
         result
     }
 
+    /// Accurate command decoding, with the same cancellation boundaries as
+    /// the fast wake-check decoder. Dedicated keyword spotting is separate.
+    pub fn transcribe_command_cancelled(
+        &mut self,
+        samples: &[f32],
+        cancel: Arc<AtomicBool>,
+    ) -> Result<String, VoiceError> {
+        if cancel.load(Ordering::Acquire) {
+            return Err(VoiceError::Cancelled);
+        }
+        let result = self.transcribe_command(samples);
+        if cancel.load(Ordering::Acquire) {
+            return Err(VoiceError::Cancelled);
+        }
+        result
+    }
+
     /// Load trusted local weights once. Header/size checks are preflight checks,
     /// not a complete security validator for arbitrary native model files.
     pub fn load(model_path: &Path) -> Result<Self, VoiceError> {
@@ -110,8 +127,39 @@ impl Transcriber {
     /// Transcribe a single utterance synchronously. Call on a dedicated worker
     /// thread, not the AppKit main thread. Past transcript context is disabled.
     pub fn transcribe(&mut self, samples: &[f32]) -> Result<String, VoiceError> {
+        self.decode(samples, SamplingStrategy::Greedy { best_of: 1 }, false)
+    }
+
+    /// Decode a complete command with a bounded beam. Wake checks retain the
+    /// fast greedy decoder through `transcribe`.
+    pub fn transcribe_command(&mut self, samples: &[f32]) -> Result<String, VoiceError> {
+        // Command transcription has a separate budget from keyword spotting.
+        // A small beam preserves competing word hypotheses without biasing
+        // decoding toward a fixed list of people, applications, or commands.
+        self.decode(
+            samples,
+            SamplingStrategy::BeamSearch {
+                beam_size: 5,
+                patience: -1.0,
+            },
+            true,
+        )
+    }
+
+    fn decode(
+        &mut self,
+        samples: &[f32],
+        strategy: SamplingStrategy,
+        deterministic: bool,
+    ) -> Result<String, VoiceError> {
         validate_audio(samples)?;
-        let mut parameters = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        let mut parameters = FullParams::new(strategy);
+        // Do not retry uncertain speech with progressively random sampling.
+        // Keep both command latency and decoding behavior predictable.
+        if deterministic {
+            parameters.set_temperature(0.0);
+            parameters.set_temperature_inc(0.0);
+        }
         parameters.set_n_threads(INFERENCE_THREADS);
         parameters.set_language(Some("en"));
         parameters.set_translate(false);

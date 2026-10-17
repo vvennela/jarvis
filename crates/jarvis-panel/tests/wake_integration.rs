@@ -231,7 +231,15 @@ fn mute_and_owned_speech_suppression_discard_late_wake_results() {
             )
         });
         assert!(worker.control.take_command().is_none());
-        assert!(probe.stops.load(Ordering::Relaxed) > 0);
+        if suppress {
+            assert_eq!(
+                probe.stops.load(Ordering::Relaxed),
+                0,
+                "owned speech must keep the stream warm"
+            );
+        } else {
+            assert!(probe.stops.load(Ordering::Relaxed) > 0);
+        }
         // Fresh ambient text after resuming cannot inherit the prior wake.
         if suppress {
             worker.control.suppress(false);
@@ -247,7 +255,7 @@ fn mute_and_owned_speech_suppression_discard_late_wake_results() {
 }
 
 #[test]
-fn owned_speech_suppression_stops_capture_and_prevents_new_decode_work() {
+fn owned_speech_suppression_drains_capture_and_prevents_new_decode_work() {
     let probe = Arc::new(Probe::default());
     let mut worker = worker(&probe);
     worker.control.set_enabled(true);

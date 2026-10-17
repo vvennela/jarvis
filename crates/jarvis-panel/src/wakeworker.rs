@@ -109,6 +109,13 @@ pub trait WakeBackend {
         samples: &[f32],
         cancelled: Arc<AtomicBool>,
     ) -> Result<String, &'static str>;
+    fn transcribe_command(
+        &mut self,
+        samples: &[f32],
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<String, &'static str> {
+        self.transcribe(samples, cancelled)
+    }
 }
 fn append_keyword_audio(buffer: &mut Vec<f32>, samples: &[f32]) {
     let keep = samples.len().min(64_000);
@@ -386,41 +393,32 @@ impl WakeWorker {
                 let mut keyword_audio = Vec::<f32>::with_capacity(64_000);
                 let mut seen_generation = c.generation.load(Ordering::Acquire);
                 let mut followup_armed = false;
+                let mut discard_audio = false;
                 loop {
                     if c.stopped.load(Ordering::Acquire) {
                         break;
                     }
                     let generation = c.generation.load(Ordering::Acquire);
                     if generation != seen_generation {
-                        backend.stop();
+                        // Logical cancellation must not renegotiate the hardware route.
+                        // Drain the old generation before recognition resumes.
+                        discard_audio = true;
                         backend.reset_keyword();
                         keyword_audio.clear();
-                        running = false;
                         detector.reset();
                         next_decode = None;
                         seen_generation = generation;
                         followup_armed = false;
                     }
                     let suppressed = c.suppressed.load(Ordering::Acquire);
-                    if !c.enabled() || suppressed {
+                    if !c.enabled() {
                         if running {
                             backend.stop();
                             running = false;
                         }
                         detector.reset();
                         next_decode = None;
-                        c.publish(
-                            if suppressed {
-                                State::Suppressed
-                            } else {
-                                State::Muted
-                            },
-                            if suppressed {
-                                "Voice paused during reply"
-                            } else {
-                                "Microphone muted"
-                            },
-                        );
+                        c.publish(State::Muted, "Microphone muted");
                         thread::sleep(Duration::from_millis(20));
                         continue;
                     }
@@ -444,6 +442,46 @@ impl WakeWorker {
                         }
                         c.input(input, backend.listening_message());
                         c.cancelled.store(false, Ordering::Release);
+                    }
+                    if suppressed || discard_audio {
+                        // Keep the enabled stream warm while thinking/speaking, but
+                        // feed none of its audio to KWS, VAD, ASR, or command state.
+                        // The first drain after unsuppression also discards TTS tail.
+                        match backend.poll() {
+                            Ok((samples, overflow)) => {
+                                c.capture_diagnostics(backend.capture_diagnostics());
+                                c.audio(&samples, overflow);
+                                if overflow {
+                                    c.clear_followup();
+                                    followup_armed = false;
+                                    backend.reset_keyword();
+                                    c.input(backend.input_info(), backend.listening_message());
+                                }
+                            }
+                            Err(message) => {
+                                backend.stop();
+                                running = false;
+                                c.capture_error();
+                                c.enabled.store(false, Ordering::Release);
+                                c.publish(State::Failed, message);
+                                while !c.enabled() && !c.stopped.load(Ordering::Acquire) {
+                                    thread::sleep(Duration::from_millis(20));
+                                }
+                                continue;
+                            }
+                        }
+                        detector.reset();
+                        next_decode = None;
+                        keyword_audio.clear();
+                        discard_audio = false;
+                        if generation == c.generation.load(Ordering::Acquire) {
+                            c.cancelled.store(false, Ordering::Release);
+                        }
+                        if suppressed {
+                            c.publish(State::Suppressed, "Voice paused during reply");
+                        }
+                        thread::sleep(Duration::from_millis(20));
+                        continue;
                     }
                     let followup = c.followup_deadline(generation);
                     if followup.is_some_and(|deadline| Instant::now() >= deadline)
@@ -585,7 +623,11 @@ impl WakeWorker {
                         }
                         c.decode_started();
                         let decode_started = Instant::now();
-                        let result = backend.transcribe(&request.samples, c.cancelled.clone());
+                        let result = if request.phase == Phase::Wake {
+                            backend.transcribe(&request.samples, c.cancelled.clone())
+                        } else {
+                            backend.transcribe_command(&request.samples, c.cancelled.clone())
+                        };
                         c.decode_finished(decode_started.elapsed(), result.is_err());
                         if followup_armed
                             && c.followup_deadline(generation)
@@ -597,9 +639,8 @@ impl WakeWorker {
                             next_decode = None;
                             backend.reset_keyword();
                             keyword_audio.clear();
-                            // Restart capture to discard audio recorded after this answer expired.
-                            backend.stop();
-                            running = false;
+                            // Discard expired answer audio without reopening the device.
+                            discard_audio = true;
                             continue;
                         }
                         if generation != c.generation.load(Ordering::Acquire)
@@ -1022,6 +1063,16 @@ impl WakeBackend for NativeBackend {
     ) -> Result<String, &'static str> {
         self.transcriber
             .transcribe_cancelled(samples, cancelled)
+            .map_err(|_| "Try saying Jarvis again")
+    }
+
+    fn transcribe_command(
+        &mut self,
+        samples: &[f32],
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<String, &'static str> {
+        self.transcriber
+            .transcribe_command_cancelled(samples, cancelled)
             .map_err(|_| "Try saying Jarvis again")
     }
 }

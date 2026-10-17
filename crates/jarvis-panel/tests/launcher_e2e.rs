@@ -248,3 +248,38 @@ fn opt_in_normal_bundle_stays_alive_until_explicit_termination() {
         thread::sleep(Duration::from_millis(20));
     }
 }
+
+#[test]
+fn launcher_requests_release_metal_and_packages_the_matching_profile_binary() {
+    // Intercept the real launcher's build boundary before signing/installing or
+    // invoking any native program. This proves argv/profile selection only.
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let launcher = repo.join("scripts/launch-jarvis.command");
+    let output = std::process::Command::new("/bin/bash")
+        .arg("-c")
+        .arg("cargo() { printf '%s\\n' \"$@\"; exit 73; }; uname() { printf 'Darwin\\n'; }; source \"$1\" --root \"$2\" --build-only")
+        .arg("launcher-contract")
+        .arg(&launcher)
+        .arg(repo.join("examples/demo-workspace"))
+        .output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(73),
+        "launcher did not reach intercepted build: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let args = String::from_utf8(output.stdout).unwrap();
+    let args: Vec<_> = args.lines().collect();
+    assert_eq!(args[0], "build");
+    assert!(args.contains(&"--release"));
+    assert!(args.windows(2).any(|pair| pair == ["--features", "metal"]));
+    assert!(args.windows(2).any(|pair| pair == ["-p", "jarvis-panel"]));
+    let source = std::fs::read_to_string(launcher).unwrap();
+    assert!(
+        source.lines().any(|line| line.starts_with("cp -X ")
+            && line.contains("$repo_dir/target/release/jarvis-panel")
+            && line.contains("$staging_app/Contents/MacOS/jarvis-panel")),
+        "packaging must copy the release artifact requested above"
+    );
+    assert!(!source.contains("target/debug/jarvis-panel"));
+}

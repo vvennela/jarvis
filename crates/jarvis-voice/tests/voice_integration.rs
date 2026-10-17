@@ -224,3 +224,33 @@ fn opt_in_real_model_transcribes_generated_fixture_twice_without_reloading_file(
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+#[ignore = "requires explicit local model and generated command fixture"]
+fn command_decoder_recognizes_fast_public_fixture_and_respects_bounds_and_precancellation() {
+    use jarvis_voice::VoiceError;
+    use std::sync::{Arc, atomic::AtomicBool};
+    let model = std::env::var_os("JARVIS_TEST_WHISPER_MODEL").expect("local model required");
+    let fixture =
+        std::env::var_os("JARVIS_TEST_COMMAND_WAV").expect("generated command fixture required");
+    let expected =
+        std::env::var("JARVIS_TEST_COMMAND_EXPECT").expect("fixture expected phrase required");
+    let samples = load_wav(Path::new(&fixture)).unwrap();
+    let mut transcriber = Transcriber::load(Path::new(&model)).unwrap();
+    assert!(matches!(
+        transcriber.transcribe_command_cancelled(&samples, Arc::new(AtomicBool::new(true))),
+        Err(VoiceError::Cancelled)
+    ));
+    assert!(transcriber.transcribe_command(&[]).is_err());
+    assert!(transcriber.transcribe_command(&[f32::NAN]).is_err());
+    assert!(
+        transcriber
+            .transcribe_command(&vec![0.1; MAX_SAMPLES + 1])
+            .is_err()
+    );
+    let text = transcriber.transcribe_command(&samples).unwrap();
+    assert!(
+        text.to_lowercase().contains(&expected.to_lowercase()),
+        "generated fixture did not match expected phrase: {text}"
+    );
+}

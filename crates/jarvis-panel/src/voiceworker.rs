@@ -404,7 +404,7 @@ impl VoiceBackend for NativeBackend {
         cancelled: Arc<AtomicBool>,
     ) -> Result<String, VoiceFailure> {
         self.transcriber
-            .transcribe_cancelled(samples, cancelled)
+            .transcribe_command_cancelled(samples, cancelled)
             .map_err(|error| {
                 if error == jarvis_voice::VoiceError::Cancelled {
                     VoiceFailure::Cancelled
