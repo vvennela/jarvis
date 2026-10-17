@@ -241,8 +241,21 @@ impl SpotifyPlayback {
         user_request: &str,
         artist: &ResolvedArtist,
     ) -> Result<PlaybackResult, PlaybackError> {
+        let intent = crate::music_intent::ArtistIntent::explicit(user_request, artist.name())
+            .ok_or(PlaybackError::NotAuthorized)?;
+        self.play_authorized_artist(user_request, &intent, artist)
+            .await
+    }
+    pub(crate) async fn play_authorized_artist(
+        &self,
+        user_request: &str,
+        intent: &crate::music_intent::ArtistIntent,
+        artist: &ResolvedArtist,
+    ) -> Result<PlaybackResult, PlaybackError> {
         let started = Instant::now();
-        authorize_artist_request(user_request, artist.name())?;
+        if !intent.matches(user_request, artist.name()) {
+            return Err(PlaybackError::NotAuthorized);
+        }
         if artist.name().len() > 256
             || artist.name().chars().any(char::is_control)
             || !spotify_id(artist.id())

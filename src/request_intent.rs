@@ -32,6 +32,24 @@ fn quoted(text: &str) -> bool {
     text.chars()
         .any(|c| matches!(c, '\'' | '"' | '`' | '‘' | '’' | '“' | '”' | '«' | '»'))
 }
+
+// A possessive in a target ("Napoleon's Wikipedia page") is not quoted
+// speech. All other quotation marks remain a boundary against splitting
+// described/quoted instructions into independently executable commands.
+fn quoted_command(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    chars.iter().enumerate().any(|(index, &c)| {
+        if matches!(c, '\'' | '’')
+            && index > 0
+            && chars[index - 1].is_alphanumeric()
+            && chars.get(index + 1).is_some_and(|c| matches!(c, 's' | 'S'))
+            && chars.get(index + 2).is_none_or(|c| c.is_whitespace())
+        {
+            return false;
+        }
+        matches!(c, '\'' | '"' | '`' | '‘' | '’' | '“' | '”' | '«' | '»')
+    })
+}
 fn restrictive(text: &str) -> bool {
     text.split(|c: char| !c.is_alphanumeric()).any(|token| {
         matches!(
@@ -89,7 +107,7 @@ pub fn command_clauses(request: &str) -> Result<Vec<&str>, ()> {
     }
     let lower = request.to_ascii_lowercase();
     let body = imperative(lower.trim());
-    if quoted(request)
+    if quoted_command(request)
         || request
             .chars()
             .any(|c| matches!(c, ';' | '|' | '&' | '$' | '<' | '>'))
@@ -356,8 +374,78 @@ pub fn tab_navigation_intent(request: &str) -> Option<(String, String)> {
 /// Fill only a supported explicit user-request slot. A model's question cannot
 /// turn a summary or general conversation into permission to perform an action.
 pub fn resolve_action_followup(original: &str, answer: &str) -> Option<String> {
-    if original.len() > MAX_REQUEST || original.chars().any(char::is_control) || quoted(original) {
+    if original.len() > MAX_REQUEST
+        || original.chars().any(char::is_control)
+        || quoted_command(original)
+        || restrictive(&original.to_ascii_lowercase())
+    {
         return None;
+    }
+    let continuation = answer
+        .trim()
+        .trim_end_matches(['.', '!', '?'])
+        .to_ascii_lowercase();
+    let clauses = command_clauses(original).ok()?;
+    if clauses.len() == 1
+        && (matches!(
+            continuation.as_str(),
+            "next" | "the next one" | "do the remaining one"
+        ) || (matches!(
+            continuation.as_str(),
+            "now the music" | "now the song" | "do the music next" | "do the song next"
+        ) && (crate::spotify_tracks::requested_track(original).is_some()
+            || crate::spotify_playback::requested_artist(original).is_some()))
+            || (matches!(
+                continuation.as_str(),
+                "now the page" | "now the wikipedia page"
+            ) && wikipedia_page_intent(original).is_some()))
+    {
+        return Some(original.to_owned());
+    }
+    // Choosing an action from a pending compound request retains its original
+    // target, rather than treating "Wikipedia first" as a new missing-topic
+    // request. Only an unambiguous existing clause can be selected.
+    if let Ok(clauses) = command_clauses(original)
+        && clauses.len() > 1
+    {
+        let answer = answer
+            .trim()
+            .trim_end_matches(['.', '!', '?'])
+            .to_ascii_lowercase();
+        if answer.len() > 128
+            || answer.chars().any(char::is_control)
+            || quoted(&answer)
+            || restrictive(&answer)
+        {
+            return None;
+        }
+        let selection = answer
+            .strip_prefix("do ")
+            .or_else(|| answer.strip_prefix("open "))
+            .unwrap_or(&answer);
+        let selection = selection.strip_prefix("the ").unwrap_or(selection);
+        let selection = selection.strip_suffix(" first").unwrap_or(selection);
+        let ordinal = match selection {
+            "first" | "first one" => Some(0),
+            "second" | "second one" => Some(1),
+            "third" | "third one" => Some(2),
+            _ => None,
+        };
+        if let Some(index) = ordinal {
+            return clauses.get(index).map(|clause| (*clause).to_owned());
+        }
+        let mut matches = clauses.iter().filter(|clause| match selection {
+            "wikipedia" | "wikipedia page" | "page" | "article" => {
+                wikipedia_page_intent(clause).is_some()
+            }
+            "music" | "song" | "spotify" => {
+                crate::spotify_tracks::requested_track(clause).is_some()
+                    || crate::spotify_playback::requested_artist(clause).is_some()
+            }
+            _ => false,
+        });
+        let selected = matches.next()?;
+        return matches.next().is_none().then(|| (*selected).to_owned());
     }
     let lower = original
         .trim()

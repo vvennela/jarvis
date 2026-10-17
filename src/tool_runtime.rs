@@ -19,7 +19,7 @@ use crate::{
     gate,
     music_catalog::MusicCatalog,
     providers::{ToolCall, ToolSpec},
-    spotify_playback::{SpotifyPlayback, authorize_artist_request},
+    spotify_playback::SpotifyPlayback,
     web_search::WebSearch,
 };
 
@@ -66,6 +66,7 @@ pub struct ToolRuntime {
     actions: Option<ActionExecutor>,
     drafts: Option<Arc<dyn DraftSubmitter>>,
     music: Option<(MusicCatalog, SpotifyPlayback)>,
+    music_intent: Option<Arc<crate::providers::JevClient>>,
     tracks: Option<crate::spotify_tracks::SpotifyTracks>,
     file_edits: Option<Arc<dyn FileEditSubmitter>>,
     coding: Option<Arc<dyn CodingSubmitter>>,
@@ -81,6 +82,16 @@ pub struct ToolResult {
     pub acknowledgment: Option<String>,
     /// Only a validated ask_user proposal requests a bounded voice answer.
     pub needs_followup: bool,
+    pub confirmation: Option<ArtistConfirmation>,
+}
+
+/// A bounded target from the user's own request, awaiting their explicit answer.
+/// Private fields prevent tool/model arguments from manufacturing authority.
+#[derive(Clone)]
+pub struct ArtistConfirmation {
+    original: String,
+    artist: String,
+    issued: Instant,
 }
 
 impl ToolRuntime {
@@ -91,6 +102,7 @@ impl ToolRuntime {
             actions: None,
             drafts: None,
             music: None,
+            music_intent: None,
             tracks: None,
             file_edits: None,
             coding: None,
@@ -115,6 +127,52 @@ impl ToolRuntime {
     pub fn with_music(mut self, catalog: MusicCatalog, playback: SpotifyPlayback) -> Self {
         self.music = Some((catalog, playback));
         self
+    }
+    pub fn with_music_intent(mut self, jev: Arc<crate::providers::JevClient>) -> Self {
+        self.music_intent = Some(jev);
+        self
+    }
+
+    pub async fn confirm_artist(
+        &self,
+        confirmation: &ArtistConfirmation,
+        response: &str,
+    ) -> Option<ToolResult> {
+        if confirmation.issued.elapsed() >= Duration::from_secs(60) {
+            return None;
+        }
+        let answer = response
+            .trim()
+            .trim_end_matches(['.', '!', '?'])
+            .to_lowercase();
+        if matches!(
+            answer.as_str(),
+            "no" | "no thanks" | "cancel" | "stop" | "never mind" | "nevermind"
+        ) {
+            return Some(acknowledgment("Okay, I won't play it."));
+        }
+        if !matches!(
+            answer.as_str(),
+            "yes"
+                | "yeah"
+                | "yep"
+                | "yes please"
+                | "please do"
+                | "go ahead"
+                | "do it"
+                | "that's right"
+                | "correct"
+        ) {
+            return None;
+        }
+        let intent = crate::music_intent::ArtistIntent::confirmed(
+            &confirmation.original,
+            &confirmation.artist,
+        )?;
+        Some(
+            self.play_music_intent(&confirmation.original, &confirmation.artist, &intent)
+                .await,
+        )
     }
     pub fn with_tracks(mut self, tracks: crate::spotify_tracks::SpotifyTracks) -> Self {
         self.tracks = Some(tracks);
@@ -276,9 +334,46 @@ impl ToolRuntime {
                 arguments: json!({"artist":artist}),
             }
         } else {
+            if self.music.is_some()
+                && user_request
+                    .split(|c: char| !c.is_alphanumeric())
+                    .any(|word| word.eq_ignore_ascii_case("spotify"))
+                && let Some(jev) = &self.music_intent
+                && let Some((intent, artist)) =
+                    crate::music_intent::ArtistIntent::resolve(user_request, jev).await
+            {
+                return Some(self.play_music_intent(user_request, &artist, &intent).await);
+            }
             return None;
         };
         Some(self.execute(user_request, &proposal).await)
+    }
+
+    async fn play_music_intent(
+        &self,
+        request: &str,
+        name: &str,
+        intent: &crate::music_intent::ArtistIntent,
+    ) -> ToolResult {
+        let Some((catalog, playback)) = &self.music else {
+            return acknowledgment("Artist lookup isn't connected yet.");
+        };
+        let result = tokio::time::timeout(Duration::from_secs(35), async {
+            let artist = catalog
+                .resolve_artist(name)
+                .await
+                .map_err(|e| e.to_string())?;
+            playback
+                .play_authorized_artist(request, intent, &artist)
+                .await
+                .map_err(|e| e.to_string())
+        })
+        .await;
+        match result {
+            Ok(Ok(played)) => acknowledgment(&played.text),
+            Ok(Err(message)) => acknowledgment(&message),
+            Err(_) => acknowledgment("That took too long. I couldn't confirm your music started."),
+        }
     }
 
     /// Clear, approved app commands need neither a model nor provider keys.
@@ -539,28 +634,43 @@ impl ToolRuntime {
                 };
                 // Model arguments are proposals, never authority. Check intent
                 // before search so rejected targets leave no network trace.
-                if let Err(error) = authorize_artist_request(user_request, &args.artist) {
-                    return acknowledgment(&error.to_string());
-                }
-                let Some((catalog, playback)) = &self.music else {
-                    return acknowledgment("Artist lookup isn't connected yet.");
-                };
-                let result = tokio::time::timeout(Duration::from_secs(35), async {
-                    let artist = catalog
-                        .resolve_artist(&args.artist)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    playback
-                        .play_artist(user_request, &artist)
-                        .await
-                        .map_err(|e| e.to_string())
-                })
-                .await;
-                match result {
-                    Ok(Ok(played)) => acknowledgment(&played.text),
-                    Ok(Err(message)) => acknowledgment(&message),
-                    Err(_) => {
-                        acknowledgment("That took too long. I couldn't confirm your music started.")
+                let intent =
+                    match crate::music_intent::ArtistIntent::explicit(user_request, &args.artist) {
+                        Some(intent) => Some(intent),
+                        None => match &self.music_intent {
+                            Some(jev) => {
+                                crate::music_intent::ArtistIntent::semantic(
+                                    user_request,
+                                    &args.artist,
+                                    jev,
+                                )
+                                .await
+                            }
+                            None => None,
+                        },
+                    };
+                match intent {
+                    Some(intent) => {
+                        self.play_music_intent(user_request, &args.artist, &intent)
+                            .await
+                    }
+                    None => {
+                        if !crate::music_intent::eligible(user_request)
+                            || !crate::music_intent::contains_target(user_request, &args.artist)
+                        {
+                            return acknowledgment("Tell me who you'd like to hear on Spotify.");
+                        }
+                        let mut result = acknowledgment(&format!(
+                            "Do you want me to play {} on Spotify?",
+                            args.artist
+                        ));
+                        result.needs_followup = true;
+                        result.confirmation = Some(ArtistConfirmation {
+                            original: user_request.to_owned(),
+                            artist: args.artist,
+                            issued: Instant::now(),
+                        });
+                        result
                     }
                 }
             }
@@ -707,6 +817,7 @@ fn data(value: Value) -> ToolResult {
         content: value.to_string(),
         acknowledgment: None,
         needs_followup: false,
+        confirmation: None,
     }
 }
 fn error(message: &str) -> ToolResult {
@@ -717,6 +828,7 @@ fn acknowledgment(message: &str) -> ToolResult {
         content: json!({"observation":message}).to_string(),
         acknowledgment: Some(message.into()),
         needs_followup: false,
+        confirmation: None,
     }
 }
 

@@ -94,6 +94,28 @@ impl Peer {
                         .pop_front()
                         .expect("unexpected catalog request");
                     tokio::time::sleep(plan.delay).await;
+                    let mut plan = plan;
+                    if let Ok(marker) = serde_json::from_slice::<Value>(&plan.body)
+                        && let Some(target) = marker["__fixture_artist"].as_str()
+                    {
+                        let end = bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                        let request: Value = serde_json::from_slice(&bytes[end..]).unwrap();
+                        let state: Value =
+                            serde_json::from_str(request["state"].as_str().unwrap()).unwrap();
+                        let confidence = marker["confidence"].as_f64().unwrap();
+                        let answer = if request["questions"].get("artist").is_some() {
+                            let index = state["candidate_artist_spans"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .position(|span| span.as_str() == Some(target))
+                                .expect("fixture target not in caller spans");
+                            json!({"answers":{"artist":{"type":"choice","choice":format!("artist_{index}"),"confidence":confidence}}})
+                        } else {
+                            json!({"answers":{"music":{"type":"choice","choice":"play_artist","confidence":confidence}}})
+                        };
+                        plan.body = answer.to_string().into_bytes();
+                    }
                     let headers = plan
                         .headers
                         .iter()
@@ -1336,5 +1358,346 @@ async fn open_artist_needs_explicit_spotify_target_and_trusted_affirmative_user_
             "catalog touched: {question}"
         );
         assert!(!dir.join("args").exists(), "player launched: {question}");
+    }
+}
+
+fn music_span_verdict(artist: &str, confidence: f64) -> Plan {
+    Plan::json(json!({"__fixture_artist":artist,"confidence":confidence}))
+}
+fn music_verdict(choice: &str, confidence: f64) -> Plan {
+    Plan::json(
+        json!({"answers":{"music":{"type":"choice","choice":choice,"confidence":confidence}}}),
+    )
+}
+fn music_router(peer: &Peer, timeout: Duration) -> Arc<jarvis::providers::JevClient> {
+    Arc::new(
+        jarvis::providers::JevClient::new(
+            "fixture-only-router",
+            jarvis::providers::ProviderConfig::loopback_for_tests(&peer.url, timeout).unwrap(),
+        )
+        .unwrap(),
+    )
+}
+
+fn proposed_artist(name: &str) -> Plan {
+    Plan::json(
+        json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":[{"id":"semantic-artist","type":"function","function":{"name":"spotify_play_artist","arguments":json!({"artist":name}).to_string()}}]}}]}),
+    )
+}
+
+#[tokio::test]
+async fn conversational_artist_proposal_preserves_filler_request_and_executes_verified_target() {
+    for name in ["Taylor Swift", "Aurora Fixture Quartet"] {
+        let dir = TempDir::new();
+        let model = Peer::new(vec![proposed_artist(name)]).await;
+        let routing = Peer::new(vec![music_span_verdict(name, 0.99)]).await;
+        let peer = Peer::new(vec![
+            search(&[&format!("https://open.spotify.com/artist/{FIRST_ID}")]),
+            oembed(name),
+        ])
+        .await;
+        let runtime = ToolRuntime::read_only(dir.join("context.db")).with_music(
+            catalog(&peer, Duration::from_secs(2)),
+            SpotifyPlayback::with_executable(
+                executable(&dir, &observed(name).to_string()),
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+        );
+        let runtime = runtime.with_music_intent(music_router(&routing, Duration::from_secs(2)));
+        let mut conversation = intent_conversation(&dir, &model, runtime);
+        let original = format!("nice open {name} on Spotify.");
+        let reply = conversation.ask(&original).await.unwrap();
+        assert_eq!(routing.requests().len(), 1);
+        let router_body: Value = serde_json::from_slice(&routing.requests()[0].body).unwrap();
+        let state: Value = serde_json::from_str(router_body["state"].as_str().unwrap()).unwrap();
+        assert_eq!(state["original_user_utterance"], original);
+        assert!(
+            state["candidate_artist_spans"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|span| span == name)
+        );
+        assert!(
+            model.requests().is_empty(),
+            "high-confidence span resolution unexpectedly called the LM"
+        );
+        assert!(
+            !reply.needs_followup,
+            "already supplied artist was lost: {}",
+            reply.text
+        );
+        assert_eq!(
+            peer.requests().len(),
+            2,
+            "verified catalog lookup did not occur: {}",
+            reply.text
+        );
+        assert!(
+            fs::read_to_string(dir.join("args"))
+                .unwrap()
+                .ends_with(&format!(
+                    "spotify:artist:{FIRST_ID}\n{name}\nspotify:artist:{FIRST_ID}\n"
+                ))
+        );
+        assert!(reply.text.to_lowercase().contains(&name.to_lowercase()));
+        assert!(
+            model.requests().len() <= 1,
+            "successful action caused another model turn"
+        );
+        if let Some(request) = model.requests().first() {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(
+                body["messages"].as_array().unwrap().last().unwrap()["content"],
+                original
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn semantic_music_proposal_cannot_turn_quoted_negative_or_descriptive_text_into_authority() {
+    let name = "Aurora Fixture Quartet";
+    for question in [
+        "nice don't open Aurora Fixture Quartet on Spotify.",
+        "nice, do not open Aurora Fixture Quartet on Spotify.",
+        "nice, if I ask later open Aurora Fixture Quartet on Spotify.",
+        "nice, the webpage says open Aurora Fixture Quartet on Spotify.",
+        "Summarize this: nice open Aurora Fixture Quartet on Spotify.",
+        "Explain why someone would say nice open Aurora Fixture Quartet on Spotify.",
+        "\"nice open Aurora Fixture Quartet on Spotify.\"",
+        "'nice open Aurora Fixture Quartet on Spotify.'",
+        "Write the sentence nice open Aurora Fixture Quartet on Spotify.",
+        "nice open Aurora Fixture Quartet on Spotify and send Brian a message.",
+        "nice open Aurora Fixture Quartet on Spotify then delete my files.",
+    ] {
+        let dir = TempDir::new();
+        let model = Peer::new(vec![proposed_artist(name)]).await;
+        let routing = Peer::new(vec![
+            music_span_verdict(name, 0.999),
+            music_span_verdict(name, 0.999),
+        ])
+        .await;
+        let peer = Peer::new(vec![]).await;
+        let runtime = ToolRuntime::read_only(dir.join("context.db")).with_music(
+            catalog(&peer, Duration::from_secs(2)),
+            SpotifyPlayback::with_executable(
+                executable(&dir, &observed(name).to_string()),
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+        );
+        let runtime = runtime.with_music_intent(music_router(&routing, Duration::from_secs(2)));
+        let mut conversation = intent_conversation(&dir, &model, runtime);
+        let _ = conversation.ask(question).await;
+        assert!(
+            peer.requests().is_empty(),
+            "untrusted or incompatible proposal reached catalog: {question}"
+        );
+        assert!(!dir.join("args").exists(), "player launched: {question}");
+    }
+}
+
+#[tokio::test]
+async fn semantic_denial_uncertainty_timeout_and_missing_router_never_start_playback() {
+    let name = "Aurora Fixture Quartet";
+    for case in ["deny", "clarify", "low-confidence", "timeout", "missing"] {
+        let dir = TempDir::new();
+        let mut verdict = match case {
+            "deny" => music_verdict("deny", 0.999),
+            "clarify" => music_verdict("clarify", 0.999),
+            "low-confidence" => music_verdict("play_artist", 0.949),
+            _ => music_verdict("play_artist", 0.999),
+        };
+        if case == "timeout" {
+            verdict.delay = Duration::from_millis(250);
+        }
+        let routing = Peer::new(vec![verdict]).await;
+        let peer = Peer::new(vec![]).await;
+        let mut runtime = ToolRuntime::read_only(dir.join("context.db")).with_music(
+            catalog(&peer, Duration::from_secs(2)),
+            SpotifyPlayback::with_executable(
+                executable(&dir, &observed(name).to_string()),
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+        );
+        if case != "missing" {
+            runtime = runtime.with_music_intent(music_router(&routing, Duration::from_millis(50)));
+        }
+        let reply = runtime
+            .execute(
+                &format!("nice open {name} on Spotify."),
+                &ToolCall {
+                    id: "proposal".into(),
+                    name: "spotify_play_artist".into(),
+                    arguments: json!({"artist":name}),
+                },
+            )
+            .await;
+        assert!(peer.requests().is_empty(), "{case} reached lookup");
+        assert!(!dir.join("args").exists(), "{case} launched player");
+        if case == "missing" {
+            assert!(
+                reply.needs_followup,
+                "missing router did not request confirmation"
+            );
+            assert!(
+                reply.content.to_lowercase().contains(&name.to_lowercase()),
+                "confirmation lost already known target: {}",
+                reply.content
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn high_confidence_semantic_verdict_cannot_replace_literal_artist_target() {
+    let dir = TempDir::new();
+    let wrong = "Aurora Fixture Quartet";
+    let routing = Peer::new(vec![music_verdict("play_artist", 1.0)]).await;
+    let peer = Peer::new(vec![]).await;
+    let runtime = ToolRuntime::read_only(dir.join("context.db"))
+        .with_music(
+            catalog(&peer, Duration::from_secs(2)),
+            SpotifyPlayback::with_executable(
+                executable(&dir, &observed(wrong).to_string()),
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+        )
+        .with_music_intent(music_router(&routing, Duration::from_secs(2)));
+    let _ = runtime
+        .execute(
+            "nice open Neon Fixture Duo on Spotify.",
+            &ToolCall {
+                id: "wrong-target".into(),
+                name: "spotify_play_artist".into(),
+                arguments: json!({"artist":wrong}),
+            },
+        )
+        .await;
+    assert!(peer.requests().is_empty());
+    assert!(!dir.join("args").exists());
+}
+
+#[tokio::test]
+async fn uncertain_span_requires_independent_high_confidence_authorization_before_playback() {
+    for verdict in ["play_artist", "deny"] {
+        let dir = TempDir::new();
+        let name = "Aurora Fixture Quartet";
+        let model = Peer::new(vec![]).await;
+        let router = Peer::new(vec![
+            music_span_verdict(name, 0.88),
+            music_verdict(verdict, 0.999),
+        ])
+        .await;
+        let catalog_peer = Peer::new(vec![
+            search(&[&format!("https://open.spotify.com/artist/{FIRST_ID}")]),
+            oembed(name),
+        ])
+        .await;
+        let runtime = ToolRuntime::read_only(dir.join("context.db"))
+            .with_music(
+                catalog(&catalog_peer, Duration::from_secs(2)),
+                SpotifyPlayback::with_executable(
+                    executable(&dir, &observed(name).to_string()),
+                    Duration::from_secs(2),
+                )
+                .unwrap(),
+            )
+            .with_music_intent(music_router(&router, Duration::from_secs(2)));
+        // The runtime seam isolates the two-step authority decision from ordinary LM fallback.
+        let result = runtime
+            .handle_resolved_intent(&format!("nice open {name} on Spotify."))
+            .await;
+        assert_eq!(router.requests().len(), 2);
+        let authorization: Value = serde_json::from_slice(&router.requests()[1].body).unwrap();
+        let state: Value = serde_json::from_str(authorization["state"].as_str().unwrap()).unwrap();
+        assert_eq!(state["proposed_artist"], name);
+        if verdict == "play_artist" {
+            assert!(result.is_some());
+            assert_eq!(catalog_peer.requests().len(), 2);
+            assert!(dir.join("args").exists());
+        } else {
+            assert!(result.is_none());
+            assert!(catalog_peer.requests().is_empty());
+            assert!(!dir.join("args").exists());
+        }
+        assert!(model.requests().is_empty());
+    }
+}
+
+fn plain_answer() -> Plan {
+    Plan::json(
+        json!({"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"Okay."}}]}),
+    )
+}
+
+#[tokio::test]
+async fn artist_confirmation_executes_once_and_rejections_clear_the_bound_target() {
+    for answer in ["yes please", "no", "cancel", "What is a quartet?", "clear"] {
+        let dir = TempDir::new();
+        let name = "Aurora Fixture Quartet";
+        let model = Peer::new(vec![proposed_artist(name), plain_answer(), plain_answer()]).await;
+        let router = Peer::new((0..5).map(|_| music_span_verdict(name, 0.90)).collect()).await;
+        let peer = Peer::new(vec![
+            search(&[&format!("https://open.spotify.com/artist/{FIRST_ID}")]),
+            oembed(name),
+        ])
+        .await;
+        // Both an uncertain semantic verdict and a missing router must preserve the target.
+        let mut runtime = ToolRuntime::read_only(dir.join("context.db")).with_music(
+            catalog(&peer, Duration::from_secs(2)),
+            SpotifyPlayback::with_executable(
+                executable(&dir, &observed(name).to_string()),
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+        );
+        if answer == "yes please" {
+            runtime = runtime.with_music_intent(music_router(&router, Duration::from_secs(2)));
+        }
+        let mut conversation = intent_conversation(&dir, &model, runtime);
+        let first = conversation
+            .ask(&format!("nice open {name} on Spotify."))
+            .await
+            .unwrap();
+        assert!(first.needs_followup);
+        assert!(first.text.contains(name));
+        assert!(peer.requests().is_empty());
+        assert!(!dir.join("args").exists());
+        let initial_router_calls = router.requests().len();
+        if answer == "yes please" {
+            assert!(initial_router_calls > 0);
+        }
+        if answer == "clear" {
+            conversation.clear();
+        } else {
+            let response = conversation.ask(answer).await.unwrap();
+            if answer == "yes please" {
+                assert!(!response.needs_followup);
+                assert_eq!(
+                    model.requests().len(),
+                    1,
+                    "confirmed authority must not ask the LM again"
+                );
+                assert_eq!(peer.requests().len(), 2);
+            }
+        }
+        assert_eq!(
+            router.requests().len(),
+            initial_router_calls,
+            "answer re-routed instead of consuming the bound confirmation"
+        );
+        let before = peer.requests().len();
+        let _ = conversation.ask("yes").await;
+        assert_eq!(
+            peer.requests().len(),
+            before,
+            "stale/replayed confirmation: {answer}"
+        );
+        assert_eq!(dir.join("args").exists(), answer == "yes please");
     }
 }

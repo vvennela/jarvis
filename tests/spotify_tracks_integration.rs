@@ -317,6 +317,15 @@ async fn stale_or_paused_playback_cannot_claim_requested_song_started() {
 
 #[tokio::test]
 async fn guessed_by_requires_yes_and_does_not_replay_completed_article_clause() {
+    assert_possessive_compound_song(true).await;
+}
+
+#[tokio::test]
+async fn possessive_page_and_exact_song_execute_both_without_model_or_redundant_question() {
+    assert_possessive_compound_song(false).await;
+}
+
+async fn assert_possessive_compound_song(confirm: bool) {
     use jarvis::{
         context::{ContextStore, Limits},
         conversation::Conversation,
@@ -329,7 +338,7 @@ async fn guessed_by_requires_yes_and_does_not_replay_completed_article_clause() 
     let model = Peer::new(vec![]).await;
     let music = Peer::new(vec![
         discovery(&[ID]),
-        embed(entity("Northern Fixture", "Aurora Quartet", ID)),
+        embed(entity("Shake It Off", "Taylor Swift", ID)),
     ])
     .await;
     let wiki = Peer::new(vec![Plan::json(
@@ -360,15 +369,26 @@ async fn guessed_by_requires_yes_and_does_not_replay_completed_article_clause() 
     .unwrap();
     let mut conversation = Conversation::new(dir.join("context.db"), None, lm);
     conversation.set_tool_runtime(Arc::new(runtime));
-    let first=conversation.ask("open the Napoleon Wikipedia page and play Northern Fixture on Spotify, my Aurora Quartet").await.unwrap();
-    assert!(first.needs_followup);
-    assert!(first.text.to_lowercase().contains("northern fixture"));
-    assert!(first.text.to_lowercase().contains("aurora quartet"));
+    let question = if confirm {
+        "open Napoleon's Wikipedia page and play Shake It Off on Spotify, my Taylor Swift"
+    } else {
+        "open Napoleon's Wikipedia page and play Shake It Off by Taylor Swift on Spotify"
+    };
+    let first = conversation.ask(question).await.unwrap();
     assert_eq!(wiki.requests().len(), 1);
-    assert!(music.requests().is_empty());
-    assert!(!dir.join("args").exists());
-    let answer = conversation.ask("yes").await.unwrap();
-    assert!(!answer.needs_followup, "{}", answer.text);
+    if confirm {
+        assert!(first.needs_followup, "{}", first.text);
+        assert!(first.text.to_lowercase().contains("shake it off"));
+        assert!(first.text.to_lowercase().contains("taylor swift"));
+        assert!(music.requests().is_empty());
+        assert!(!dir.join("args").exists());
+        let answer = conversation.ask("yes").await.unwrap();
+        assert!(!answer.needs_followup, "{}", answer.text);
+    } else {
+        assert!(!first.needs_followup, "{}", first.text);
+        assert!(first.text.to_lowercase().contains("napoleon"));
+        assert!(first.text.to_lowercase().contains("shake it off"));
+    }
     assert_eq!(music.requests().len(), 2);
     assert_eq!(
         wiki.requests().len(),

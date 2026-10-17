@@ -176,6 +176,11 @@ impl ConversationWorker {
                 .get("YOU_API_KEY")
                 .filter(|key| !key.trim().is_empty())
         {
+            if let Some(key) = settings.get("TYPESAFE_API_KEY")
+                && let Ok(jev) = jarvis::providers::JevClient::production(key.clone())
+            {
+                tools = tools.with_music_intent(Arc::new(jev));
+            }
             if let Ok(catalog) = MusicCatalog::production(key.clone())
                 && let Ok(playback) = SpotifyPlayback::native()
             {
