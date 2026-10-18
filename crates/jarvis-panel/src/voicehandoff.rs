@@ -75,7 +75,80 @@ pub fn dispatch_question_with_coding(
     dispatch_question(question, conversation, task)
 }
 
+/// Hands-free turns allowed before "Hey Jarvis" is required again.
+pub const MAX_HANDS_FREE_TURNS: u8 = 6;
+const CONVERSATION_WINDOW: Duration = Duration::from_secs(6);
+
+/// Background speech often reaches an open conversational window. A hands-free
+/// turn must look addressed to Jarvis; closers end the conversation.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HandsFree {
+    Accept,
+    Ignore,
+    End,
+}
+pub fn classify_hands_free(command: &str) -> HandsFree {
+    let normalized = command
+        .trim()
+        .trim_end_matches(['.', '!', '?', ','])
+        .to_ascii_lowercase();
+    let words: Vec<&str> = normalized
+        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .filter(|word| !word.is_empty())
+        .collect();
+    let phrase = words.join(" ");
+    if matches!(
+        phrase.as_str(),
+        "thanks"
+            | "thank you"
+            | "thanks jarvis"
+            | "thank you jarvis"
+            | "that's all"
+            | "that's it"
+            | "never mind"
+            | "nevermind"
+            | "stop"
+            | "stop listening"
+            | "goodbye"
+            | "bye"
+            | "we're done"
+            | "all good"
+    ) {
+        return HandsFree::End;
+    }
+    if matches!(
+        phrase.as_str(),
+        "yes"
+            | "yeah"
+            | "yep"
+            | "no"
+            | "nope"
+            | "sure"
+            | "do it"
+            | "send it"
+            | "send"
+            | "cancel"
+            | "read it back"
+            | "read it"
+            | "go ahead"
+            | "next"
+    ) {
+        return HandsFree::Accept;
+    }
+    let filler = |word: &&str| {
+        matches!(
+            *word,
+            "uh" | "um" | "hmm" | "mm" | "ah" | "oh" | "okay" | "ok" | "yeah" | "like" | "so"
+        )
+    };
+    if words.iter().filter(|word| !filler(word)).count() < 2 {
+        return HandsFree::Ignore;
+    }
+    HandsFree::Accept
+}
+
 struct SpokenQuestion {
+    conversational: bool,
     speech_revision: u64,
     speech_epoch: u64,
     wake_generation: u64,
@@ -96,11 +169,24 @@ pub struct VoiceHandoff {
     visible_microphone_notice: Option<(String, Instant)>,
     microphone_reveal: bool,
     last_wake_matches: Option<u64>,
+    conversation_mode: bool,
+    /// Wake count when a conversational window opened; an unchanged count at
+    /// command time means the command arrived without "Hey Jarvis".
+    hands_free_since: Option<u64>,
+    hands_free_turns: u8,
 }
 
 impl VoiceHandoff {
     pub fn new() -> Self {
         Self::default()
+    }
+    /// After every spoken reply to a voice request, listen briefly for the
+    /// next turn without requiring the wake phrase.
+    pub fn conversational() -> Self {
+        Self {
+            conversation_mode: true,
+            ..Self::default()
+        }
     }
 
     /// The native card displays the same bounded notice that speech announces.
@@ -287,8 +373,16 @@ impl VoiceHandoff {
                     // Only successful completion of this owned clarification may
                     // reopen capture. Suppression's generation reset clears TTS echo.
                     wake.set_playback_active(false);
-                    if wake.arm_followup() {
+                    let armed = if question.conversational {
+                        wake.arm_followup_for(CONVERSATION_WINDOW)
+                    } else {
+                        wake.arm_followup()
+                    };
+                    if armed {
                         self.active_followup = Some((question.chat_epoch, question.speech_epoch));
+                        if question.conversational {
+                            self.hands_free_since = Some(wake.snapshot().diagnostics.wake_matches);
+                        }
                     }
                 }
                 self.spoken_question = None;
@@ -314,12 +408,16 @@ impl VoiceHandoff {
                         end -= 1;
                     }
                     let speech_revision = playback.snapshot().revision;
+                    let conversational = self.conversation_mode
+                        && !reply.needs_followup
+                        && self.hands_free_turns < MAX_HANDS_FREE_TURNS;
                     if playback.speak(reply.text[..end].to_owned()).is_ok()
                         && reply.state == chat::State::Reply
-                        && reply.needs_followup
+                        && (reply.needs_followup || conversational)
                     {
                         wake.set_playback_active(true);
                         self.spoken_question = Some(SpokenQuestion {
+                            conversational: !reply.needs_followup,
                             speech_revision,
                             speech_epoch: playback.cancellation_epoch(),
                             wake_generation: wake.generation(),
@@ -420,6 +518,27 @@ impl VoiceHandoff {
         } else {
             None
         };
+        let command = command.and_then(|command| {
+            let hands_free = self
+                .hands_free_since
+                .take()
+                .is_some_and(|since| since == wake.snapshot().diagnostics.wake_matches);
+            if !hands_free {
+                self.hands_free_turns = 0;
+                return Some(command);
+            }
+            match classify_hands_free(&command) {
+                HandsFree::Accept => {
+                    self.hands_free_turns = self.hands_free_turns.saturating_add(1);
+                    Some(command)
+                }
+                HandsFree::Ignore | HandsFree::End => {
+                    self.active_followup = None;
+                    self.hands_free_turns = 0;
+                    None
+                }
+            }
+        });
         if let Some(command) = &command {
             self.active_followup = None;
             if let Some(tasks) = tasks {

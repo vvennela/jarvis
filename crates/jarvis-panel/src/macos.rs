@@ -595,7 +595,7 @@ pub fn run(options: Options) -> Result<(), &'static str> {
     let mut task_notice = false;
     let mut coding_revision = None;
     let mut coding_notice = false;
-    let mut voice_handoff = VoiceHandoff::new();
+    let mut voice_handoff = VoiceHandoff::conversational();
     loop {
         if expanded != actions.ivars().expanded.get() {
             expanded = actions.ivars().expanded.get();
