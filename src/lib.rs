@@ -15,6 +15,7 @@ pub mod context;
 pub mod conversation;
 pub mod draft;
 pub mod elevenlabs;
+pub mod email;
 pub mod file_work;
 pub mod install;
 pub mod music_catalog;

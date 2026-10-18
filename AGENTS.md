@@ -7,7 +7,8 @@
 - Root/coordinating agent commits and pushes each meaningful verified increment. Subagents must not commit or push unless explicitly assigned.
 - Run formatting, clippy, and relevant tests before a commit. Never claim a live adapter is verified by a mock fixture alone.
 - All executable proposals, including LM/worker/retry proposals, pass policy and execution-time checks. A model cannot override policy or assert its own authorization.
-- Sensitive operations stop at `READY_FOR_REVIEW`: no send, purchase, final booking submission, or deletion capability. Verify the exact artifact revision before declaring it ready.
+- Sensitive operations stop at `READY_FOR_REVIEW`: no purchase, final booking submission, or deletion capability. Verify the exact artifact revision before declaring it ready.
+- Email is the only send capability. The model may only compose; the exact draft revision is read back to the user and sent once, only after the user's explicit confirmation, decided by fixed code and never by a model proposal.
 - Capture structured state, not screenshots. Unknown actor attribution remains unknown. Never mistake worker events for user intent.
 - The runner owns durable job state and revisions. Conflicting user writes pause jobs; ambiguous external outcomes require reconciliation rather than blind retries.
 - Keep secrets, raw private content, actual browsing histories, and model weights out of git and diagnostic output.

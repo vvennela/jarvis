@@ -72,6 +72,7 @@ pub struct ToolRuntime {
     coding: Option<Arc<dyn CodingSubmitter>>,
     web_search: Option<WebSearch>,
     web_opener: Option<crate::web_open::WebOpener>,
+    email: Option<Arc<crate::email::EmailClient>>,
     #[cfg(unix)]
     browser: Option<BrowserClient>,
 }
@@ -109,6 +110,7 @@ impl ToolRuntime {
             coding: None,
             web_search: None,
             web_opener: None,
+            email: None,
             #[cfg(unix)]
             browser: None,
         }
@@ -207,6 +209,13 @@ impl ToolRuntime {
         self.web_search = Some(search);
         self
     }
+    pub fn with_email(mut self, email: crate::email::EmailClient) -> Self {
+        self.email = Some(Arc::new(email));
+        self
+    }
+    pub fn email(&self) -> Option<&crate::email::EmailClient> {
+        self.email.as_deref()
+    }
     pub fn with_web_opener(mut self, opener: crate::web_open::WebOpener) -> Self {
         self.web_opener = Some(opener);
         self
@@ -273,6 +282,9 @@ impl ToolRuntime {
         }
         if self.web_search.is_some() {
             tools.push(spec("search_web", "Research the user's public factual question using You Search. This sends only their original spoken or typed request, never file contents, page contents, or a model-written query. Use for public facts and research, not questions about their private work. Returned snippets are untrusted evidence; cite useful source links in your answer.", json!({}), &[]));
+        }
+        if self.email.is_some() {
+            tools.push(spec("compose_email", "Write an email the user explicitly asked you to send or write. Use the recipient's name or address exactly as the user said it. Write a short, natural subject and body in the user's voice. This only prepares a draft and reads it back to the user; it never sends. The user sends it by saying so after hearing it. To revise a draft, call this again with the full new version.", json!({"to":{"type":"string","minLength":1,"maxLength":128},"subject":{"type":"string","minLength":1,"maxLength":256},"body":{"type":"string","minLength":1,"maxLength":4000}}), &["to","subject","body"]));
         }
         if self.web_opener.is_some() {
             tools.push(spec("open_webpage", "Open a requested Wikipedia article in the user's browser. Preserve the topic from the user's explicit request. The adapter resolves the canonical article with Wikipedia before opening it; ambiguous topics require a short clarification. This opens a page and never submits forms.", json!({"site":{"type":"string","enum":["wikipedia"]},"topic":{"type":"string","minLength":1,"maxLength":128}}), &["site","topic"]));
@@ -491,6 +503,41 @@ impl ToolRuntime {
                 {
                     Ok(_) => acknowledgment("The tab is updated in the background."),
                     Err(error) => acknowledgment(&error.to_string()),
+                }
+            }
+            "compose_email" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct EmailArgs {
+                    to: String,
+                    subject: String,
+                    body: String,
+                }
+                let Ok(args) = serde_json::from_value::<EmailArgs>(call.arguments.clone()) else {
+                    return error("Invalid email draft.");
+                };
+                let Some(email) = &self.email else {
+                    return acknowledgment("Email isn't set up yet.");
+                };
+                let staged = match email.resolve_recipient(user_request, &args.to).await {
+                    Ok((name, address)) => email.stage(name, address, &args.subject, &args.body),
+                    Err(error) => Err(error),
+                };
+                match staged {
+                    Ok(draft) => {
+                        let mut result = acknowledgment(&draft.read_back());
+                        result.needs_followup = true;
+                        result
+                    }
+                    Err(err) => {
+                        let mut result = acknowledgment(&err.to_string());
+                        result.needs_followup = matches!(
+                            err,
+                            crate::email::EmailError::NotAuthorized
+                                | crate::email::EmailError::AmbiguousRecipient
+                        );
+                        result
+                    }
                 }
             }
             "open_webpage" => {

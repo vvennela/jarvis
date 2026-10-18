@@ -159,6 +159,9 @@ impl ConversationWorker {
         if let Ok(opener) = jarvis::web_open::WebOpener::native() {
             tools = tools.with_web_opener(opener);
         }
+        if let Ok(email) = jarvis::email::EmailClient::native() {
+            tools = tools.with_email(email);
+        }
         #[cfg(unix)]
         if let Ok(browser) = jarvis::browser_tools::BrowserClient::native() {
             tools = tools.with_browser(browser);
