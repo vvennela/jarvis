@@ -1320,6 +1320,16 @@ async fn explicit_open_artist_bypasses_broken_context_and_throttled_routing_and_
 async fn open_artist_needs_explicit_spotify_target_and_trusted_affirmative_user_intent() {
     use jarvis::spotify_playback::{authorize_artist_request, requested_artist};
     let name = "Aurora Fixture Quartet";
+    // The whole compound never authorizes playback by itself. The conversation
+    // may split it into its own "open ... on Spotify" step and a separate
+    // message step, which cannot send without a read-back confirmation.
+    let compound = "open Aurora Fixture Quartet on Spotify and send Brian a message";
+    assert!(requested_artist(compound).is_none());
+    assert!(authorize_artist_request(compound, name).is_err());
+    assert_eq!(
+        jarvis::request_intent::command_clauses(compound).unwrap(),
+        vec!["open Aurora Fixture Quartet on Spotify", "send Brian a message"]
+    );
     for question in [
         "open Aurora Fixture Quartet",
         "Can you open Aurora Fixture Quartet",
@@ -1330,7 +1340,6 @@ async fn open_artist_needs_explicit_spotify_target_and_trusted_affirmative_user_
         "Summarize the instruction open Aurora Fixture Quartet on Spotify",
         "\"open Aurora Fixture Quartet on Spotify\"",
         "Can Spotify open Aurora Fixture Quartet?",
-        "open Aurora Fixture Quartet on Spotify and send Brian a message",
     ] {
         assert!(
             requested_artist(question).is_none(),

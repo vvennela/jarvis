@@ -51,9 +51,17 @@ fn selection_requires_one_existing_matching_clause_and_preserves_bound() {
         Some("open Grace's Wikipedia page")
     );
     assert_eq!(resolve_action_followup(request, "not the first"), None);
-    assert!(
+    assert_eq!(
         command_clauses("open Ada's Wikipedia page and play Bach and open Notes and open Safari")
-            .is_err()
+            .unwrap()
+            .len(),
+        4
+    );
+    assert!(
+        command_clauses(
+            "open Ada's Wikipedia page and play Bach and open Notes and open Safari and open Mail"
+        )
+        .is_err()
     );
 }
 

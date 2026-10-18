@@ -47,6 +47,14 @@ fn quoted_command(text: &str) -> bool {
         {
             return false;
         }
+        // An apostrophe between letters is a contraction ("I'm", "there's").
+        if matches!(c, '\'' | '’')
+            && index > 0
+            && chars[index - 1].is_alphabetic()
+            && chars.get(index + 1).is_some_and(|c| c.is_alphabetic())
+        {
+            return false;
+        }
         matches!(c, '\'' | '"' | '`' | '‘' | '’' | '“' | '”' | '«' | '»')
     })
 }
@@ -97,7 +105,47 @@ fn documentary(text: &str) -> bool {
     })
 }
 
-/// Separate at most three explicit actions, keeping borrowed original text.
+/// Verbs that may begin a later clause of a multi-step request.
+const CLAUSE_STARTS: &[&str] = &[
+    "open",
+    "launch",
+    "play",
+    "pause",
+    "draft",
+    "write",
+    "create",
+    "update",
+    "fix",
+    "build",
+    "implement",
+    "search",
+    "summarize",
+    "email",
+    "send",
+    "shoot",
+    "check",
+    "read",
+    "show",
+    "pull",
+    "bring",
+];
+/// Clauses whose text is content: it runs to the end of the request unless a
+/// comma clearly ends it ("email Brian that I'll open it and play the demo").
+const CONTENT_STARTS: &[&str] = &[
+    "draft",
+    "write",
+    "create",
+    "search",
+    "summarize",
+    "email",
+    "send",
+    "shoot",
+];
+/// Read-only clauses may contain conditions ("check my texts and tell me if
+/// anything is new") without making the request ambiguous.
+const READ_STARTS: &[&str] = &["check", "read"];
+
+/// Separate at most four explicit actions, keeping borrowed original text.
 /// Ordinary questions and ambiguous wording remain one untouched request, so
 /// callers can answer them normally and apply their existing whole-request gate.
 #[allow(clippy::result_unit_err)]
@@ -106,63 +154,75 @@ pub fn command_clauses(request: &str) -> Result<Vec<&str>, ()> {
         return Err(());
     }
     let lower = request.to_ascii_lowercase();
+    let whole = Ok(vec![request]);
     let body = imperative(lower.trim());
     if quoted_command(request)
         || request
             .chars()
             .any(|c| matches!(c, ';' | '|' | '&' | '$' | '<' | '>'))
         || lower.contains(" then ")
-        || restrictive(&lower)
-        || documentary(&lower)
-        || !ACTIONS.contains(&word(body))
-        || matches!(
-            word(body),
-            "search" | "summarize" | "draft" | "write" | "create"
-        )
+        || !CLAUSE_STARTS.contains(&word(body))
     {
-        return Ok(vec![request]);
+        return whole;
     }
-    let mut cuts = Vec::new();
-    // Only "and" describes independent actions here. "Then" stays intact
-    // above; this helper must not turn a dependency into parallel execution.
-    for (index, matched) in lower.match_indices(" and ") {
-        let next = index + matched.len();
-        if ACTIONS.contains(&word(lower[next..].trim_start())) {
-            cuts.push((index, next));
+    // Candidate boundaries: ", and verb", ", verb", or " and verb".
+    let mut cuts: Vec<(usize, usize, bool)> = Vec::new();
+    for (index, _) in lower.match_indices(' ') {
+        let before = &lower[..index];
+        let after = &lower[index..];
+        let (end, next, comma) = if let Some(rest) = after.strip_prefix(" and ") {
+            let comma = before.ends_with(',');
+            (
+                if comma { index - 1 } else { index },
+                lower.len() - rest.len(),
+                comma,
+            )
+        } else if before.ends_with(',') && !after.starts_with(" and ") {
+            (index - 1, index + 1, true)
+        } else {
+            continue;
+        };
+        if CLAUSE_STARTS.contains(&word(lower[next..].trim_start())) {
+            cuts.push((end, next, comma));
         }
     }
     cuts.sort_unstable();
-    // Content requests consume their remaining text. A later conjunction could
-    // belong to the text being summarized rather than to the user's commands.
-    if cuts
-        .iter()
-        .take(cuts.len().saturating_sub(1))
-        .any(|(_, next)| {
-            matches!(
-                word(lower[*next..].trim_start()),
-                "search" | "summarize" | "draft" | "write" | "create"
-            )
-        })
-    {
-        return Ok(vec![request]);
-    }
-    if cuts.len() > 2 {
-        return Err(());
-    }
+    cuts.dedup_by_key(|cut| cut.1);
     if cuts.is_empty() {
-        return Ok(vec![request]);
+        return whole;
     }
     let mut clauses = Vec::with_capacity(cuts.len() + 1);
     let mut start = 0;
-    for (end, next) in cuts {
+    let mut content = CONTENT_STARTS.contains(&word(body));
+    for (end, next, comma) in cuts {
+        if content && !comma {
+            // A bare "and verb" inside content is ambiguous: keep it whole.
+            return whole;
+        }
         let clause = request[start..end].trim().trim_end_matches(',').trim_end();
         if clause.is_empty() {
-            return Ok(vec![request]);
+            return whole;
         }
         clauses.push(clause);
         start = next;
+        content = CONTENT_STARTS.contains(&word(&lower[next..]));
     }
     clauses.push(request[start..].trim());
+    if clauses.len() > 4 {
+        return Err(());
+    }
+    // Conditions and described instructions in an action clause keep the
+    // request whole, as do any in a clause that is not content or a read.
+    for clause in &clauses {
+        let lower = clause.to_ascii_lowercase();
+        let verb = word(imperative(&lower));
+        if CONTENT_STARTS.contains(&verb) || READ_STARTS.contains(&verb) {
+            continue;
+        }
+        if restrictive(&lower) || documentary(&lower) {
+            return whole;
+        }
+    }
     Ok(clauses)
 }
 

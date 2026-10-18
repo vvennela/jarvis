@@ -246,7 +246,7 @@ async fn over_limit_compound_is_rejected_before_any_side_effect() {
     let peer = Peer::new(|_| app_call("Notes")).await;
     let mut conversation = peer.conversation(&dir, runtime(&dir, "printf 'verified:running\\n'"));
     let _ = conversation
-        .ask("Open Notes and open Calculator and open Safari and open Calendar")
+        .ask("Open Notes and open Calculator and open Safari and open Calendar and open Mail")
         .await;
     assert!(effects(&dir).is_empty());
 }

@@ -327,8 +327,7 @@ impl Conversation {
             Ok(clauses) => clauses,
             Err(_) => {
                 return Ok(Reply {
-                    text: "Let's do up to three things at a time. Which should I start with?"
-                        .into(),
+                    text: "Let's do up to four things at a time. Which should I start with?".into(),
                     needs_followup: true,
                     routing_degraded: false,
                 });
@@ -373,13 +372,13 @@ impl Conversation {
                     Some((clause, runtime.handle_resolved_intent(clause).await))
                 }
             };
-            let (first, second, third) = tokio::join!(run(0), run(1), run(2));
+            let (first, second, third, fourth) = tokio::join!(run(0), run(1), run(2), run(3));
             let mut text = Vec::new();
             let mut needs_followup = false;
             let mut pending = None;
             let mut confirmation = None;
             let mut confirmation_count = 0;
-            for (clause, result) in [first, second, third].into_iter().flatten() {
+            for (clause, result) in [first, second, third, fourth].into_iter().flatten() {
                 let Some(result) = result else {
                     text.push(format!(
                         "Sorry, I couldn't get \"{}\" done.",
@@ -450,12 +449,12 @@ impl Conversation {
                         Some((clause, result))
                     }
                 };
-                let (first, second, third) = tokio::join!(run(0), run(1), run(2));
+                let (first, second, third, fourth) = tokio::join!(run(0), run(1), run(2), run(3));
                 let mut text = Vec::new();
                 let mut needs_followup = false;
                 let mut confirmation = None;
                 let mut confirmation_count = 0;
-                for (clause, result) in [first, second, third].into_iter().flatten() {
+                for (clause, result) in [first, second, third, fourth].into_iter().flatten() {
                     match result {
                         Ok(reply) => {
                             if let Some(token) = reply.confirmation {
