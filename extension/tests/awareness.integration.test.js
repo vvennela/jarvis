@@ -44,6 +44,7 @@ async function background({ tabs = [tab()], approved = true, paused = false } = 
   const injections = [];
   const controls = [];
   const updates = [];
+  const windowUpdates = [];
   let updateTab = async (id, properties) => { Object.assign(tabMap.get(id), properties); return structuredClone(tabMap.get(id)); };
   const storage = {};
   let permission = approved;
@@ -76,12 +77,13 @@ async function background({ tabs = [tab()], approved = true, paused = false } = 
     scripting: { executeScript: async args => { injections.push(args); } },
     webNavigation: { getFrame: args => getFrame(args), onCommitted: new Event(), onHistoryStateUpdated: new Event() },
     alarms: { create() {}, clear: async () => true, onAlarm: new Event() },
+    windows: { update: async (id, properties) => { windowUpdates.push({id, properties:structuredClone(properties)}); return {id, focused:true}; } },
   };
   vm.runInNewContext(backgroundSource, { ...protocol, chrome, crypto: webcrypto, URL, TextEncoder,
     setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout, console });
   await tick();
   return {
-    chrome, ports, tabMap, injections, controls, storage, clock, updates,
+    chrome, ports, tabMap, injections, controls, storage, clock, updates, windowUpdates,
     updateTab(fn) { updateTab = fn; },
     permission(value) { permission = value; },
     permissionChecker(fn) { checkPermission = fn; },
@@ -486,4 +488,58 @@ test("a redirected URL or moved window after navigation is unknown rather than a
     assert.equal(request.result()?.status,"outcome_unknown",change);
     assert.equal(h.updates.length,1);
   }
+});
+
+async function focusFixture(options = {}) {
+  const h = await navigationFixture(options);
+  let sequence = 100;
+  return Object.assign(h, {
+    async focus(overrides = {}) {
+      const session = "a".repeat(64);
+      const id = (++sequence).toString(16).padStart(64,"0");
+      const args = {resource_id:`browser-live:${session}:1`,expected_document_id:"document-current",...overrides};
+      for (const key of Object.keys(args)) if (args[key] === undefined) delete args[key];
+      h.port.onMessage.emit({type:"browser.request",protocol_version:1,session_id:session,request_id:id,operation:"focus_tab",arguments:args});
+      await tick();
+      return { id, result: () => h.port.messages.find(m => m.type === "browser.result" && m.request_id === id) };
+    },
+  });
+}
+
+test("focus selects the exact tab and window and verifies the document is unchanged", async () => {
+  const h = await focusFixture();
+  const request = await h.focus();
+  assert.equal(request.result()?.status,"ok");
+  assert.equal(request.result().tabs[0].document_id,"document-current");
+  assert.deepEqual(h.updates,[{id:1,properties:{active:true}}]);
+  assert.equal(h.windowUpdates.length,1);
+  assert.deepEqual(h.windowUpdates[0].properties,{focused:true});
+});
+
+test("focus denies stale, private, unapproved and malformed targets before touching tabs", async () => {
+  for (const scenario of ["stale","private","unapproved","extra","url"]) {
+    const h = await focusFixture(scenario === "private" ? {tabs:[tab(1,{incognito:true})]} : {});
+    if (scenario === "unapproved") h.permission(false);
+    const override = scenario === "stale" ? {expected_document_id:"stale"}
+      : scenario === "extra" ? {url:"https://example.com/elsewhere"}
+      : scenario === "url" ? {expected_document_id:undefined} : {};
+    const request = await h.focus(override);
+    assert.notEqual(request.result()?.status,"ok",scenario);
+    assert.equal(h.updates.length,0,scenario);
+    assert.equal(h.windowUpdates.length,0,scenario);
+  }
+});
+
+test("a document change while focusing is reported as an unknown outcome, never ok", async () => {
+  const h = await focusFixture();
+  h.getFrame(async ({tabId}) => ({documentId:h.updates.length ? "document-other" : "document-current",url:h.tabMap.get(tabId).url}));
+  const request = await h.focus();
+  assert.equal(request.result()?.status,"outcome_unknown");
+});
+
+test("a tab that does not become active is not reported as focused", async () => {
+  const h = await focusFixture();
+  h.updateTab(async (id) => structuredClone(h.tabMap.get(id)));
+  const request = await h.focus();
+  assert.equal(request.result()?.status,"outcome_unknown");
 });

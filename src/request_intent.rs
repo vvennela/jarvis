@@ -128,6 +128,9 @@ const CLAUSE_STARTS: &[&str] = &[
     "show",
     "pull",
     "bring",
+    "switch",
+    "jump",
+    "focus",
 ];
 /// Clauses whose text is content: it runs to the end of the request unless a
 /// comma clearly ends it ("email Brian that I'll open it and play the demo").
@@ -379,9 +382,90 @@ pub fn wikipedia_page_intent(request: &str) -> Option<String> {
     None
 }
 
+/// A named tab to bring to the front ("switch to the Docs tab"), optionally
+/// followed by an explicit destination ("... and navigate it to https://...").
+pub fn tab_switch_intent(request: &str) -> Option<(String, Option<String>)> {
+    if request.len() > MAX_REQUEST || request.chars().any(char::is_control) || quoted(request) {
+        return None;
+    }
+    let text = request.trim().trim_end_matches(['.', '!', '?']);
+    let lower = text.to_ascii_lowercase();
+    let body = imperative(&lower);
+    let rest = [
+        "switch to ",
+        "switch over to ",
+        "go to ",
+        "go back to ",
+        "jump to ",
+        "flip to ",
+        "take me to ",
+        "show me ",
+        "bring up ",
+        "pull up ",
+        "open ",
+        "focus ",
+        "focus on ",
+    ]
+    .iter()
+    .find_map(|prefix| body.strip_prefix(prefix))?;
+    // "tab" must be its own word, and a page request is never a tab.
+    if rest.contains("wikipedia") || rest.contains(" page") || rest.contains(" article") {
+        return None;
+    }
+    let (named, destination) = rest
+        .match_indices(" tab")
+        .map(|(index, matched)| (&rest[..index], &rest[index + matched.len()..]))
+        .find(|(_, after)| after.is_empty() || after.starts_with(' '))?;
+    let destination = destination.trim();
+    let url = if destination.is_empty() {
+        None
+    } else {
+        let tail = [
+            "and navigate it to ",
+            "and navigate to ",
+            "and go to ",
+            "and take it to ",
+            "and open ",
+        ]
+        .iter()
+        .find_map(|prefix| destination.strip_prefix(prefix))?;
+        let start = lower.rfind(tail)?;
+        let original = &text[start..];
+        let parsed = reqwest::Url::parse(original).ok()?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || original.chars().any(char::is_whitespace)
+        {
+            return None;
+        }
+        Some(parsed.to_string())
+    };
+    let query = named
+        .strip_prefix("the ")
+        .or_else(|| named.strip_prefix("my "))
+        .unwrap_or(named)
+        .trim();
+    if query.len() < 3
+        || query.len() > 128
+        || restrictive(query)
+        || matches!(
+            query,
+            "this" | "that" | "current" | "active" | "any" | "new" | "next" | "last"
+        )
+    {
+        return None;
+    }
+    Some((query.to_owned(), url))
+}
+
 /// A named tab and explicit destination from human speech/text. Document text
 /// and implicit focus cannot supply either part of a navigation authorization.
 pub fn tab_navigation_intent(request: &str) -> Option<(String, String)> {
+    if let Some((query, Some(url))) = tab_switch_intent(request) {
+        return Some((query, url));
+    }
     if request.len() > MAX_REQUEST || request.chars().any(char::is_control) || quoted(request) {
         return None;
     }
@@ -554,7 +638,8 @@ pub fn resolve_action_followup(original: &str, answer: &str) -> Option<String> {
 
 /// One complete, deterministic action: a named page, song, or artist.
 pub fn resolved_action(clause: &str) -> bool {
-    wikipedia_page_intent(clause).is_some_and(|topic| !topic.is_empty())
+    tab_switch_intent(clause).is_some()
+        || wikipedia_page_intent(clause).is_some_and(|topic| !topic.is_empty())
         || crate::spotify_tracks::requested_track(clause).is_some()
         || crate::spotify_playback::requested_artist(clause).is_some()
 }
@@ -593,8 +678,7 @@ fn canonical_clause(clause: &str) -> String {
         let Some(filler) = ["hey", "hi", "okay", "ok", "so", "um", "uh", "and", "jarvis"]
             .iter()
             .find(|filler| {
-                lower.starts_with(*filler)
-                    && lower[filler.len()..].starts_with([' ', ','])
+                lower.starts_with(*filler) && lower[filler.len()..].starts_with([' ', ','])
             })
         else {
             break;

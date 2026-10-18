@@ -284,7 +284,7 @@ async function handleBrowserRequest(message, current) {
     catch { disconnect(); }
   };
   if (readLease !== null || paused) { send("unavailable"); return; }
-  if (!["search_tabs", "read_tab", "navigate_tab"].includes(message.operation)) { send("unavailable"); return; }
+  if (!["search_tabs", "read_tab", "navigate_tab", "focus_tab"].includes(message.operation)) { send("unavailable"); return; }
   const lease = message.request_id;
   readLease = lease;
   const expiry = setTimeout(() => {
@@ -327,6 +327,23 @@ async function handleBrowserRequest(message, current) {
     if (!await permitted(tab)) { send("permission_required"); return; }
     const before = await identity(tab);
     if (!before || before.document_id !== args.expected_document_id) { send("stale_document"); return; }
+    if (message.operation === "focus_tab") {
+      if (Object.keys(args).length !== 2
+          || !Object.keys(args).every(key => ["resource_id", "expected_document_id"].includes(key))) {
+        send("unavailable"); return;
+      }
+      mutationStarted = true;
+      // Selecting a tab never changes its document; verify that afterwards.
+      await chrome.tabs.update(tab.id, { active: true });
+      await chrome.windows.update(tab.windowId, { focused: true });
+      const currentTab = await chrome.tabs.get(tab.id);
+      const after = await identity(currentTab);
+      if (!stillValid()) { send("outcome_unknown"); return; }
+      if (!after || currentTab.active !== true || after.document_id !== before.document_id
+          || after.url !== before.url) { send("outcome_unknown"); return; }
+      send("ok", { tabs: [after] });
+      return;
+    }
     if (message.operation === "navigate_tab") {
       if (Object.keys(args).length !== 3
           || !Object.keys(args).every(key => ["resource_id", "expected_document_id", "url"].includes(key))) {

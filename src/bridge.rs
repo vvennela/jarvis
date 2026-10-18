@@ -527,6 +527,7 @@ pub fn run_live_session<R: Read + Send + 'static, W: Write>(
             Ok(LiveInput::Command(command)) => {
                 let expected_tab = match &command.request.request {
                     BrowserRequest::ReadTab { resource_id, .. }
+                    | BrowserRequest::FocusTab { resource_id, .. }
                     | BrowserRequest::NavigateTab { resource_id, .. } => {
                         discovered.get(resource_id).cloned()
                     }
@@ -539,6 +540,10 @@ pub fn run_live_session<R: Read + Send + 'static, W: Write>(
                             && !query.chars().any(char::is_control)
                     }
                     BrowserRequest::ReadTab {
+                        resource_id,
+                        expected_document_id,
+                    }
+                    | BrowserRequest::FocusTab {
                         resource_id,
                         expected_document_id,
                     } => discovered
@@ -689,6 +694,20 @@ pub fn run_live_session<R: Read + Send + 'static, W: Write>(
                                 };
                                 event.validate_owned(true)?;
                                 report.resources_changed += apply_event(store, &event, now)?;
+                            }
+                            BrowserRequest::FocusTab { .. } => {
+                                let expected = expected_tab
+                                    .as_ref()
+                                    .ok_or(BridgeError::InvalidObservation)?;
+                                if response.page.is_some()
+                                    || response.tabs.len() != 1
+                                    || !crate::browser_tools::valid_focus_result(
+                                        expected,
+                                        &response.tabs[0],
+                                    )
+                                {
+                                    return Err(BridgeError::InvalidObservation);
+                                }
                             }
                             BrowserRequest::ReadTab {
                                 resource_id,

@@ -72,6 +72,11 @@ pub enum BrowserRequest {
         resource_id: String,
         expected_document_id: String,
     },
+    #[serde(rename = "focus_tab")]
+    FocusTab {
+        resource_id: String,
+        expected_document_id: String,
+    },
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -161,6 +166,36 @@ impl BrowserClient {
             return Err(BrowserError::OutcomeUnknown);
         }
         discovered.insert(tab.resource_id.clone(), tab.clone());
+        Ok(tab)
+    }
+    /// Bring a previously discovered exact document to the front: select its
+    /// tab and focus its window. The document itself is unchanged.
+    pub async fn focus_tab(
+        &self,
+        resource_id: &str,
+        expected_document_id: &str,
+    ) -> Result<BrowserTab, BrowserError> {
+        let expected = self
+            .discovered_tab(resource_id)
+            .filter(|tab| tab.document_id == expected_document_id)
+            .ok_or(BrowserError::InvalidInput)?;
+        let response = self
+            .request(BrowserRequest::FocusTab {
+                resource_id: resource_id.to_owned(),
+                expected_document_id: expected_document_id.to_owned(),
+            })
+            .await?;
+        if response.page.is_some() || response.tabs.len() != 1 {
+            return Err(BrowserError::OutcomeUnknown);
+        }
+        let tab = response
+            .tabs
+            .into_iter()
+            .next()
+            .ok_or(BrowserError::OutcomeUnknown)?;
+        if !valid_focus_result(&expected, &tab) {
+            return Err(BrowserError::OutcomeUnknown);
+        }
         Ok(tab)
     }
     pub async fn search_tabs(&self, query: &str) -> Result<Vec<BrowserTab>, BrowserError> {
@@ -337,6 +372,14 @@ pub(crate) fn valid_navigation_result(
         && actual.window_id == expected.window_id
         && actual.document_id != expected.document_id
         && actual.url == url
+}
+/// Focusing must report the same tab and the same, unchanged document.
+pub(crate) fn valid_focus_result(expected: &BrowserTab, actual: &BrowserTab) -> bool {
+    valid_tab(actual)
+        && actual.resource_id == expected.resource_id
+        && actual.tab_id == expected.tab_id
+        && actual.document_id == expected.document_id
+        && actual.url == expected.url
 }
 pub(crate) fn valid_tab(tab: &BrowserTab) -> bool {
     if !(0..=i32::MAX as i64).contains(&tab.tab_id)
