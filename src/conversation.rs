@@ -127,6 +127,8 @@ pub struct Conversation {
     pending_music_confirmation: Option<(MusicConfirmation, Instant)>,
     /// Revision of the email draft read back by the previous reply.
     email_awaiting: Option<u64>,
+    /// When the current request began, for end-to-end route timing.
+    turn_started: Instant,
 }
 
 impl Conversation {
@@ -156,6 +158,7 @@ impl Conversation {
             pending_clarification: None,
             pending_music_confirmation: None,
             email_awaiting: None,
+            turn_started: Instant::now(),
         }
     }
 
@@ -280,6 +283,7 @@ impl Conversation {
     }
 
     async fn ask_inner(&mut self, question: &str) -> Result<Reply, ConversationError> {
+        self.turn_started = Instant::now();
         if question.trim().is_empty()
             || question.len() > MAX_QUESTION_BYTES
             || question.contains('\0')
@@ -366,6 +370,30 @@ impl Conversation {
                 .or(deferred);
             self.remember(question, &reply.text);
             return Ok(reply);
+        }
+        // A learned skill reuses a verified past plan without any model call.
+        // The runtime still authorizes it against this request; a skill that
+        // fails before acting falls back to the model and is demoted.
+        if clauses.len() == 1
+            && let Some(runtime) = self.tool_runtime.clone()
+            && let Some(experience) = runtime.experience()
+            && let Some(skill) = experience.match_request(effective_question)
+        {
+            let result = runtime.execute(effective_question, &skill.call).await;
+            experience.report(&skill.key, result.verified, self.turn_started.elapsed());
+            if result.verified || result.attempted {
+                let text = result
+                    .acknowledgment
+                    .unwrap_or_else(|| "I couldn't confirm that action completed.".into());
+                self.pending_clarification = deferred;
+                self.pending_music_confirmation = None;
+                self.remember(question, &text);
+                return Ok(Reply {
+                    text,
+                    needs_followup: false,
+                    routing_degraded: false,
+                });
+            }
         }
         // Every clause is a complete page/song/artist action: run them in
         // parallel now, without waiting for routing or indexed context.
@@ -594,6 +622,15 @@ impl Conversation {
                     // observed result is immediately committed as the reply.
                     if has_action {
                         let result = runtime.execute(question, &calls[0]).await;
+                        if result.verified
+                            && let Some(experience) = runtime.experience()
+                        {
+                            experience.record_model_turn(
+                                question,
+                                Some(&calls[0]),
+                                self.turn_started.elapsed(),
+                            );
+                        }
                         // A rejected proposal with no side effect may be
                         // corrected. Completed/attempted actions return an
                         // acknowledgment and never enter this retry path.

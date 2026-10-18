@@ -24,8 +24,8 @@ Rust gives explicit ownership and bounded lifetimes, but it does not automatical
 | Browser metadata | URL 8,192 bytes; title 2,048; IDs 128 | Validate before any evidence write |
 | Extension buffers | 32 queued tabs; 256 cached tab/document entries | Latest-state coalescing and bounded eviction |
 | Local `.env` | 16 KiB | Reject oversized or invalid UTF-8 configuration |
-| Compound requests | At most 3 parallel clause-specific tool loops; 8 KiB original request | Each clause keeps its own user authority; acknowledgments retain order; “then” stays intact |
-| Typed tool protocol | At most 16 registered schemas; 4 calls per model response; 4 tool rounds per clause | Validate every proposal; stop when the bounded loop is exhausted |
+| Compound requests | At most 4 parallel clause-specific tool loops; 8 KiB original request | Each clause keeps its own user authority; acknowledgments retain order; “then” stays intact |
+| Typed tool protocol | At most 24 registered schemas; 4 calls per model response; 4 tool rounds per clause | Validate every proposal; stop when the bounded loop is exhausted |
 | Wikipedia open | 256 KiB API response; 10-second production whole-operation deadline | Canonical topic resolution and native `/usr/bin/open` share the deadline; dropping the future kills the owned opener; no browser DOM success claim |
 | Conversation history | 8 turns, 24 KiB; 4 KiB per stored reply | Drop oldest turns to fit bounded provider packet |
 | Local Whisper | Model file at most 256 MiB; 4 CPU threads | Load model once per voice worker; reuse native state |

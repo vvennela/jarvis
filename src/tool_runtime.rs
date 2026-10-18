@@ -75,6 +75,7 @@ pub struct ToolRuntime {
     email: Option<Arc<crate::email::EmailClient>>,
     messages: Option<Arc<crate::messages::MessagesReader>>,
     preferences: Option<Arc<crate::preferences::PreferenceStore>>,
+    experience: Option<Arc<crate::experience::ExperienceStore>>,
     #[cfg(unix)]
     browser: Option<BrowserClient>,
 }
@@ -86,6 +87,12 @@ pub struct ToolResult {
     /// Only a validated ask_user proposal requests a bounded voice answer.
     pub needs_followup: bool,
     pub confirmation: Option<MusicConfirmation>,
+    /// The adapter observed the requested outcome (page open, playback,
+    /// running app, focused tab). Only verified outcomes teach skills.
+    pub verified: bool,
+    /// The adapter began an external side effect. An unverified attempted
+    /// result is never retried through another route.
+    pub attempted: bool,
 }
 
 /// A bounded target from the user's own request, awaiting their explicit answer.
@@ -115,6 +122,7 @@ impl ToolRuntime {
             email: None,
             messages: None,
             preferences: None,
+            experience: None,
             #[cfg(unix)]
             browser: None,
         }
@@ -216,6 +224,13 @@ impl ToolRuntime {
     pub fn with_email(mut self, email: crate::email::EmailClient) -> Self {
         self.email = Some(Arc::new(email));
         self
+    }
+    pub fn with_experience(mut self, store: crate::experience::ExperienceStore) -> Self {
+        self.experience = Some(Arc::new(store));
+        self
+    }
+    pub fn experience(&self) -> Option<&crate::experience::ExperienceStore> {
+        self.experience.as_deref()
     }
     pub fn with_preferences(mut self, store: crate::preferences::PreferenceStore) -> Self {
         self.preferences = Some(Arc::new(store));
@@ -470,11 +485,15 @@ impl ToolRuntime {
             .play_authorized_track(request, intent, title, artist)
             .await
         {
-            Ok(text) => acknowledgment(&text),
+            Ok(text) => verified(&text),
             Err(crate::spotify_tracks::TrackError::NotFound) => {
                 acknowledgment(&format!("I couldn't find {title} by {artist} on Spotify."))
             }
-            Err(error) => acknowledgment(&error.to_string()),
+            Err(error) => {
+                let mut result = acknowledgment(&error.to_string());
+                result.attempted = true;
+                result
+            }
         }
     }
 
@@ -498,11 +517,14 @@ impl ToolRuntime {
                 .map_err(|e| e.to_string())
         })
         .await;
-        match result {
-            Ok(Ok(played)) => acknowledgment(&played.text),
+        let mut result = match result {
+            Ok(Ok(played)) => verified(&played.text),
             Ok(Err(message)) => acknowledgment(&message),
             Err(_) => acknowledgment("That took too long. I couldn't confirm your music started."),
-        }
+        };
+        // Lookup and playback share one deadline; treat any outcome as attempted.
+        result.attempted = true;
+        result
     }
 
     /// Clear, approved app commands need neither a model nor provider keys.
@@ -552,7 +574,7 @@ impl ToolRuntime {
                     .focus_tab(&args.resource_id, &args.expected_document_id)
                     .await
                 {
-                    Ok(tab) => acknowledgment(&format!("Switched to {}.", tab.title)),
+                    Ok(tab) => verified(&format!("Switched to {}.", tab.title)),
                     Err(error) => acknowledgment(&error.to_string()),
                 }
             }
@@ -602,7 +624,7 @@ impl ToolRuntime {
                     .navigate_tab(&args.resource_id, &args.expected_document_id, &destination)
                     .await
                 {
-                    Ok(_) => acknowledgment("The tab is updated in the background."),
+                    Ok(_) => verified("The tab is updated in the background."),
                     Err(error) => acknowledgment(&error.to_string()),
                 }
             }
@@ -722,7 +744,7 @@ impl ToolRuntime {
                     return acknowledgment("The browser opener isn't connected yet.");
                 };
                 match opener.open(user_request, &args.site, &args.topic).await {
-                    Ok(page) => acknowledgment(&format!("Opened {} on Wikipedia.", page.title)),
+                    Ok(page) => verified(&format!("Opened {} on Wikipedia.", page.title)),
                     Err(err) => {
                         let mut result = acknowledgment(&err.to_string());
                         result.needs_followup = matches!(
@@ -851,7 +873,7 @@ impl ToolRuntime {
                     return acknowledgment("I can't open apps from here just yet.");
                 };
                 match apps.open_application(user_request, &args.app).await {
-                    Ok(result) => acknowledgment(&result.text),
+                    Ok(result) => verified(&result.text),
                     Err(err) => acknowledgment(&err.to_string()),
                 }
             }
@@ -868,7 +890,7 @@ impl ToolRuntime {
                     return acknowledgment("Spotify isn't connected to this window yet.");
                 };
                 match actions.execute(user_request, action).await {
-                    Ok(result) => acknowledgment(&result.text),
+                    Ok(result) => verified(&result.text),
                     Err(err) => acknowledgment(&crate::actions::friendly_error(user_request, &err)),
                 }
             }
@@ -1123,7 +1145,14 @@ fn data(value: Value) -> ToolResult {
         acknowledgment: None,
         needs_followup: false,
         confirmation: None,
+        verified: false,
+        attempted: false,
     }
+}
+fn verified(message: &str) -> ToolResult {
+    let mut result = acknowledgment(message);
+    result.verified = true;
+    result
 }
 fn error(message: &str) -> ToolResult {
     data(json!({"error":message}))
@@ -1134,6 +1163,8 @@ fn acknowledgment(message: &str) -> ToolResult {
         acknowledgment: Some(message.into()),
         needs_followup: false,
         confirmation: None,
+        verified: false,
+        attempted: false,
     }
 }
 

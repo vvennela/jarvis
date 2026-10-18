@@ -168,6 +168,9 @@ impl ConversationWorker {
         tools = tools.with_preferences(jarvis::preferences::PreferenceStore::new(
             database.with_file_name("preferences.json"),
         ));
+        tools = tools.with_experience(jarvis::experience::ExperienceStore::new(
+            database.with_file_name("experience.json"),
+        ));
         #[cfg(unix)]
         if let Ok(browser) = jarvis::browser_tools::BrowserClient::native() {
             tools = tools.with_browser(browser);

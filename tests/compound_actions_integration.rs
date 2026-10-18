@@ -493,8 +493,18 @@ async fn fully_configured_registry_fits_provider_wire_limit_without_dropping_too
         .with_browser(
             jarvis::browser_tools::BrowserClient::new("/tmp/jarvis-registry-fixture.sock".into())
                 .unwrap(),
-        );
-    assert_eq!(runtime.specs().len(), 14);
+        )
+        // Everything the native panel registers: email, texts, preferences.
+        .with_email(jarvis::email::EmailClient::native().unwrap())
+        .with_messages(jarvis::messages::MessagesReader::with_paths(
+            dir.join("no-chat.db"),
+            vec![],
+        ))
+        .with_preferences(jarvis::preferences::PreferenceStore::new(
+            dir.join("preferences.json"),
+        ));
+    assert_eq!(runtime.specs().len(), 19);
+    assert!(runtime.specs().len() <= jarvis::providers::MAX_TOOL_SPECS);
     let mut conversation = peer.conversation(&dir, runtime);
     assert_eq!(
         conversation.ask("Hello").await.unwrap().text,
@@ -503,14 +513,18 @@ async fn fully_configured_registry_fits_provider_wire_limit_without_dropping_too
     let requests = peer.requests();
     assert_eq!(requests.len(), 1);
     let specs = requests[0]["tools"].as_array().unwrap();
-    assert_eq!(specs.len(), 14);
+    assert_eq!(specs.len(), 19, "a registered tool was dropped on the wire");
     let names: std::collections::HashSet<_> = specs
         .iter()
         .map(|s| s["function"]["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), 14);
+    assert_eq!(names.len(), 19);
     assert!(
-        names.contains("open_webpage")
+        names.contains("compose_email")
+            && names.contains("check_messages")
+            && names.contains("remember_preference")
+            && names.contains("browser_switch_tab")
+            && names.contains("open_webpage")
             && names.contains("delegate_coding")
             && names.contains("browser_read_tab")
             && names.contains("search_web")

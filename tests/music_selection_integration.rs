@@ -1328,7 +1328,10 @@ async fn open_artist_needs_explicit_spotify_target_and_trusted_affirmative_user_
     assert!(authorize_artist_request(compound, name).is_err());
     assert_eq!(
         jarvis::request_intent::command_clauses(compound).unwrap(),
-        vec!["open Aurora Fixture Quartet on Spotify", "send Brian a message"]
+        vec![
+            "open Aurora Fixture Quartet on Spotify",
+            "send Brian a message"
+        ]
     );
     for question in [
         "open Aurora Fixture Quartet",
@@ -1709,4 +1712,90 @@ async fn artist_confirmation_executes_once_and_rejections_clear_the_bound_target
         );
         assert_eq!(dir.join("args").exists(), answer == "yes please");
     }
+}
+
+/// Version N+1: verified model-routed music requests teach a template that
+/// later requests reuse without the model, across restarts, while Jev and the
+/// playback readback still decide every execution.
+#[tokio::test]
+async fn learned_skill_skips_the_model_after_two_verified_successes() {
+    use jarvis::experience::ExperienceStore;
+    let memory = TempDir::new();
+    let experience_path = memory.join("experience.json");
+    let turn = |name: &'static str, model_plans: Vec<Plan>, verdict: Plan| {
+        let experience_path = experience_path.clone();
+        async move {
+            let dir = TempDir::new();
+            let model = Peer::new(model_plans).await;
+            let routing = Peer::new(vec![verdict]).await;
+            let catalog_peer = Peer::new(vec![
+                search(&[&format!("https://open.spotify.com/artist/{FIRST_ID}")]),
+                oembed(name),
+            ])
+            .await;
+            let runtime = ToolRuntime::read_only(dir.join("context.db"))
+                .with_music(
+                    catalog(&catalog_peer, Duration::from_secs(2)),
+                    SpotifyPlayback::with_executable(
+                        executable(&dir, &observed(name).to_string()),
+                        Duration::from_secs(2),
+                    )
+                    .unwrap(),
+                )
+                .with_music_intent(music_router(&routing, Duration::from_secs(2)))
+                .with_experience(ExperienceStore::new(experience_path));
+            // A fresh conversation per turn: learning survives restarts.
+            let mut conversation = intent_conversation(&dir, &model, runtime);
+            let reply = conversation
+                .ask(&format!("I wanna hear some {name}"))
+                .await
+                .unwrap();
+            let played = dir.join("args").exists();
+            (reply, model.requests().len(), played)
+        }
+    };
+    for name in ["Taylor Swift", "Metallica"] {
+        let (reply, model_calls, played) = turn(
+            name,
+            vec![proposed_artist(name)],
+            music_verdict("play_artist", 0.99),
+        )
+        .await;
+        assert_eq!(model_calls, 1, "{}", reply.text);
+        assert!(played, "{}", reply.text);
+    }
+    let store = ExperienceStore::new(experience_path.clone());
+    let skills = store.skills();
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0].template, "i wanna hear some {artist}");
+    assert!(skills[0].active());
+
+    // Run 3: a new artist, no model call, still Jev-authorized and verified.
+    let (reply, model_calls, played) = turn(
+        "Aurora Fixture Quartet",
+        vec![],
+        music_verdict("play_artist", 0.99),
+    )
+    .await;
+    assert_eq!(model_calls, 0, "learned skill still called the model");
+    assert!(played);
+    assert!(
+        reply.text.contains("Aurora Fixture Quartet"),
+        "{}",
+        reply.text
+    );
+    let stats = store.stats();
+    assert_eq!((stats.model_routed, stats.skill_hits), (2, 1));
+
+    // A look-alike that is not a music request: Jev denies, nothing plays,
+    // the model answers instead, and the skill records the failure.
+    let (reply, model_calls, played) = turn(
+        "news about the election",
+        vec![Plan::json(json!({"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"Here's the latest I know."}}]}))],
+        music_verdict("deny", 0.99),
+    )
+    .await;
+    assert!(!played, "{}", reply.text);
+    assert_eq!(model_calls, 1);
+    assert_eq!(store.stats().skill_failures, 1);
 }

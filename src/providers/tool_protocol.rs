@@ -10,7 +10,7 @@ use std::{
     io::{self, Write},
 };
 
-pub const MAX_TOOL_SPECS: usize = 16;
+pub const MAX_TOOL_SPECS: usize = 24;
 pub const MAX_TOOL_CALLS: usize = 4;
 pub const MAX_TOOL_ARGUMENT_BYTES: usize = 8192;
 
