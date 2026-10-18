@@ -320,7 +320,22 @@ pub fn wikipedia_page_intent(request: &str) -> Option<String> {
         };
         body = rest;
     }
-    let rest = body.strip_prefix("open ")?;
+    let rest = [
+        "open up ",
+        "open ",
+        "pull up ",
+        "bring up ",
+        "show me ",
+        "look up ",
+        "go to ",
+        "take me to ",
+        "load up ",
+        "load ",
+        "find me ",
+        "get me ",
+    ]
+    .iter()
+    .find_map(|verb| body.strip_prefix(verb))?;
     let rest = rest
         .strip_prefix("the ")
         .or_else(|| rest.strip_prefix("a "))

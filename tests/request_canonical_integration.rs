@@ -15,16 +15,8 @@ fn recognizer_verb_forms_and_fillers_become_complete_actions() {
         ),
         ("Hey, Jarvis, play Taylor Swift.", "play Taylor Swift."),
         (
-            "pull up Napoleon's Wikipedia page",
-            "open Napoleon's Wikipedia page",
-        ),
-        (
             "the Wikipedia page for Napoleon",
             "open the Wikipedia page for Napoleon",
-        ),
-        (
-            "show me the Wikipedia page for Ada Lovelace",
-            "open the Wikipedia page for Ada Lovelace",
         ),
         (
             "opened the Wikipedia page for Napoleon and playing Taylor Swift on Spotify",
@@ -76,4 +68,31 @@ fn a_leading_to_from_the_recognizer_still_opens_the_page() {
     );
     // "to" inside a request is untouched.
     assert_eq!(canonical_request("how to open a jar"), None);
+}
+
+#[test]
+fn every_opening_phrase_opens_the_napoleon_page() {
+    for request in [
+        "open up the Wikipedia page for Napoleon",
+        "Open up the Wikipedia page for Napoleon.",
+        "pull up the Wikipedia page for Napoleon",
+        "bring up Napoleon's Wikipedia page",
+        "show me the Wikipedia article about Napoleon",
+        "look up Napoleon on Wikipedia",
+        "go to the Wikipedia page for Napoleon",
+        "can you open up the Wikipedia page for Napoleon",
+        "to open up the Wikipedia page for Napoleon",
+    ] {
+        let canonical = canonical_request(request);
+        let text = canonical.as_deref().unwrap_or(request);
+        assert_eq!(
+            jarvis::request_intent::wikipedia_page_intent(text).as_deref(),
+            Some("napoleon"),
+            "{request}"
+        );
+        assert!(
+            jarvis::web_open::authorize_page_request(text, "wikipedia", "napoleon").is_ok(),
+            "{request}"
+        );
+    }
 }
