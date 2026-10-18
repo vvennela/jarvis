@@ -21,6 +21,7 @@ pub mod install;
 pub mod messages;
 pub mod music_catalog;
 mod music_intent;
+pub mod preferences;
 pub mod providers;
 pub mod request_intent;
 pub mod spotify_playback;

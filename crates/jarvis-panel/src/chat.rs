@@ -165,6 +165,9 @@ impl ConversationWorker {
         if let Some(messages) = jarvis::messages::MessagesReader::native() {
             tools = tools.with_messages(messages);
         }
+        tools = tools.with_preferences(jarvis::preferences::PreferenceStore::new(
+            database.with_file_name("preferences.json"),
+        ));
         #[cfg(unix)]
         if let Ok(browser) = jarvis::browser_tools::BrowserClient::native() {
             tools = tools.with_browser(browser);
