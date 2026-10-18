@@ -745,7 +745,9 @@ impl WakeWorker {
                                         None
                                     }
                                 }
-                                None => detector.ingest_with_activity(&samples, activity.as_deref()),
+                                None => {
+                                    detector.ingest_with_activity(&samples, activity.as_deref())
+                                }
                             }
                         } else {
                             detector.ingest_with_activity(&samples, activity.as_deref())

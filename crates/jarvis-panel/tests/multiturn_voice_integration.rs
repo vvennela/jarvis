@@ -463,7 +463,10 @@ fn hey_jarvis_right_after_a_question_still_answers_it() {
     rig.wake.control.cancel_followup();
     rig.pump(Duration::from_millis(100));
     let reply = rig.exchange("Jarvis Kanye");
-    assert!(rig.played().contains("Kanye"), "recent question was lost: {reply}");
+    assert!(
+        rig.played().contains("Kanye"),
+        "recent question was lost: {reply}"
+    );
     assert_eq!(rig.model.count(), 0);
 }
 
