@@ -128,6 +128,8 @@ const CLAUSE_STARTS: &[&str] = &[
     "show",
     "pull",
     "bring",
+    "visit",
+    "look",
     "switch",
     "jump",
     "focus",
@@ -515,6 +517,148 @@ pub fn tab_navigation_intent(request: &str) -> Option<(String, String)> {
     Some((query.to_owned(), url.to_string()))
 }
 
+/// "Play some music", "put something on", "I want to listen to music": a
+/// music request with no artist, song or playlist named.
+pub fn generic_music_request(request: &str) -> bool {
+    if request.len() > 200 || request.chars().any(char::is_control) || quoted(request) {
+        return false;
+    }
+    let lower = request
+        .trim()
+        .trim_end_matches(['.', '!', '?'])
+        .to_lowercase();
+    if restrictive(&lower) {
+        return false;
+    }
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.len() > 10 {
+        return false;
+    }
+    let verb = words.iter().any(|w| {
+        matches!(
+            *w,
+            "play" | "listen" | "hear" | "put" | "throw" | "queue" | "start"
+        )
+    });
+    let generic = words.iter().any(|w| {
+        matches!(
+            *w,
+            "music" | "song" | "songs" | "something" | "tunes" | "anything" | "jams" | "track"
+        )
+    });
+    // Every other word must be filler, so a named target is never ignored.
+    let rest_is_filler = words.iter().all(|w| {
+        matches!(
+            *w,
+            "play"
+                | "listen"
+                | "hear"
+                | "put"
+                | "throw"
+                | "queue"
+                | "start"
+                | "music"
+                | "song"
+                | "songs"
+                | "something"
+                | "tunes"
+                | "anything"
+                | "jams"
+                | "track"
+                | "some"
+                | "a"
+                | "an"
+                | "to"
+                | "on"
+                | "me"
+                | "i"
+                | "want"
+                | "wanna"
+                | "would"
+                | "like"
+                | "i'd"
+                | "can"
+                | "could"
+                | "you"
+                | "please"
+                | "jarvis"
+                | "hey"
+                | "spotify"
+                | "up"
+                | "good"
+                | "let's"
+                | "lets"
+                | "us"
+                | "for"
+                | "the"
+        )
+    });
+    verb && generic && rest_is_filler
+}
+
+/// A spoken name answer with conversational padding removed.
+fn answer_name(answer: &str) -> Option<String> {
+    let mut text = answer
+        .replace(',', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_end_matches(['.', '!', '?'])
+        .trim()
+        .to_owned();
+    for _ in 0..3 {
+        let lower = text.to_lowercase();
+        let Some(prefix) = [
+            "um ",
+            "uh ",
+            "uhh ",
+            "hmm ",
+            "oh ",
+            "how about ",
+            "what about ",
+            "let's do ",
+            "lets do ",
+            "let's go with ",
+            "go with ",
+            "maybe ",
+            "i'd say ",
+            "i guess ",
+            "play ",
+            "put on ",
+            "some ",
+            "definitely ",
+            "probably ",
+        ]
+        .iter()
+        .find(|prefix| lower.starts_with(*prefix)) else {
+            break;
+        };
+        text = text[prefix.len()..]
+            .trim_start_matches([' ', ','])
+            .to_owned();
+    }
+    for _ in 0..2 {
+        let lower = text.to_lowercase();
+        let Some(suffix) = [
+            " please",
+            " i guess",
+            " thanks",
+            " thank you",
+            " on spotify",
+        ]
+        .iter()
+        .find(|suffix| lower.ends_with(*suffix)) else {
+            break;
+        };
+        text.truncate(text.len() - suffix.len());
+        text = text.trim_end_matches([' ', ',']).to_owned();
+    }
+    plain_name(&text).map(str::to_owned)
+}
+
 /// Fill only a supported explicit user-request slot. A model's question cannot
 /// turn a summary or general conversation into permission to perform an action.
 pub fn resolve_action_followup(original: &str, answer: &str) -> Option<String> {
@@ -610,6 +754,9 @@ pub fn resolve_action_followup(original: &str, answer: &str) -> Option<String> {
         .then(|| format!("play {} by {} on Spotify", track.title, track.artist));
     }
     let body = imperative(&lower);
+    if generic_music_request(original) {
+        return answer_name(answer).map(|name| format!("play {name} on Spotify"));
+    }
     let answer = plain_name(answer)?;
     if let Some(topic) = wikipedia_page_intent(original) {
         let named = answer.to_lowercase();
@@ -639,6 +786,7 @@ pub fn resolve_action_followup(original: &str, answer: &str) -> Option<String> {
 /// One complete, deterministic action: a named page, song, or artist.
 pub fn resolved_action(clause: &str) -> bool {
     tab_switch_intent(clause).is_some()
+        || crate::web_visit::website_intent(clause).is_some()
         || wikipedia_page_intent(clause).is_some_and(|topic| !topic.is_empty())
         || crate::spotify_tracks::requested_track(clause).is_some()
         || crate::spotify_playback::requested_artist(clause).is_some()

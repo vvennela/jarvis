@@ -198,6 +198,7 @@ impl Conversation {
     pub fn clear(&mut self) {
         self.history.clear();
         self.history_bytes = 0;
+        self.email_awaiting = None;
         self.clear_pending_clarification();
     }
 

@@ -413,21 +413,50 @@ fn authorized_open_intent(request: &str, approved_name: &str) -> Result<bool, Ap
     let request = request.strip_prefix("please ").unwrap_or(request);
     let request = request.strip_suffix(" please").unwrap_or(request);
     let request = request.strip_suffix(" for me").unwrap_or(request);
-    let (target, show) = if let Some(target) = request
-        .strip_prefix("show ")
-        .or_else(|| request.strip_prefix("bring up "))
-    {
+    let request = [
+        "can you ",
+        "could you ",
+        "would you ",
+        "will you ",
+        "go ahead and ",
+    ]
+    .iter()
+    .find_map(|prefix| request.strip_prefix(prefix))
+    .unwrap_or(request);
+    // Bringing an app forward vs. launching it; both are explicit opens.
+    let shown = [
+        "show me ",
+        "show ",
+        "bring up ",
+        "pull up ",
+        "switch to ",
+        "go to ",
+    ]
+    .iter()
+    .find_map(|prefix| request.strip_prefix(prefix));
+    let (target, show) = if let Some(target) = shown {
         (target, true)
     } else {
         (
-            request
-                .strip_prefix("open ")
-                .or_else(|| request.strip_prefix("launch "))
-                .or_else(|| request.strip_prefix("start "))
-                .ok_or(AppError::Clarification)?,
+            [
+                "open up ",
+                "open ",
+                "launch ",
+                "start up ",
+                "start ",
+                "fire up ",
+                "boot up ",
+                "load up ",
+                "get ",
+                "run ",
+            ]
+            .iter()
+            .find_map(|prefix| request.strip_prefix(prefix))
+            .ok_or(AppError::Clarification)?,
             false,
         )
     };
+    let target = target.strip_suffix(" up").unwrap_or(target);
     let target = target.strip_prefix("the ").unwrap_or(target);
     let target = target
         .strip_suffix(" application")

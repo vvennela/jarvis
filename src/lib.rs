@@ -31,6 +31,7 @@ pub mod task_journal;
 pub mod tool_runtime;
 pub mod web_open;
 pub mod web_search;
+pub mod web_visit;
 
 pub const MAX_REVIEW_BYTES: usize = 64 * 1024;
 pub const MAX_ANSWER_BYTES: usize = 8192;

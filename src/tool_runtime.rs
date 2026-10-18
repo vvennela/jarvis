@@ -76,6 +76,7 @@ pub struct ToolRuntime {
     messages: Option<Arc<crate::messages::MessagesReader>>,
     preferences: Option<Arc<crate::preferences::PreferenceStore>>,
     experience: Option<Arc<crate::experience::ExperienceStore>>,
+    web_visitor: Option<Arc<crate::web_visit::WebVisitor>>,
     #[cfg(unix)]
     browser: Option<BrowserClient>,
 }
@@ -123,6 +124,7 @@ impl ToolRuntime {
             messages: None,
             preferences: None,
             experience: None,
+            web_visitor: None,
             #[cfg(unix)]
             browser: None,
         }
@@ -225,6 +227,10 @@ impl ToolRuntime {
         self.email = Some(Arc::new(email));
         self
     }
+    pub fn with_web_visitor(mut self, visitor: crate::web_visit::WebVisitor) -> Self {
+        self.web_visitor = Some(Arc::new(visitor));
+        self
+    }
     pub fn with_experience(mut self, store: crate::experience::ExperienceStore) -> Self {
         self.experience = Some(Arc::new(store));
         self
@@ -323,6 +329,9 @@ impl ToolRuntime {
         if self.email.is_some() {
             tools.push(spec("compose_email", "Write an email the user explicitly asked you to send or write. Use the recipient's name or address exactly as the user said it. Write a short, natural subject and body in the user's voice. This only prepares a draft and reads it back to the user; it never sends. The user sends it by saying so after hearing it. To revise a draft, call this again with the full new version.", json!({"to":{"type":"string","minLength":1,"maxLength":128},"subject":{"type":"string","minLength":1,"maxLength":256},"body":{"type":"string","minLength":1,"maxLength":4000}}), &["to","subject","body"]));
         }
+        if self.web_visitor.is_some() {
+            tools.push(spec("open_website", "Open a website the user named by its address, like cartoonnetwork.com or nytimes.com, in their browser (a browser they named, else the default). Pass https:// plus the exact domain they said. Only the user's own words authorize the site.", json!({"url":{"type":"string","minLength":8,"maxLength":1024}}), &["url"]));
+        }
         if self.web_opener.is_some() {
             tools.push(spec("open_webpage", "Open a requested Wikipedia article in the user's browser. Preserve the topic from the user's explicit request. The adapter resolves the canonical article with Wikipedia before opening it; ambiguous topics require a short clarification. This opens a page and never submits forms.", json!({"site":{"type":"string","enum":["wikipedia"]},"topic":{"type":"string","minLength":1,"maxLength":128}}), &["site","topic"]));
         }
@@ -402,6 +411,21 @@ impl ToolRuntime {
                 id: "trusted-tab-navigation".into(),
                 name: "browser_navigate_tab".into(),
                 arguments: json!({"resource_id":tab.resource_id,"expected_document_id":tab.document_id,"url":url}),
+            };
+            return Some(self.execute(user_request, &proposal).await);
+        }
+        if self.music.is_some() && crate::request_intent::generic_music_request(user_request) {
+            let mut result = acknowledgment("Sure, who do you want to hear?");
+            result.needs_followup = true;
+            return Some(result);
+        }
+        if self.web_visitor.is_some()
+            && let Some(visit) = crate::web_visit::website_intent(user_request)
+        {
+            let proposal = ToolCall {
+                id: "trusted-website".into(),
+                name: "open_website".into(),
+                arguments: json!({"url":visit.url}),
             };
             return Some(self.execute(user_request, &proposal).await);
         }
@@ -693,6 +717,27 @@ impl ToolRuntime {
                     })),
                     Ok(Err(err)) => acknowledgment(&err.to_string()),
                     Err(_) => acknowledgment("I couldn't read your messages right now."),
+                }
+            }
+            "open_website" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct SiteArgs {
+                    url: String,
+                }
+                let Ok(args) = serde_json::from_value::<SiteArgs>(call.arguments.clone()) else {
+                    return acknowledgment("Which website should I open?");
+                };
+                let Some(visitor) = &self.web_visitor else {
+                    return acknowledgment("I can't open websites from here yet.");
+                };
+                match visitor.visit(user_request, &args.url).await {
+                    Ok(text) => {
+                        let mut result = acknowledgment(&text);
+                        result.attempted = true;
+                        result
+                    }
+                    Err(err) => acknowledgment(&err.to_string()),
                 }
             }
             "compose_email" => {

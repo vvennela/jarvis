@@ -87,6 +87,31 @@ pub enum HandsFree {
     Ignore,
     End,
 }
+/// Only sounds like "um", "hmm", "okay": nothing a person would answer with.
+pub fn is_filler(command: &str) -> bool {
+    command
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .all(|word| {
+            matches!(
+                word,
+                "uh" | "um"
+                    | "umm"
+                    | "hmm"
+                    | "mm"
+                    | "mhm"
+                    | "ah"
+                    | "oh"
+                    | "huh"
+                    | "er"
+                    | "like"
+                    | "so"
+                    | "okay"
+                    | "ok"
+            )
+        })
+}
 pub fn classify_hands_free(command: &str) -> HandsFree {
     let normalized = command
         .trim()
@@ -174,6 +199,9 @@ pub struct VoiceHandoff {
     /// command time means the command arrived without "Hey Jarvis".
     hands_free_since: Option<u64>,
     hands_free_turns: u8,
+    /// Wake count at the last dispatched command; a higher count means the
+    /// next command came from a new "Hey Jarvis" and starts a new session.
+    dispatched_wakes: Option<u64>,
 }
 
 impl VoiceHandoff {
@@ -508,7 +536,7 @@ impl VoiceHandoff {
             }
             // Visible delivery remains available if the configured speech service
             // is unavailable. Never repeat or interrupt an active user request.
-            let _ = playback.speak(notice.clone());
+            // Shown in the panel only; switching microphones is not announced aloud.
             self.visible_microphone_notice =
                 Some((notice, Instant::now() + Duration::from_secs(8)));
             self.microphone_reveal = true;
@@ -519,11 +547,23 @@ impl VoiceHandoff {
             None
         };
         let command = command.and_then(|command| {
+            let wakes = wake.snapshot().diagnostics.wake_matches;
             let hands_free = self
                 .hands_free_since
                 .take()
-                .is_some_and(|since| since == wake.snapshot().diagnostics.wake_matches);
+                .is_some_and(|since| since == wakes);
             if !hands_free {
+                // An answer to Jarvis's own question (no new wake) may be a
+                // single word, but pure filler is never an answer.
+                let answer = self
+                    .dispatched_wakes
+                    .is_some_and(|previous| previous == wakes);
+                if answer
+                    && classify_hands_free(&command) == HandsFree::Ignore
+                    && is_filler(&command)
+                {
+                    return None;
+                }
                 self.hands_free_turns = 0;
                 return Some(command);
             }
@@ -541,6 +581,14 @@ impl VoiceHandoff {
         });
         if let Some(command) = &command {
             self.active_followup = None;
+            let wakes = wake.snapshot().diagnostics.wake_matches;
+            if self
+                .dispatched_wakes
+                .is_some_and(|previous| wakes > previous)
+            {
+                conversation.start_new_session();
+            }
+            self.dispatched_wakes = Some(wakes);
             if let Some(tasks) = tasks {
                 match dispatch_question_with_coding(command.clone(), conversation, tasks, coding) {
                     Ok(Dispatch::Conversation) => {

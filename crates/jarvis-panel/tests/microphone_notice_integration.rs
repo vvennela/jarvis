@@ -143,7 +143,7 @@ impl Drop for Rig {
 }
 
 #[test]
-fn initial_input_is_silent_and_changed_microphone_is_announced_and_revealed_exactly_once() {
+fn initial_input_is_silent_and_changed_microphone_is_shown_once_but_never_spoken() {
     let mut r = Rig::new();
     r.pump(Duration::from_millis(50));
     assert!(r.spoken().is_empty());
@@ -153,16 +153,19 @@ fn initial_input_is_silent_and_changed_microphone_is_announced_and_revealed_exac
     r.tick();
     r.input.fallback.store(true, Ordering::Release);
     r.input.set(Some("MacBook Pro Microphone"));
-    r.until(|r| r.spoken().contains("--utterance--") && !r.speech.control.busy());
-    assert!(r.handoff.microphone_notice().unwrap().contains("MacBook"));
+    r.until(|r| r.handoff.microphone_notice().is_some());
+    let notice = r.handoff.microphone_notice().unwrap().to_owned();
+    assert_eq!(
+        notice,
+        "AirPods microphone stopped responding. Using the MacBook microphone."
+    );
+    assert!(!notice.contains("Private Owner"));
     assert!(r.handoff.take_microphone_reveal());
     assert!(!r.handoff.take_microphone_reveal());
-    r.pump(Duration::from_millis(100));
-    let spoken = r.spoken();
-    assert_eq!(spoken.matches("--utterance--").count(), 1);
-    assert!(!spoken.contains("Private Owner"));
+    r.pump(Duration::from_millis(150));
     assert!(
-        spoken.contains("AirPods microphone stopped responding. Using the MacBook microphone.")
+        r.spoken().is_empty(),
+        "microphone change was announced aloud"
     );
 }
 #[test]
@@ -172,11 +175,13 @@ fn muted_microphone_changes_wait_until_listening_resumes() {
     wait(|| r.wake.control.snapshot().state == State::Muted);
     r.input.set(Some("MacBook Pro Microphone"));
     r.pump(Duration::from_millis(100));
-    assert!(r.spoken().is_empty());
+    assert!(r.handoff.microphone_notice().is_none());
     assert!(!r.handoff.take_microphone_reveal());
     r.wake.control.set_enabled(true);
-    r.until(|r| r.spoken().contains("--utterance--") && !r.speech.control.busy());
-    assert_eq!(r.spoken().matches("--utterance--").count(), 1);
+    r.until(|r| r.handoff.microphone_notice().is_some());
+    assert!(r.handoff.take_microphone_reveal());
+    r.pump(Duration::from_millis(100));
+    assert!(r.spoken().is_empty());
 }
 #[test]
 fn owned_speech_is_not_interrupted_and_latest_selected_microphone_notice_waits() {
@@ -189,12 +194,13 @@ fn owned_speech_is_not_interrupted_and_latest_selected_microphone_notice_waits()
     r.input.set(Some("MacBook Pro Microphone"));
     r.pump(Duration::from_millis(40));
     assert!(r.speech.control.busy());
-    assert_eq!(r.spoken().matches("--utterance--").count(), 1);
-    assert!(!r.handoff.take_microphone_reveal());
+    assert!(r.handoff.microphone_notice().is_none());
     fs::remove_file(r.dir.join("hold")).unwrap();
-    r.until(|r| r.spoken().matches("--utterance--").count() == 2 && !r.speech.control.busy());
-    assert!(r.spoken().contains("MacBook"));
-    assert!(!r.spoken().contains("Intermediate USB"));
+    r.until(|r| r.handoff.microphone_notice().is_some() && !r.speech.control.busy());
+    let notice = r.handoff.microphone_notice().unwrap();
+    assert!(notice.contains("MacBook"), "{notice}");
+    assert!(!notice.contains("Intermediate USB"));
+    assert_eq!(r.spoken().matches("--utterance--").count(), 1);
 }
 
 #[test]

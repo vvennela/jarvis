@@ -58,6 +58,8 @@ pub struct Control {
     sender: mpsc::Sender<Request>,
     cancellation: watch::Sender<u64>,
     busy: AtomicBool,
+    /// A fresh invocation starts without the previous conversation's turns.
+    new_session: AtomicBool,
     ready: AtomicBool,
     stopping: AtomicBool,
     snapshot: Mutex<Snapshot>,
@@ -94,6 +96,11 @@ impl Control {
             return Err(SubmitError::Unavailable);
         }
         Ok(())
+    }
+    /// The next request begins a new session: short-term history and pending
+    /// clarifications are dropped. Saved preferences and skills remain.
+    pub fn start_new_session(&self) {
+        self.new_session.store(true, Ordering::Release);
     }
     pub fn cancellation_epoch(&self) -> u64 {
         *self.cancellation.borrow()
@@ -159,6 +166,7 @@ impl ConversationWorker {
         if let Ok(opener) = jarvis::web_open::WebOpener::native() {
             tools = tools.with_web_opener(opener);
         }
+        tools = tools.with_web_visitor(jarvis::web_visit::WebVisitor::native());
         if let Ok(email) = jarvis::email::EmailClient::native() {
             tools = tools.with_email(email);
         }
@@ -245,6 +253,7 @@ impl ConversationWorker {
             sender,
             cancellation,
             busy: AtomicBool::new(false),
+            new_session: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             snapshot: Mutex::new(Snapshot {
@@ -291,6 +300,11 @@ impl ConversationWorker {
                         request = receiver.recv() => { match request { Some(request) => request, None => break } }
                     };
                     if worker_control.stopping.load(Ordering::Acquire) { break; }
+                    if worker_control.new_session.swap(false, Ordering::AcqRel)
+                        && let Some(conversation) = conversation.as_mut()
+                    {
+                        conversation.clear();
+                    }
                     if *cancelled.borrow() != request.epoch {
                         if let Some(conversation) = conversation.as_mut() {
                             conversation.clear_pending_clarification();
