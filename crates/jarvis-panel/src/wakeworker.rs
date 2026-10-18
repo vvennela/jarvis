@@ -94,6 +94,8 @@ pub trait WakeBackend {
         Ok(None)
     }
     fn reset_keyword(&mut self) {}
+    /// Clear speech-activity state, e.g. after it idled during wake listening.
+    fn reset_speech_activity(&mut self) {}
 
     fn input_info(&self) -> Option<InputInfo> {
         None
@@ -677,44 +679,11 @@ impl WakeWorker {
                             thread::sleep(Duration::from_millis(20));
                             continue;
                         }
-                        let activity = match backend.speech_activity(&samples) {
-                            Ok(activity) => activity,
-                            Err(message) => {
-                                backend.stop();
-                                running = false;
-                                detector.reset();
-                                c.enabled.store(false, Ordering::Release);
-                                c.publish(State::Failed, message);
-                                while !c.enabled() && !c.stopped.load(Ordering::Acquire) {
-                                    thread::sleep(Duration::from_millis(20));
-                                }
-                                continue;
-                            }
-                        };
-                        if detector.phase() == Phase::Wake {
+                        // While waiting for the wake phrase only the keyword model
+                        // runs; speech detection starts once a command is being heard.
+                        let keyword = if detector.phase() == Phase::Wake {
                             match backend.keyword_spot(&samples) {
-                                Ok(Some(status)) => {
-                                    // Fixed-size prerecording recovers words spoken immediately
-                                    // after the keyword while the streaming model confirms it.
-                                    append_keyword_audio(&mut keyword_audio, &samples);
-                                    if let Some(lookback) = status.lookback_samples {
-                                        let start = keyword_audio
-                                            .len()
-                                            .saturating_sub(lookback.min(64_000));
-                                        detector.arm_keyword(&keyword_audio[start..]);
-                                        keyword_audio.clear();
-                                        c.wake_matched();
-                                        None
-                                    } else if backend.wake_fallback_enabled() && activity.is_some()
-                                    {
-                                        detector.ingest_with_activity(&samples, activity.as_deref())
-                                    } else {
-                                        None
-                                    }
-                                }
-                                Ok(None) => {
-                                    detector.ingest_with_activity(&samples, activity.as_deref())
-                                }
+                                Ok(status) => status,
                                 Err(message) => {
                                     backend.stop();
                                     running = false;
@@ -727,6 +696,56 @@ impl WakeWorker {
                                     }
                                     continue;
                                 }
+                            }
+                        } else {
+                            None
+                        };
+                        let needs_activity = detector.phase() != Phase::Wake
+                            || keyword.is_none()
+                            || backend.wake_fallback_enabled();
+                        let activity = if needs_activity {
+                            match backend.speech_activity(&samples) {
+                                Ok(activity) => activity,
+                                Err(message) => {
+                                    backend.stop();
+                                    running = false;
+                                    detector.reset();
+                                    c.enabled.store(false, Ordering::Release);
+                                    c.publish(State::Failed, message);
+                                    while !c.enabled() && !c.stopped.load(Ordering::Acquire) {
+                                        thread::sleep(Duration::from_millis(20));
+                                    }
+                                    continue;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        if detector.phase() == Phase::Wake {
+                            match keyword {
+                                Some(status) => {
+                                    // Fixed-size prerecording recovers words spoken immediately
+                                    // after the keyword while the streaming model confirms it.
+                                    append_keyword_audio(&mut keyword_audio, &samples);
+                                    if let Some(lookback) = status.lookback_samples {
+                                        let start = keyword_audio
+                                            .len()
+                                            .saturating_sub(lookback.min(64_000));
+                                        detector.arm_keyword(&keyword_audio[start..]);
+                                        keyword_audio.clear();
+                                        // Speech detection idled during wake listening;
+                                        // start it fresh for the command.
+                                        backend.reset_speech_activity();
+                                        c.wake_matched();
+                                        None
+                                    } else if backend.wake_fallback_enabled() && activity.is_some()
+                                    {
+                                        detector.ingest_with_activity(&samples, activity.as_deref())
+                                    } else {
+                                        None
+                                    }
+                                }
+                                None => detector.ingest_with_activity(&samples, activity.as_deref()),
                             }
                         } else {
                             detector.ingest_with_activity(&samples, activity.as_deref())
@@ -1039,6 +1058,9 @@ impl WakeBackend for NativeBackend {
     }
     fn reset_keyword(&mut self) {
         self.keyword.reset();
+        self.vad.reset();
+    }
+    fn reset_speech_activity(&mut self) {
         self.vad.reset();
     }
     fn input_info(&self) -> Option<InputInfo> {

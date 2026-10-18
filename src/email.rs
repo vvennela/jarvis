@@ -417,6 +417,11 @@ impl EmailClient {
         Ok(Composed::Choose(question))
     }
 
+    /// Drop a pending "which one" question without choosing.
+    pub fn discard_choice(&self) {
+        self.choice.lock().unwrap_or_else(|p| p.into_inner()).take();
+    }
+
     pub fn awaiting_choice(&self) -> bool {
         self.choice
             .lock()
@@ -660,9 +665,10 @@ impl EmailClient {
 }
 
 fn mentions_email(request: &str) -> bool {
-    request
-        .split(|c: char| !c.is_alphanumeric() && c != '-')
-        .any(|word| matches!(word, "email" | "e-mail" | "mail" | "emails"))
+    !crate::request_intent::negated_before(request, &["email", "e-mail", "mail", "emails"])
+        && request
+            .split(|c: char| !c.is_alphanumeric() && c != '-')
+            .any(|word| matches!(word, "email" | "e-mail" | "mail" | "emails"))
 }
 
 fn contains_words(haystack: &str, needle: &str) -> bool {

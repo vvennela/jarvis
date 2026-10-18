@@ -96,7 +96,7 @@ impl PreferenceStore {
         if !asks_to_remember(user_request) {
             return Err(PreferenceError::NotRequested);
         }
-        if !from_user_words(user_request, text) {
+        if !from_user_words(user_request, text) || polarity(user_request) != polarity(text) {
             return Err(PreferenceError::NotUserWords);
         }
         let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -216,7 +216,19 @@ pub fn asks_to_remember(request: &str) -> bool {
 }
 
 pub fn asks_to_forget(request: &str) -> bool {
-    let lower = request.to_lowercase();
+    let lower = request.to_lowercase().replace('’', "'");
+    if [
+        "don't forget",
+        "do not forget",
+        "never forget",
+        "dont forget",
+        "not forget",
+    ]
+    .iter()
+    .any(|cue| lower.contains(cue))
+    {
+        return false;
+    }
     [
         "forget ",
         "stop remembering",
@@ -344,4 +356,34 @@ fn from_user_words(request: &str, text: &str) -> bool {
             .count()
             * 10
             >= words.len() * 7
+}
+
+/// Whether the words carry a negation. A saved preference must keep the
+/// user's "don't"/"never"/"no" so its meaning cannot flip.
+fn polarity(text: &str) -> bool {
+    let lower = text.to_lowercase().replace('’', "'");
+    lower_words(&lower).iter().any(|word| {
+        matches!(
+            word.as_str(),
+            "not"
+                | "no"
+                | "never"
+                | "don't"
+                | "dont"
+                | "doesn't"
+                | "won't"
+                | "stop"
+                | "avoid"
+                | "without"
+                | "less"
+                | "fewer"
+                | "hate"
+                | "dislike"
+                | "can't"
+                | "cannot"
+                | "shouldn't"
+                | "isn't"
+                | "aren't"
+        )
+    })
 }

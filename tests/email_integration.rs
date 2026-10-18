@@ -577,3 +577,49 @@ async fn a_split_multi_step_request_keeps_its_work_context_for_the_email() {
         sends(&dir)
     );
 }
+
+#[tokio::test]
+async fn cancel_discards_the_draft_so_a_later_yes_or_send_it_cannot_send() {
+    let dir = TempDir::new();
+    let peer = Peer::new(vec![compose("Brian", "Hi", "Hello.")]).await;
+    let mut conversation = peer.conversation(&dir, runtime(&dir, BRIAN, "sent"));
+    conversation.ask("email Brian hello").await.unwrap();
+    // The Cancel button / an interrupted read-back.
+    conversation.clear_pending_clarification();
+    conversation.ask("yes").await.unwrap();
+    conversation.ask("send it").await.unwrap();
+    assert!(sends(&dir).is_empty(), "{:?}", sends(&dir));
+}
+
+#[tokio::test]
+async fn a_fresh_wake_right_after_the_read_back_can_still_say_yes() {
+    let dir = TempDir::new();
+    let peer = Peer::new(vec![compose("Brian", "Hi", "Hello.")]).await;
+    let mut conversation = peer.conversation(&dir, runtime(&dir, BRIAN, "sent"));
+    conversation.ask("email Brian hello").await.unwrap();
+    // "Hey Jarvis, yes": a new session, seconds after the question.
+    conversation.start_session();
+    conversation.ask("yes").await.unwrap();
+    assert_eq!(sends(&dir).len(), 1);
+}
+
+#[tokio::test]
+async fn negated_email_requests_never_draft_but_content_with_conditions_does() {
+    for (request, drafts) in [
+        ("don't email Brian about it", false),
+        ("never email Brian again", false),
+        ("email Brian that I'll be there after 5", true),
+        ("email Brian if he's free tonight, dinner is on me", true),
+    ] {
+        let dir = TempDir::new();
+        let peer = Peer::new(vec![compose("Brian", "Hi", "Hello."), text("Okay.")]).await;
+        let mut conversation = peer.conversation(&dir, runtime(&dir, BRIAN, "sent"));
+        let reply = conversation.ask(request).await.unwrap();
+        assert_eq!(
+            reply.text.starts_with("Here's the email"),
+            drafts,
+            "{request}: {}",
+            reply.text
+        );
+    }
+}

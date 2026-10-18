@@ -342,3 +342,55 @@ async fn saved_preference_reaches_later_conversations_as_instructions() {
     assert!(system.contains("saved preferences"), "{system}");
     assert!(system.contains("- Call me V"));
 }
+
+#[test]
+fn a_saved_preference_keeps_the_users_negation() {
+    let dir = TempDir::new();
+    let store = store(&dir);
+    assert_eq!(
+        store.remember("Remember I don't like long replies", "I like long replies"),
+        Err(PreferenceError::NotUserWords)
+    );
+    assert_eq!(
+        store.remember("from now on never play country music", "Play country music"),
+        Err(PreferenceError::NotUserWords)
+    );
+    assert_eq!(
+        store.remember("remember I like long replies", "Don't give long replies"),
+        Err(PreferenceError::NotUserWords)
+    );
+    store
+        .remember(
+            "Remember I don't like long replies",
+            "I don't like long replies",
+        )
+        .unwrap();
+    store
+        .remember(
+            "from now on never play country music",
+            "Never play country music",
+        )
+        .unwrap();
+    assert_eq!(store.list().len(), 2);
+}
+
+#[test]
+fn dont_forget_is_not_a_request_to_forget() {
+    let dir = TempDir::new();
+    let store = store(&dir);
+    store
+        .remember("remember that I like jazz", "I like jazz")
+        .unwrap();
+    for request in [
+        "don't forget that I like jazz",
+        "never forget I like jazz",
+        "do not forget jazz",
+    ] {
+        assert_eq!(
+            store.forget(request, "jazz"),
+            Err(PreferenceError::NotRequested),
+            "{request}"
+        );
+    }
+    assert_eq!(store.list().len(), 1);
+}

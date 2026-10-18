@@ -65,3 +65,15 @@ fn bounded_input_is_rejected_without_rewriting() {
     assert_eq!(canonical_request(&"opened ".repeat(2000)), None);
     assert_eq!(canonical_request("opened the page\u{0} for Napoleon"), None);
 }
+
+#[test]
+fn a_leading_to_from_the_recognizer_still_opens_the_page() {
+    let rewritten = canonical_request("to open the Wikipedia page for Napoleon").unwrap();
+    assert_eq!(rewritten, "open the Wikipedia page for Napoleon");
+    assert_eq!(
+        jarvis::request_intent::wikipedia_page_intent(&rewritten).as_deref(),
+        Some("napoleon")
+    );
+    // "to" inside a request is untouched.
+    assert_eq!(canonical_request("how to open a jar"), None);
+}

@@ -310,6 +310,9 @@ impl VoiceHandoff {
             && playback.busy();
         self.last_wake_matches = Some(matches);
         if interrupted {
+            // An interrupted reply was not fully heard: nothing it asked for
+            // (a question, an email read-back) can be answered afterwards.
+            conversation.cancel();
             playback.stop_speaking();
             self.spoken_question = None;
             self.active_followup = None;

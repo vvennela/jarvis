@@ -305,7 +305,7 @@ impl ConversationWorker {
                     if worker_control.new_session.swap(false, Ordering::AcqRel)
                         && let Some(conversation) = conversation.as_mut()
                     {
-                        conversation.clear();
+                        conversation.start_session();
                     }
                     if *cancelled.borrow() != request.epoch {
                         if let Some(conversation) = conversation.as_mut() {

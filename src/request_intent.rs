@@ -783,6 +783,40 @@ pub fn resolve_action_followup(original: &str, answer: &str) -> Option<String> {
     }
 }
 
+/// The request says not to, or only conditionally ("don't", "never", "if").
+pub fn negated(request: &str) -> bool {
+    let lower = request.to_lowercase().replace('’', "'");
+    restrictive(&lower.replace("n't", " not"))
+        || lower
+            .split(|c: char| !c.is_alphanumeric() && c != '\'')
+            .any(|word| matches!(word, "don't" | "dont" | "won't" | "shouldn't" | "stop"))
+}
+
+/// Negation or condition in the words before the first of `targets` ("don't
+/// read my messages"), ignoring the content that follows ("email Brian that
+/// I'll be there after 5").
+pub fn negated_before(request: &str, targets: &[&str]) -> bool {
+    let lower = request.to_lowercase();
+    let mut cut = lower.len();
+    let mut start = None;
+    for (index, c) in lower.char_indices().chain([(lower.len(), ' ')]) {
+        let part = c.is_alphanumeric() || c == '-';
+        match (start, part) {
+            (None, true) => start = Some(index),
+            (Some(begin), false) => {
+                if targets.contains(&&lower[begin..index]) {
+                    cut = begin;
+                    break;
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    // Lowercasing can change byte lengths; cut the lowercase text itself.
+    negated(&lower[..cut])
+}
+
 /// One complete, deterministic action: a named page, song, or artist.
 pub fn resolved_action(clause: &str) -> bool {
     tab_switch_intent(clause).is_some()
@@ -823,12 +857,11 @@ fn canonical_clause(clause: &str) -> String {
     // Fillers and recognized wake residue before the command itself.
     for _ in 0..4 {
         let lower = rest.to_ascii_lowercase();
-        let Some(filler) = ["hey", "hi", "okay", "ok", "so", "um", "uh", "and", "jarvis"]
-            .iter()
-            .find(|filler| {
-                lower.starts_with(*filler) && lower[filler.len()..].starts_with([' ', ','])
-            })
-        else {
+        let Some(filler) = [
+            "hey", "hi", "okay", "ok", "so", "um", "uh", "and", "jarvis", "to", "please",
+        ]
+        .iter()
+        .find(|filler| lower.starts_with(*filler) && lower[filler.len()..].starts_with([' ', ','])) else {
             break;
         };
         rest = rest[filler.len()..].trim_start_matches([' ', ',']);

@@ -284,3 +284,24 @@ async fn no_unread_messages_is_spoken_directly() {
         Some("Nothing new. You're all caught up on texts.")
     );
 }
+
+#[tokio::test]
+async fn negated_message_requests_never_read_but_conditional_content_does() {
+    let dir = TempDir::new();
+    let runtime = ToolRuntime::read_only(dir.join("context.db"))
+        .with_messages(reader(&dir, &[row("+14155550134", "dinner tonight?", 2)]));
+    for (request, reads) in [
+        ("Don't read my messages", false),
+        ("never check my texts", false),
+        ("don’t look at my texts right now", false),
+        ("check my texts and tell me if there's anything new", true),
+        ("any new messages?", true),
+    ] {
+        let result = runtime.execute(request, &call()).await;
+        assert_eq!(
+            result.content.contains("dinner tonight?"),
+            reads,
+            "{request}"
+        );
+    }
+}

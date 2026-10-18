@@ -272,7 +272,18 @@ pub fn attributed_text(body: &[u8]) -> Option<String> {
 
 /// The user's own request must ask about texts or messages.
 pub fn mentions_messages(request: &str) -> bool {
-    request
+    !crate::request_intent::negated_before(
+        request,
+        &[
+            "text",
+            "texts",
+            "message",
+            "messages",
+            "imessage",
+            "imessages",
+            "sms",
+        ],
+    ) && request
         .to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
         .any(|word| {

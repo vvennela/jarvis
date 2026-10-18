@@ -456,22 +456,15 @@ fn filler_while_jarvis_waits_for_an_answer_is_not_an_answer() {
 }
 
 #[test]
-fn a_new_wake_does_not_answer_an_old_question() {
-    let mut rig = Rig::new(vec![text("Kanye's a rapper and producer.")], "Kanye");
+fn hey_jarvis_right_after_a_question_still_answers_it() {
+    let mut rig = Rig::new(vec![], "Kanye");
     rig.exchange("Jarvis play some music");
-    // The window is left to the next explicit wake instead of an answer.
+    // The user re-wakes instead of answering hands-free, seconds later.
     rig.wake.control.cancel_followup();
     rig.pump(Duration::from_millis(100));
     let reply = rig.exchange("Jarvis Kanye");
-    assert!(
-        rig.played().is_empty(),
-        "stale question was answered: {reply}"
-    );
-    assert_eq!(rig.model.count(), 1);
-    assert!(
-        rig.history_sent_with(0).is_empty(),
-        "fresh wake carried history"
-    );
+    assert!(rig.played().contains("Kanye"), "recent question was lost: {reply}");
+    assert_eq!(rig.model.count(), 0);
 }
 
 #[test]

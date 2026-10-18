@@ -127,6 +127,8 @@ pub struct Conversation {
     pending_music_confirmation: Option<(MusicConfirmation, Instant)>,
     /// Revision of the email draft read back by the previous reply.
     email_awaiting: Option<u64>,
+    /// When Jarvis last asked the user something it is waiting on.
+    question_asked_at: Option<Instant>,
     /// When the current request began, for end-to-end route timing.
     turn_started: Instant,
 }
@@ -158,6 +160,7 @@ impl Conversation {
             pending_clarification: None,
             pending_music_confirmation: None,
             email_awaiting: None,
+            question_asked_at: None,
             turn_started: Instant::now(),
         }
     }
@@ -198,23 +201,47 @@ impl Conversation {
     pub fn clear(&mut self) {
         self.history.clear();
         self.history_bytes = 0;
-        self.email_awaiting = None;
         self.clear_pending_clarification();
     }
 
-    /// An explicit cancel revokes missing-slot authority without erasing history.
+    /// A fresh "Hey Jarvis": earlier turns are dropped, but a question Jarvis
+    /// asked moments ago can still be answered ("Hey Jarvis, yes").
+    pub fn start_session(&mut self) {
+        self.history.clear();
+        self.history_bytes = 0;
+        let recent = self
+            .question_asked_at
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(30));
+        if !recent {
+            self.clear_pending_clarification();
+        }
+    }
+
+    /// An explicit cancel revokes missing-slot authority without erasing
+    /// history, including any email draft, recipient question or confirmation.
     pub fn clear_pending_clarification(&mut self) {
         self.pending_clarification = None;
         self.pending_music_confirmation = None;
+        self.email_awaiting = None;
+        self.question_asked_at = None;
+        if let Some(email) = self.tool_runtime.as_ref().and_then(|r| r.email()) {
+            email.discard();
+            email.discard_choice();
+        }
     }
 
     /// Cancellation by dropping this future leaves retained history unchanged.
     /// A bounded blocking database read may finish after the caller cancels.
     pub async fn ask(&mut self, question: &str) -> Result<Reply, ConversationError> {
         if let Some(reply) = self.email_turn(question).await {
+            self.question_asked_at = reply.needs_followup.then(Instant::now);
             return Ok(reply);
         }
         let reply = self.ask_inner(question).await;
+        self.question_asked_at = reply
+            .as_ref()
+            .is_ok_and(|reply| reply.needs_followup)
+            .then(Instant::now);
         // A bare "yes" may send only the draft that this very reply read back.
         self.email_awaiting = match (&reply, self.tool_runtime.as_ref()) {
             (Ok(reply), Some(runtime)) => runtime
