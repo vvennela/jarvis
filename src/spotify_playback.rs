@@ -25,7 +25,7 @@ impl fmt::Display for PlaybackError {
         f.write_str(match self {
             Self::InvalidConfiguration => "Spotify playback needs a setup fix.",
             Self::InvalidArtist => "I couldn't verify that artist's Spotify identity.",
-            Self::NotAuthorized => "Which artist would you like me to play?",
+            Self::NotAuthorized => "Sorry, I didn't quite catch which artist.",
             Self::Unavailable => "I couldn't reach the Spotify desktop app. Is it installed?",
             Self::PermissionDenied => "I need permission to control Spotify. Enable Jarvis under System Settings, Privacy & Security, Automation.",
             Self::Timeout => "Spotify took too long to respond. I couldn't confirm playback.",

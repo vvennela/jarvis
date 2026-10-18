@@ -21,7 +21,7 @@ impl fmt::Display for WebOpenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::InvalidConfiguration => "The webpage opener needs a setup fix.",
-            Self::NotAuthorized => "Which Wikipedia page would you like me to open?",
+            Self::NotAuthorized => "Sorry, I didn't quite catch which page.",
             Self::NotFound => {
                 "I couldn't find that Wikipedia article. What exact topic did you mean?"
             }

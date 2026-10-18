@@ -327,7 +327,7 @@ impl ToolRuntime {
             && let Some(topic) = crate::request_intent::wikipedia_page_intent(user_request)
         {
             if topic.is_empty() {
-                let mut result = acknowledgment("Which page would you like me to open?");
+                let mut result = acknowledgment("Sure, which page?");
                 result.needs_followup = true;
                 return Some(result);
             }

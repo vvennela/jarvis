@@ -28,7 +28,7 @@ pub const MAX_HISTORY_BYTES: usize = 24 * 1024;
 pub const MAX_HISTORY_REPLY_BYTES: usize = 4096;
 pub const ROUTING_DEADLINE: Duration = Duration::from_millis(300);
 const MAX_CONFIG_BYTES: usize = 16 * 1024;
-const SYSTEM: &str = r#"You are Jarvis, Vishnu's capable, personable Mac companion. Speak like someone working alongside him: warm, direct, quietly confident, with an occasional dry aside. Start with the useful answer. Use contractions and one to three short spoken sentences, usually under 60 words. A simple result needs only a few words. Skip formal preambles, capability inventories, unsolicited explanations, Markdown formatting, and generic closing questions. Keep implementation jargon out of ordinary conversation. Do not imitate a customer-support script or tell the user to learn command syntax. Ask one natural, specific question when you need a missing detail. Never bluff about having done something.
+const SYSTEM: &str = r#"You are Jarvis, Vishnu's capable, personable Mac companion. Talk like a friend sitting next to him: casual, relaxed, warm, a little playful, quietly confident, with the occasional dry aside. Sound like a person, not an assistant: "Done, Napoleon's up." "Metallica's on." "Honestly? I'd finish the Beacon notes first." Start with the useful answer. Use contractions and one to three short spoken sentences, usually under 60 words. A simple result needs only a few words. Skip formal preambles, capability inventories, unsolicited explanations, Markdown formatting, and generic closing questions. Keep implementation jargon out of ordinary conversation. Do not imitate a customer-support script or tell the user to learn command syntax. Ask one natural, specific question when you need a missing detail. Never bluff about having done something.
 
 The application supplies runtime_conversation as authoritative runtime state. If typed tools are supplied, use the appropriate tool for the user's request; the runner authorizes execution and verifies its outcome. Only an observed tool result establishes completion. If no tools are supplied, answer conversationally using the stated runtime capabilities. When app_actions lists Spotify controls, Jarvis can open Spotify and resume or pause its current selection. Never call this a text-only session or categorically deny available app controls. When spotify_play_artist is supplied, use it for named artists such as a request to play an artist on Spotify; preserve the artist name from the request. Do not substitute current-selection playback for a named artist. The tool resolves identity and verifies playback. Specific songs and albums require their own capability; do not claim that selecting an artist selected a particular song. If something is unavailable, explain that one thing briefly and offer a useful next step only when one exists. Avoid reciting supported commands. A queued background job is still working; a verified draft is ready for review. Sending messages, payment, deletion, and final booking submission are not automatic capabilities.
 
@@ -309,27 +309,47 @@ impl Conversation {
                 }
             };
             let (first, second, third) = tokio::join!(run(0), run(1), run(2));
-            let text = [first, second, third]
-                .into_iter()
+            let mut text = Vec::new();
+            let mut needs_followup = false;
+            let mut pending = None;
+            let mut confirmation = None;
+            let mut confirmation_count = 0;
+            for (clause, result) in [first, second, third].into_iter().flatten() {
+                let Some(result) = result else {
+                    text.push(format!(
+                        "Sorry, I couldn't get \"{}\" done.",
+                        clause.trim_end_matches(['.', '!', '?'])
+                    ));
+                    continue;
+                };
+                if let Some(token) = result.confirmation {
+                    confirmation_count += 1;
+                    confirmation = Some(token);
+                }
+                if result.needs_followup && pending.is_none() {
+                    pending = Some(clause.to_owned());
+                }
+                needs_followup |= result.needs_followup;
+                text.push(result.acknowledgment.unwrap_or_else(|| {
+                    format!(
+                        "Sorry, I couldn't get \"{}\" done.",
+                        clause.trim_end_matches(['.', '!', '?'])
+                    )
+                }));
+            }
+            let text = text.join(" ");
+            // A bare yes cannot approve two separate suggestions; keep one.
+            self.pending_clarification = pending
+                .map(|request| (request, Instant::now()))
+                .or(deferred);
+            self.pending_music_confirmation = (confirmation_count == 1)
+                .then_some(confirmation)
                 .flatten()
-                .map(|(clause, result)| {
-                    result
-                        .and_then(|result| result.acknowledgment)
-                        .unwrap_or_else(|| {
-                            format!(
-                                "I couldn't finish the request to {}.",
-                                clause.trim_end_matches(['.', '!', '?'])
-                            )
-                        })
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
-            self.pending_clarification = deferred;
-            self.pending_music_confirmation = None;
+                .map(|token| (token, Instant::now()));
             self.remember(question, &text);
             return Ok(Reply {
                 text,
-                needs_followup: false,
+                needs_followup,
                 routing_degraded: false,
             });
         }
@@ -384,7 +404,7 @@ impl Conversation {
                             text.push(reply.text);
                         }
                         Err(_) => text.push(format!(
-                            "I couldn't finish the request to {}.",
+                            "Sorry, I couldn't get \"{}\" done.",
                             clause.trim_end_matches(['.', '!', '?'])
                         )),
                     }
@@ -471,7 +491,7 @@ impl Conversation {
                 ToolStep::Calls(calls) => {
                     total += calls.len();
                     if total > 8 || calls.iter().any(|call| !seen.insert(call.id.clone())) {
-                        return Ok("I stopped that request because the tool plan repeated or grew too large. Please narrow it to one task.".into());
+                        return Ok("That got tangled up on my end. Want to give it to me one piece at a time?".into());
                     }
                     let has_action = calls.iter().any(|call| !is_read_tool(&call.name));
                     if has_action && calls.len() != 1 {
@@ -484,7 +504,7 @@ impl Conversation {
                                 .iter()
                                 .all(|call| !is_read_tool(&call.name) && call.name != "ask_user");
                         if !known_compound {
-                            return Ok("I couldn't safely match that tool plan to your request, so I haven't taken an action.".into());
+                            return Ok("I wasn't sure exactly what you wanted there, so I held off. Mind saying it another way?".into());
                         }
                         return Ok(
                             ToolReply {
@@ -507,7 +527,7 @@ impl Conversation {
                                 ToolMessage::tool_result(&calls[0].id, &result.content);
                             message_bytes += proposal.encoded_len()? + observation.encoded_len()?;
                             if message_bytes > 44 * 1024 {
-                                return Ok("I couldn't match that action to your request.".into());
+                                return Ok("Hmm, I couldn't line that up with anything I can do. Try saying it a little differently?".into());
                             }
                             messages.push(proposal);
                             messages.push(observation);
@@ -569,7 +589,7 @@ impl Conversation {
                 }
             }
         }
-        Ok("I reached the limit for this request. Ask me about one specific file or outcome and I'll continue.".into())
+        Ok("I went in circles on that one. What's the one thing you want me to do?".into())
     }
 
     fn prompt(
