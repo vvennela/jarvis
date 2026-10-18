@@ -210,6 +210,10 @@ impl Conversation {
         {
             return Err(ConversationError::InvalidQuestion);
         }
+        // Correct recognizer verb forms ("opened", "playing") and fillers only
+        // when that turns the request into complete actions.
+        let canonical = crate::request_intent::canonical_request(question);
+        let question = canonical.as_deref().unwrap_or(question);
         // A semantic clarification carries a runtime-created authority token,
         // not executable model prose. Consume it before awaiting execution so
         // cancellation or a failed observation cannot replay the action.
@@ -287,6 +291,47 @@ impl Conversation {
                 .or(deferred);
             self.remember(question, &reply.text);
             return Ok(reply);
+        }
+        // Every clause is a complete page/song/artist action: run them in
+        // parallel now, without waiting for routing or indexed context.
+        if clauses.len() > 1
+            && let Some(runtime) = &self.tool_runtime
+            && clauses
+                .iter()
+                .all(|clause| crate::request_intent::resolved_action(clause))
+        {
+            let run = |index: usize| {
+                let clause = clauses.get(index).copied();
+                let runtime = Arc::clone(runtime);
+                async move {
+                    let clause = clause?;
+                    Some((clause, runtime.handle_resolved_intent(clause).await))
+                }
+            };
+            let (first, second, third) = tokio::join!(run(0), run(1), run(2));
+            let text = [first, second, third]
+                .into_iter()
+                .flatten()
+                .map(|(clause, result)| {
+                    result
+                        .and_then(|result| result.acknowledgment)
+                        .unwrap_or_else(|| {
+                            format!(
+                                "I couldn't finish the request to {}.",
+                                clause.trim_end_matches(['.', '!', '?'])
+                            )
+                        })
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            self.pending_clarification = deferred;
+            self.pending_music_confirmation = None;
+            self.remember(question, &text);
+            return Ok(Reply {
+                text,
+                needs_followup: false,
+                routing_degraded: false,
+            });
         }
         let database = self.database.clone();
         let query = effective_question.to_owned();

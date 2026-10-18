@@ -491,3 +491,90 @@ pub fn resolve_action_followup(original: &str, answer: &str) -> Option<String> {
         _ => None,
     }
 }
+
+/// One complete, deterministic action: a named page, song, or artist.
+pub fn resolved_action(clause: &str) -> bool {
+    wikipedia_page_intent(clause).is_some_and(|topic| !topic.is_empty())
+        || crate::spotify_tracks::requested_track(clause).is_some()
+        || crate::spotify_playback::requested_artist(clause).is_some()
+}
+
+fn resolved_count(request: &str) -> usize {
+    command_clauses(request).map_or(0, |clauses| {
+        clauses
+            .iter()
+            .filter(|clause| resolved_action(clause))
+            .count()
+    })
+}
+
+/// Speech recognition often changes a spoken command's verb ("opened",
+/// "playing") or keeps a filler word. Rewrite only each clause's leading
+/// words, and return the rewrite only when it yields more complete actions,
+/// so questions and ordinary conversation are never altered.
+pub fn canonical_request(request: &str) -> Option<String> {
+    if request.is_empty() || request.len() > MAX_REQUEST || request.chars().any(char::is_control) {
+        return None;
+    }
+    let text = request.split_whitespace().collect::<Vec<_>>().join(" ");
+    let rewritten = text
+        .split(" and ")
+        .map(canonical_clause)
+        .collect::<Vec<_>>()
+        .join(" and ");
+    (rewritten != text && resolved_count(&rewritten) > resolved_count(request)).then_some(rewritten)
+}
+
+fn canonical_clause(clause: &str) -> String {
+    let mut rest = clause.trim();
+    // Fillers and recognized wake residue before the command itself.
+    for _ in 0..4 {
+        let lower = rest.to_ascii_lowercase();
+        let Some(filler) = ["hey", "hi", "okay", "ok", "so", "um", "uh", "and", "jarvis"]
+            .iter()
+            .find(|filler| {
+                lower.starts_with(*filler)
+                    && lower[filler.len()..].starts_with(|c: char| c == ' ' || c == ',')
+            })
+        else {
+            break;
+        };
+        rest = rest[filler.len()..].trim_start_matches([' ', ',']);
+    }
+    let lower = rest.to_ascii_lowercase();
+    let page = lower.contains("wikipedia") || lower.contains(" page") || lower.contains(" article");
+    let verbs: &[(&str, &str)] = &[
+        ("opened ", "open "),
+        ("opens ", "open "),
+        ("opening ", "open "),
+        ("played ", "play "),
+        ("plays ", "play "),
+        ("playing ", "play "),
+        ("start playing ", "play "),
+    ];
+    if let Some((from, to)) = verbs.iter().find(|(from, _)| lower.starts_with(*from)) {
+        return format!("{to}{}", &rest[from.len()..]);
+    }
+    if page {
+        for from in [
+            "pull up ",
+            "bring up ",
+            "show me ",
+            "show ",
+            "go to ",
+            "take me to ",
+            "load ",
+            "look up ",
+            "find ",
+            "get ",
+        ] {
+            if lower.starts_with(from) {
+                return format!("open {}", &rest[from.len()..]);
+            }
+        }
+        if lower.starts_with("the wikipedia ") || lower.starts_with("wikipedia ") {
+            return format!("open {rest}");
+        }
+    }
+    rest.to_owned()
+}
