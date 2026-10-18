@@ -215,7 +215,10 @@ async fn draft_is_read_back_and_sent_only_after_explicit_confirmation() {
             .as_array()
             .unwrap()
             .iter()
-            .all(|tool| !tool["function"]["name"].as_str().unwrap().starts_with("send")),
+            .all(|tool| !tool["function"]["name"]
+                .as_str()
+                .unwrap()
+                .starts_with("send")),
         "a send tool was offered to the model"
     );
 }

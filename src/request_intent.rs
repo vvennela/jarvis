@@ -594,7 +594,7 @@ fn canonical_clause(clause: &str) -> String {
             .iter()
             .find(|filler| {
                 lower.starts_with(*filler)
-                    && lower[filler.len()..].starts_with(|c: char| c == ' ' || c == ',')
+                    && lower[filler.len()..].starts_with([' ', ','])
             })
         else {
             break;
