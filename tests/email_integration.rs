@@ -324,7 +324,7 @@ async fn compose_requires_an_email_request_and_ambiguity_is_asked_not_guessed() 
     assert!(calls_log(&dir).is_empty());
     let reply = conversation.ask("email Brian hello").await.unwrap();
     assert!(
-        reply.text.contains("A few contacts match"),
+        reply.text.starts_with("Which one: Brian Chen"),
         "{}",
         reply.text
     );
@@ -398,4 +398,182 @@ fn confirmation_phrases_are_explicit() {
     ] {
         assert!(!is_send_confirmation(phrase, true), "{phrase}");
     }
+}
+
+/// Contacts with companies: Brian Chen works at Acme; Brian Ortiz is a friend.
+const TWO_BRIANS: &str =
+    "Brian Chen\tbrian.chen@acme.com\tAcme\nBrian Ortiz\tbrianortiz@gmail.com\t\n";
+const TWO_WORK_BRIANS: &str =
+    "Brian Chen\tbrian.chen@acme.com\tAcme\nBrian Ortiz\tbrian@ortiz.studio\tOrtiz Studio\n";
+
+fn learning_runtime(dir: &TempDir, contacts: &str, memory: bool) -> ToolRuntime {
+    drop(ContextStore::open(&dir.join("context.db"), Limits::default()).unwrap());
+    let client = EmailClient::with_executable(
+        fake_osascript(dir, contacts, "sent"),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let client = if memory {
+        client.with_recipient_memory(dir.join("recipients.json"))
+    } else {
+        client
+    };
+    ToolRuntime::read_only(dir.join("context.db")).with_email(client)
+}
+
+#[tokio::test]
+async fn work_requests_pick_the_work_contact_and_personal_requests_the_personal_one() {
+    for (request, address) in [
+        (
+            "finish the export feature and email Brian that it's ready",
+            "brian.chen@acme.com",
+        ),
+        (
+            "email Brian about the client meeting",
+            "brian.chen@acme.com",
+        ),
+        ("email Brian happy birthday", "brianortiz@gmail.com"),
+        (
+            "email Brian are we still on for dinner",
+            "brianortiz@gmail.com",
+        ),
+    ] {
+        let dir = TempDir::new();
+        let peer = Peer::new(vec![compose("Brian", "Hi", "Hello.")]).await;
+        let mut conversation = peer.conversation(&dir, learning_runtime(&dir, TWO_BRIANS, true));
+        let reply = conversation.ask(request).await.unwrap();
+        assert!(
+            reply.text.starts_with("Here's the email"),
+            "{request}: {}",
+            reply.text
+        );
+        conversation.ask("send it").await.unwrap();
+        assert!(
+            sends(&dir)[0].contains(address),
+            "{request}: {:?}",
+            sends(&dir)
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unclear_context_asks_once_and_remembers_the_answer() {
+    let dir = TempDir::new();
+    let peer = Peer::new(vec![
+        compose("Brian", "Feature", "The feature shipped."),
+        compose("Brian", "Next", "Next feature is planned."),
+    ])
+    .await;
+    let mut conversation = peer.conversation(&dir, learning_runtime(&dir, TWO_WORK_BRIANS, true));
+    let question = conversation
+        .ask("email Brian that the feature shipped")
+        .await
+        .unwrap();
+    assert_eq!(
+        question.text,
+        "Which one: Brian Chen at Acme, or Brian Ortiz at Ortiz Studio?"
+    );
+    assert!(question.needs_followup);
+    let read_back = conversation.ask("the Acme one").await.unwrap();
+    assert!(
+        read_back.text.contains("brian dot chen at acme dot com"),
+        "{}",
+        read_back.text
+    );
+    conversation.ask("send it").await.unwrap();
+    // A later work email to Brian, in a new conversation, goes straight to Chen.
+    let mut later = peer.conversation(&dir, learning_runtime(&dir, TWO_WORK_BRIANS, true));
+    let reply = later
+        .ask("email Brian about the next feature")
+        .await
+        .unwrap();
+    assert!(reply.text.contains("Brian Chen"), "{}", reply.text);
+    later.ask("send it").await.unwrap();
+    let sent = sends(&dir);
+    assert_eq!(sent.len(), 2);
+    assert!(
+        sent.iter().all(|line| line.contains("brian.chen@acme.com")),
+        "{sent:?}"
+    );
+}
+
+#[tokio::test]
+async fn which_one_accepts_names_companies_ordinals_and_kinds() {
+    for (answer, address) in [
+        ("Chen", "brian.chen@acme.com"),
+        ("Brian Ortiz", "brian@ortiz.studio"),
+        ("the second one", "brian@ortiz.studio"),
+        ("Ortiz Studio", "brian@ortiz.studio"),
+    ] {
+        let dir = TempDir::new();
+        let peer = Peer::new(vec![compose("Brian", "Hi", "Hello.")]).await;
+        let mut conversation =
+            peer.conversation(&dir, learning_runtime(&dir, TWO_WORK_BRIANS, false));
+        conversation
+            .ask("email Brian about the launch")
+            .await
+            .unwrap();
+        conversation.ask(answer).await.unwrap();
+        conversation.ask("send it").await.unwrap();
+        assert!(
+            sends(&dir)[0].contains(address),
+            "{answer}: {:?}",
+            sends(&dir)
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unmatched_answer_to_which_one_never_guesses() {
+    let dir = TempDir::new();
+    let peer = Peer::new(vec![
+        compose("Brian", "Hi", "Hello."),
+        text("Sorry, which Brian did you mean?"),
+    ])
+    .await;
+    let mut conversation = peer.conversation(&dir, learning_runtime(&dir, TWO_WORK_BRIANS, false));
+    conversation
+        .ask("email Brian about the launch")
+        .await
+        .unwrap();
+    conversation.ask("the tall one").await.unwrap();
+    conversation.ask("send it").await.unwrap();
+    assert!(sends(&dir).is_empty());
+}
+
+#[test]
+fn work_and_personal_context_is_read_from_the_request() {
+    use jarvis::email::context_category;
+    for request in [
+        "finish x feature and email brian",
+        "email brian the demo slides",
+        "tell my manager the deploy is done",
+    ] {
+        assert_eq!(context_category(request), "work", "{request}");
+    }
+    for request in ["email brian happy birthday", "email mom that I landed"] {
+        assert_eq!(context_category(request), "personal", "{request}");
+    }
+}
+
+#[tokio::test]
+async fn a_split_multi_step_request_keeps_its_work_context_for_the_email() {
+    let dir = TempDir::new();
+    let peer = Peer::new(vec![
+        compose("Brian", "Export", "The export feature is done."),
+        compose("Brian", "Export", "The export feature is done."),
+    ])
+    .await;
+    let mut conversation = peer.conversation(&dir, learning_runtime(&dir, TWO_BRIANS, false));
+    let reply = conversation
+        .ask("write up the export feature notes, and email Brian that it's done")
+        .await
+        .unwrap();
+    assert!(reply.text.contains("Brian Chen"), "{}", reply.text);
+    conversation.ask("send it").await.unwrap();
+    assert!(
+        sends(&dir)[0].contains("brian.chen@acme.com"),
+        "{:?}",
+        sends(&dir)
+    );
 }

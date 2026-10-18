@@ -84,6 +84,112 @@ struct Pending {
     read_back_at: Instant,
 }
 
+/// One contact address, with the person's company when Contacts has one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    pub name: String,
+    pub address: String,
+    pub organization: String,
+}
+
+/// Several people match; the draft waits for the user to say which one.
+struct Choice {
+    query: String,
+    category: &'static str,
+    candidates: Vec<Candidate>,
+    subject: String,
+    body: String,
+    asked_at: Instant,
+}
+
+pub enum Composed {
+    Draft(EmailDraft),
+    /// A spoken question; the next answer picks the recipient.
+    Choose(String),
+}
+
+const PERSONAL_DOMAINS: &[&str] = &[
+    "gmail.com",
+    "googlemail.com",
+    "icloud.com",
+    "me.com",
+    "mac.com",
+    "yahoo.com",
+    "hotmail.com",
+    "outlook.com",
+    "live.com",
+    "aol.com",
+    "proton.me",
+    "protonmail.com",
+];
+const WORK_WORDS: &[&str] = &[
+    "work",
+    "feature",
+    "features",
+    "project",
+    "deploy",
+    "ship",
+    "shipped",
+    "launch",
+    "release",
+    "meeting",
+    "client",
+    "customer",
+    "pr",
+    "bug",
+    "bugs",
+    "review",
+    "standup",
+    "sprint",
+    "deadline",
+    "office",
+    "team",
+    "report",
+    "demo",
+    "spec",
+    "roadmap",
+    "build",
+    "code",
+    "invoice",
+    "contract",
+    "proposal",
+    "manager",
+    "boss",
+    "coworker",
+    "colleague",
+    "slides",
+    "quarter",
+    "metrics",
+    "ticket",
+    "jira",
+    "linear",
+    "deck",
+    "presentation",
+];
+
+/// "work" when the request is about work, otherwise "personal".
+pub fn context_category(request: &str) -> &'static str {
+    let lower = request.to_lowercase();
+    let work = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| WORK_WORDS.contains(&word));
+    if work { "work" } else { "personal" }
+}
+
+fn personal_address(address: &str) -> bool {
+    address
+        .rsplit_once('@')
+        .is_some_and(|(_, domain)| PERSONAL_DOMAINS.contains(&domain.to_lowercase().as_str()))
+}
+
+fn fits(candidate: &Candidate, category: &str) -> bool {
+    if category == "work" {
+        !candidate.organization.trim().is_empty() || !personal_address(&candidate.address)
+    } else {
+        personal_address(&candidate.address)
+    }
+}
+
 /// Recipient lookup and sending through Mail/Contacts via fixed AppleScript.
 /// Values are passed as argv, never interpolated into script source.
 pub struct EmailClient {
@@ -91,6 +197,11 @@ pub struct EmailClient {
     timeout: Duration,
     pending: Mutex<Option<Pending>>,
     next_revision: Mutex<u64>,
+    choice: Mutex<Option<Choice>>,
+    /// Learned recipients: "brian|work" -> address, from the user's choices.
+    memory: Option<PathBuf>,
+    /// The whole spoken request, when a multi-step request split it into clauses.
+    request_context: Mutex<String>,
 }
 
 const CONTACTS_SCRIPT: &str = r#"on run argv
@@ -101,8 +212,13 @@ tell application "Contacts"
 set matches to (every person whose name contains query)
 repeat with person_ref in matches
 set person_name to name of person_ref
+set person_org to ""
+try
+set org_value to organization of person_ref
+if org_value is not missing value then set person_org to org_value
+end try
 repeat with email_ref in emails of person_ref
-set output to output & person_name & tab & (value of email_ref) & linefeed
+set output to output & person_name & tab & (value of email_ref) & tab & person_org & linefeed
 end repeat
 end repeat
 end tell
@@ -142,7 +258,234 @@ impl EmailClient {
             timeout,
             pending: Mutex::new(None),
             next_revision: Mutex::new(0),
+            choice: Mutex::new(None),
+            memory: None,
+            request_context: Mutex::new(String::new()),
         })
+    }
+
+    /// The user's whole request for this turn; a clause like "email Brian" is
+    /// judged work or personal by everything the user said.
+    pub fn set_request_context(&self, request: &str) {
+        let mut context = self
+            .request_context
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        context.clear();
+        context.push_str(&request[..request.len().min(2048)]);
+    }
+
+    /// Remember which person the user means by a name, per work/personal context.
+    pub fn with_recipient_memory(mut self, path: PathBuf) -> Self {
+        self.memory = Some(path);
+        self
+    }
+
+    fn remembered(&self) -> std::collections::HashMap<String, String> {
+        self.memory
+            .as_ref()
+            .and_then(|path| std::fs::read(path).ok())
+            .filter(|bytes| bytes.len() <= 64 * 1024)
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    fn remember(&self, key: String, address: &str) {
+        let Some(path) = &self.memory else {
+            return;
+        };
+        let mut map = self.remembered();
+        if map.len() >= 200 && !map.contains_key(&key) {
+            return;
+        }
+        map.insert(key, address.to_owned());
+        if let Ok(bytes) = serde_json::to_vec_pretty(&map) {
+            let temporary = path.with_extension("json.tmp");
+            if std::fs::write(&temporary, bytes).is_ok() {
+                let _ = std::fs::rename(&temporary, path);
+            }
+        }
+    }
+
+    /// Contacts whose name contains what the user said, with their companies.
+    async fn candidates(&self, recipient: &str) -> Result<Vec<Candidate>, EmailError> {
+        let output = self.run(CONTACTS_SCRIPT, &[recipient]).await?;
+        let mut lines = output.lines();
+        if lines.next() != Some("ok") {
+            return Err(EmailError::Unavailable);
+        }
+        let mut found = Vec::new();
+        for line in lines.filter(|line| !line.trim().is_empty()) {
+            let mut parts = line.split('\t');
+            let (Some(name), Some(address)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            let candidate = Candidate {
+                name: name.trim().to_owned(),
+                address: address.trim().to_owned(),
+                organization: parts.next().unwrap_or("").trim().to_owned(),
+            };
+            if valid_address(&candidate.address) && !found.contains(&candidate) {
+                found.push(candidate);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Resolve the recipient and stage a draft, or ask which person is meant.
+    /// A remembered choice for this context wins; then the work/personal fit;
+    /// otherwise the user is asked once and the answer is remembered.
+    pub async fn compose(
+        &self,
+        user_request: &str,
+        recipient: &str,
+        subject: &str,
+        body: &str,
+    ) -> Result<Composed, EmailError> {
+        let recipient = recipient.trim();
+        let request = user_request.to_lowercase();
+        if recipient.is_empty()
+            || recipient.len() > 128
+            || recipient.chars().any(char::is_control)
+            || !mentions_email(&request)
+        {
+            return Err(EmailError::NotAuthorized);
+        }
+        if explicit_address(user_request).is_some() {
+            let (name, address) = self.resolve_recipient(user_request, recipient).await?;
+            return self
+                .stage(name, address, subject, body)
+                .map(Composed::Draft);
+        }
+        if !contains_words(&request, &recipient.to_lowercase()) {
+            return Err(EmailError::NotAuthorized);
+        }
+        let candidates = self.candidates(recipient).await?;
+        if candidates.is_empty() {
+            return Err(EmailError::RecipientNotFound);
+        }
+        let whole = self
+            .request_context
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let category = context_category(&format!("{user_request} {whole}"));
+        let key = format!("{}|{category}", recipient.to_lowercase());
+        let pick = |chosen: &Candidate| {
+            self.stage(chosen.name.clone(), chosen.address.clone(), subject, body)
+                .map(Composed::Draft)
+        };
+        if let Some(address) = self.remembered().get(&key)
+            && let Some(chosen) = candidates.iter().find(|c| &c.address == address)
+        {
+            return pick(chosen);
+        }
+        let mut people: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
+        people.sort_unstable();
+        people.dedup();
+        let fitting: Vec<&Candidate> = candidates.iter().filter(|c| fits(c, category)).collect();
+        let mut fitting_people: Vec<&str> = fitting.iter().map(|c| c.name.as_str()).collect();
+        fitting_people.sort_unstable();
+        fitting_people.dedup();
+        if people.len() == 1 {
+            // One person: prefer the address that fits the context.
+            return pick(fitting.first().copied().unwrap_or(&candidates[0]));
+        }
+        if fitting_people.len() == 1 && fitting.len() == 1 {
+            return pick(fitting[0]);
+        }
+        let options: Vec<String> = candidates
+            .iter()
+            .take(3)
+            .map(|c| {
+                if c.organization.is_empty() {
+                    format!("{} ({})", c.name, c.address)
+                } else {
+                    format!("{} at {}", c.name, c.organization)
+                }
+            })
+            .collect();
+        let question = format!("Which one: {}?", options.join(", or "));
+        *self.choice.lock().unwrap_or_else(|p| p.into_inner()) = Some(Choice {
+            query: recipient.to_lowercase(),
+            category,
+            candidates: candidates.into_iter().take(3).collect(),
+            subject: subject.to_owned(),
+            body: body.to_owned(),
+            asked_at: Instant::now(),
+        });
+        Ok(Composed::Choose(question))
+    }
+
+    pub fn awaiting_choice(&self) -> bool {
+        self.choice
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .is_some_and(|choice| choice.asked_at.elapsed() < Duration::from_secs(300))
+    }
+
+    /// The user's answer to "which one": a name, company, ordinal, or
+    /// "the work one". The choice is remembered for this context.
+    pub fn choose(&self, answer: &str) -> Option<Result<EmailDraft, EmailError>> {
+        let mut slot = self.choice.lock().unwrap_or_else(|p| p.into_inner());
+        let choice = slot.as_ref()?;
+        if choice.asked_at.elapsed() >= Duration::from_secs(300) {
+            *slot = None;
+            return None;
+        }
+        let lower = answer.to_lowercase();
+        let words: Vec<&str> = lower
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect();
+        let ordinal = ["first", "second", "third"]
+            .iter()
+            .position(|o| words.contains(o));
+        let by_words: Vec<&Candidate> = choice
+            .candidates
+            .iter()
+            .filter(|c| {
+                let label = format!("{} {}", c.name, c.organization).to_lowercase();
+                let label_words: Vec<&str> = label
+                    .split(|ch: char| !ch.is_alphanumeric())
+                    .filter(|w| w.len() > 1 && *w != choice.query)
+                    .collect();
+                words.iter().any(|w| label_words.contains(w))
+            })
+            .collect();
+        let by_kind: Vec<&Candidate> = if words.contains(&"work") {
+            choice
+                .candidates
+                .iter()
+                .filter(|c| fits(c, "work"))
+                .collect()
+        } else if words.contains(&"personal") {
+            choice
+                .candidates
+                .iter()
+                .filter(|c| fits(c, "personal"))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let chosen = if let Some(index) = ordinal {
+            choice.candidates.get(index)
+        } else if by_words.len() == 1 {
+            Some(by_words[0])
+        } else if by_kind.len() == 1 {
+            Some(by_kind[0])
+        } else {
+            None
+        }?
+        .clone();
+        let choice = slot.take()?;
+        drop(slot);
+        self.remember(
+            format!("{}|{}", choice.query, choice.category),
+            &chosen.address,
+        );
+        Some(self.stage(chosen.name, chosen.address, &choice.subject, &choice.body))
     }
 
     async fn run(&self, script: &str, args: &[&str]) -> Result<String, EmailError> {
@@ -215,27 +558,15 @@ impl EmailClient {
         if !contains_words(&request, &recipient.to_lowercase()) {
             return Err(EmailError::NotAuthorized);
         }
-        let output = self.run(CONTACTS_SCRIPT, &[recipient]).await?;
-        let mut lines = output.lines();
-        if lines.next() != Some("ok") {
-            return Err(EmailError::Unavailable);
-        }
-        let mut people: Vec<(String, String)> = Vec::new();
-        for line in lines.filter(|line| !line.trim().is_empty()) {
-            let Some((name, address)) = line.split_once('\t') else {
-                continue;
-            };
-            if valid_address(address.trim()) {
-                people.push((name.trim().to_owned(), address.trim().to_owned()));
-            }
-        }
-        let mut names: Vec<&str> = people.iter().map(|(name, _)| name.as_str()).collect();
+        let candidates = self.candidates(recipient).await?;
+        let mut names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
+        names.sort_unstable();
         names.dedup();
         match names.len() {
             0 => Err(EmailError::RecipientNotFound),
             // One person: use their first listed address. The read-back
             // speaks it, so a wrong address is caught before sending.
-            1 => Ok(people.swap_remove(0)),
+            1 => Ok((candidates[0].name.clone(), candidates[0].address.clone())),
             _ => Err(EmailError::AmbiguousRecipient),
         }
     }

@@ -754,13 +754,17 @@ impl ToolRuntime {
                 let Some(email) = &self.email else {
                     return acknowledgment("Email isn't set up yet.");
                 };
-                let staged = match email.resolve_recipient(user_request, &args.to).await {
-                    Ok((name, address)) => email.stage(name, address, &args.subject, &args.body),
-                    Err(error) => Err(error),
-                };
-                match staged {
-                    Ok(draft) => {
+                match email
+                    .compose(user_request, &args.to, &args.subject, &args.body)
+                    .await
+                {
+                    Ok(crate::email::Composed::Draft(draft)) => {
                         let mut result = acknowledgment(&draft.read_back());
+                        result.needs_followup = true;
+                        result
+                    }
+                    Ok(crate::email::Composed::Choose(question)) => {
+                        let mut result = acknowledgment(&question);
                         result.needs_followup = true;
                         result
                     }

@@ -74,11 +74,7 @@ fn synthesize(dir: &Path, voice: &str, rate: u32, text: &str, index: usize) -> O
 
 /// Feed 20 ms chunks like the capture loop. On detection, keep the same
 /// lookback the worker keeps and transcribe with the production cut.
-fn run(
-    spotter: &mut LocalWakeSpotter,
-    stt: &AppleTranscriber,
-    samples: &[f32],
-) -> Option<String> {
+fn run(spotter: &mut LocalWakeSpotter, stt: &AppleTranscriber, samples: &[f32]) -> Option<String> {
     spotter.reset();
     let mut heard = Vec::new();
     for (index, chunk) in samples.chunks(320).enumerate() {

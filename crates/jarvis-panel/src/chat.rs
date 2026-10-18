@@ -168,7 +168,9 @@ impl ConversationWorker {
         }
         tools = tools.with_web_visitor(jarvis::web_visit::WebVisitor::native());
         if let Ok(email) = jarvis::email::EmailClient::native() {
-            tools = tools.with_email(email);
+            tools = tools.with_email(
+                email.with_recipient_memory(database.with_file_name("recipients.json")),
+            );
         }
         if let Some(messages) = jarvis::messages::MessagesReader::native() {
             tools = tools.with_messages(messages);

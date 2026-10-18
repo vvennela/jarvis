@@ -232,6 +232,24 @@ impl Conversation {
     async fn email_turn(&mut self, question: &str) -> Option<Reply> {
         let runtime = Arc::clone(self.tool_runtime.as_ref()?);
         let email = runtime.email()?;
+        // "Which Brian?" answered: stage the draft and read it back.
+        if email.awaiting_choice()
+            && let Some(result) = email.choose(question)
+        {
+            let (text, needs_followup) = match result {
+                Ok(draft) => {
+                    self.email_awaiting = Some(draft.revision);
+                    (draft.read_back(), true)
+                }
+                Err(error) => (error.to_string(), false),
+            };
+            self.remember(question, &text);
+            return Some(Reply {
+                text,
+                needs_followup,
+                routing_degraded: false,
+            });
+        }
         let draft = email.pending()?;
         let awaiting = self.email_awaiting.take() == Some(draft.revision);
         let (text, needs_followup) = if crate::email::is_send_confirmation(question, awaiting) {
@@ -295,6 +313,9 @@ impl Conversation {
         // when that turns the request into complete actions.
         let canonical = crate::request_intent::canonical_request(question);
         let question = canonical.as_deref().unwrap_or(question);
+        if let Some(email) = self.tool_runtime.as_ref().and_then(|r| r.email()) {
+            email.set_request_context(question);
+        }
         // A semantic clarification carries a runtime-created authority token,
         // not executable model prose. Consume it before awaiting execution so
         // cancellation or a failed observation cannot replay the action.
